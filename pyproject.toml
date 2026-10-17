@@ -32,3 +32,6 @@ src = ["rune", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+
+[tool.maturin]
+module-name = "rune"

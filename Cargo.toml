@@ -6,7 +6,7 @@ readme = "README.md"
 description = "Typed serialization for Python."
 
 [lib]
-name = "_rune"
+name = "rune"
 crate-type = ["cdylib"]
 
 [profile.release]
@@ -19,3 +19,6 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 pyo3 = { version = "0.29.3", features = ["auto-initialize", "extension-module"] }
+
+[dev-dependencies]
+rstest = "0.27.0"

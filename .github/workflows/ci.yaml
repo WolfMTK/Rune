@@ -23,7 +23,7 @@ jobs:
       - run: cargo test --no-default-features
 
   clippy-python:
-    name: Clippy (python feature)
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --features python -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   python:
     name: Python ${{ matrix.python }} / ${{ matrix.os }}

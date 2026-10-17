@@ -1,7 +1,8 @@
-pub mod common;
-pub mod constants;
-pub mod json;
-pub mod msgpack;
+mod common;
+mod constants;
+mod exceptions;
+mod json;
+mod msgpack;
 
 #[pyo3::pymodule]
 mod rune {
@@ -10,14 +11,17 @@ mod rune {
     #[pymodule]
     mod json {
         #[pymodule_export]
-        use crate::json::encode;
+        use crate::json::{Decoder, decode, encode};
     }
 
     #[pymodule]
     mod msgpack {
         #[pymodule_export]
-        use crate::msgpack::encode;
+        use crate::msgpack::{Decoder, decode, encode};
     }
+
+    #[pymodule_export]
+    use crate::exceptions::{DecodeError, ValidationError};
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -10,3 +10,10 @@ pub struct JsonWriter {
     pub(crate) frames: Vec<Frame>,
     pub(crate) expect_value: bool,
 }
+
+pub struct Parser<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) src: &'a [u8],
+    pub(crate) pos: usize,
+    pub(crate) depth: usize,
+}

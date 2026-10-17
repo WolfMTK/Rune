@@ -1,3 +1,3 @@
-from .json import encode
+from .json import Decoder, decode, encode
 
-__all__ = ["encode"]
+__all__ = ["Decoder", "decode", "encode"]

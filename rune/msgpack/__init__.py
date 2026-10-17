@@ -1,3 +1,3 @@
-from .msgpack import encode
+from .msgpack import Decoder, decode, encode
 
-__all__ = ["encode"]
+__all__ = ["Decoder", "decode", "encode"]

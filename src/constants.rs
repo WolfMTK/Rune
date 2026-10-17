@@ -19,3 +19,5 @@ pub const NEEDS_ESCAPE: [bool; 256] = {
     table[b'\\' as usize] = true;
     table
 };
+
+pub const MAX_DEPTH: usize = 512;

@@ -1,5 +1,6 @@
 use crate::common::decode::DecoderCore;
-use crate::common::dynamic::serialize;
+use crate::common::dynamic::{Depth, serialize};
+use crate::common::recursion_limit;
 use crate::json::reader::parse;
 use crate::json::structures::JsonWriter;
 use pyo3::types::{PyBytes, PyType};
@@ -12,7 +13,8 @@ pub mod writer;
 #[pyfunction]
 pub fn encode<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
     let mut writer = JsonWriter::new();
-    serialize(&mut writer, obj)?;
+    let mut depth = Depth::new(recursion_limit(py)?);
+    serialize(&mut writer, obj, &mut depth)?;
     Ok(PyBytes::new(py, &writer.finish()))
 }
 

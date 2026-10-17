@@ -43,15 +43,30 @@ pub fn validation_error(message: impl Into<String>, path: &[PathElem]) -> PyErr 
     ValidationError::new_err(message)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    Syntax,
+    RecursionLimit,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
+    pub kind: ParseErrorKind,
 }
 
 impl ParseError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: ParseErrorKind::Syntax,
+        }
+    }
+
+    pub fn recursion_limit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ParseErrorKind::RecursionLimit,
         }
     }
 }

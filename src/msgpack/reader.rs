@@ -1,13 +1,13 @@
 use crate::common::token::Value;
-use crate::constants::MAX_DEPTH;
 use crate::exceptions::ParseError;
 use crate::msgpack::structures::Parser;
 
-pub fn parse(input: &[u8]) -> Result<(Value, usize), ParseError> {
+pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseError> {
     let mut parser = Parser {
         src: input,
         pos: 0,
         depth: 0,
+        max_depth,
     };
     let value = parser.parse_value()?;
     Ok((value, parser.pos))
@@ -117,8 +117,11 @@ impl<'a> Parser<'a> {
         f: impl FnOnce(&mut Self) -> Result<Value, ParseError>,
     ) -> Result<Value, ParseError> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            return Err(self.error_at_pos("Recursion limit exceeded"));
+        if self.depth > self.max_depth {
+            return Err(ParseError::recursion_limit(format!(
+                "Recursion limit exceeded at byte {}",
+                self.pos
+            )));
         }
         let value = f(self)?;
         self.depth -= 1;
@@ -156,10 +159,15 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse as parse_with_limit;
     use crate::common::token::Value;
     use crate::constants::MAX_DEPTH;
-    use crate::msgpack::reader::parse;
+    use crate::exceptions::ParseError;
     use rstest::rstest;
+
+    fn parse(input: &[u8]) -> Result<(Value, usize), ParseError> {
+        parse_with_limit(input, MAX_DEPTH)
+    }
 
     fn parse_err(input: &[u8]) -> String {
         parse(input).unwrap_err().message
@@ -277,5 +285,25 @@ mod tests {
     #[case::nil_then_rest(&[0xc0, 0xc0], (Value::Null, 1))]
     fn consumed_bytes(#[case] input: &[u8], #[case] expected: (Value, usize)) {
         assert_eq!(parse(input).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::three_levels_at_limit(&[0x91, 0x91, 0x90], 3)]
+    #[case::scalar_with_zero_limit(&[0x01], 0)]
+    fn custom_limit_accepts(#[case] input: &[u8], #[case] max_depth: usize) {
+        assert!(parse_with_limit(input, max_depth).is_ok());
+    }
+
+    #[rstest]
+    #[case::second_level_limit_one(&[0x91, 0x90], 1, "Recursion limit exceeded at byte 2")]
+    #[case::fourth_level_limit_three(
+        &[0x91, 0x91, 0x91, 0x90],
+        3,
+        "Recursion limit exceeded at byte 4"
+    )]
+    #[case::empty_array_zero_limit(&[0x90], 0, "Recursion limit exceeded at byte 1")]
+    fn custom_limit_rejects(#[case] input: &[u8], #[case] max_depth: usize, #[case] message: &str) {
+        let err = parse_with_limit(input, max_depth).unwrap_err();
+        assert_eq!(err.message, message);
     }
 }

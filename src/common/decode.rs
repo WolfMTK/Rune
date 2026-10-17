@@ -1,12 +1,13 @@
 use crate::common::converter::Converter;
+use crate::common::recursion_limit;
 use crate::common::token::Value;
-use crate::exceptions::{DecodeError, ParseError};
-use pyo3::exceptions::PyTypeError;
+use crate::exceptions::{DecodeError, ParseError, ParseErrorKind};
+use pyo3::exceptions::{PyRecursionError, PyTypeError};
 use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyListMethods};
 use pyo3::types::{PyBool, PyDict, PyList, PyString};
 use pyo3::{Bound, IntoPyObject, Py, PyAny, PyResult, Python};
 
-pub type ParseFn = fn(&[u8]) -> Result<(Value, usize), ParseError>;
+pub type ParseFn = fn(&[u8], usize) -> Result<(Value, usize), ParseError>;
 
 pub fn decode_bytes<'py>(
     py: Python<'py>,
@@ -15,7 +16,11 @@ pub fn decode_bytes<'py>(
     ty: Option<&Bound<'py, PyAny>>,
     hook: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let (value, used) = parse(buf).map_err(|err| DecodeError::new_err(err.message))?;
+    let max_depth = recursion_limit(py)?;
+    let (value, used) = parse(buf, max_depth).map_err(|err| match err.kind {
+        ParseErrorKind::RecursionLimit => PyRecursionError::new_err(err.message),
+        ParseErrorKind::Syntax => DecodeError::new_err(err.message),
+    })?;
     let mut converter = Converter::new(py, hook.cloned())?;
     let target = match ty {
         Some(ty) => ty.clone(),

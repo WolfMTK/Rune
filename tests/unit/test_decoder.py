@@ -1,4 +1,6 @@
 from collections import deque
+from types import ModuleType
+from typing import Any
 
 import pytest
 from rune.struct import Struct
@@ -16,14 +18,14 @@ class Custom:
 
 
 class TestDecoder:
-    def test_decoder_runtime_type_parameters(self, proto):
+    def test_decoder_runtime_type_parameters(self, proto: ModuleType) -> None:
         dec = proto.Decoder[int](int)
         assert isinstance(dec, proto.Decoder)
         msg = proto.encode(2)
         assert dec.decode(msg) == 2
 
-    def test_decoder_dec_hook_attribute(self, proto):
-        def dec_hook(typ, obj):
+    def test_decoder_dec_hook_attribute(self, proto: ModuleType) -> None:
+        def dec_hook(typ: type, obj: Any) -> None:
             pass
 
         dec = proto.Decoder()
@@ -35,12 +37,12 @@ class TestDecoder:
         dec = proto.Decoder(dec_hook=dec_hook)
         assert dec.dec_hook is dec_hook
 
-    def test_decoder_dec_hook_not_callable(self, proto):
+    def test_decoder_dec_hook_not_callable(self, proto: ModuleType) -> None:
         with pytest.raises(TypeError):
             proto.Decoder(dec_hook=1)
 
-    def test_decode_dec_hook(self, proto):
-        def dec_hook(typ, obj):
+    def test_decode_dec_hook(self, proto: ModuleType) -> None:
+        def dec_hook(typ: type, obj: Any) -> Any:
             assert typ is Custom
             return typ(*obj)
 
@@ -49,10 +51,10 @@ class TestDecoder:
         assert res == Custom(1, 2)
         assert isinstance(res, Custom)
 
-    def test_decoder_dec_hook(self, proto):
+    def test_decoder_dec_hook(self, proto: ModuleType) -> None:
         called = False
 
-        def dec_hook(typ, obj):
+        def dec_hook(typ: type, obj: Any) -> Custom:
             nonlocal called
             called = True
             assert typ is Custom
@@ -65,10 +67,10 @@ class TestDecoder:
         assert msg == [Custom(1, 2), Custom(3, 4), Custom(5, 6)]
         assert isinstance(msg[0], Custom)
 
-    def test_decoder_dec_hook_optional_custom_type(self, proto):
+    def test_decoder_dec_hook_optional_custom_type(self, proto: ModuleType) -> None:
         called = False
 
-        def dec_hook(typ, obj):
+        def dec_hook(typ: type, obj: Any) -> None:
             nonlocal called
             called = True
 
@@ -78,8 +80,10 @@ class TestDecoder:
         assert msg is None
 
     @pytest.mark.parametrize("err_cls", [TypeError, ValueError])
-    def test_decode_dec_hook_errors_wrapped(self, err_cls, proto):
-        def dec_hook(typ, obj):
+    def test_decode_dec_hook_errors_wrapped(
+        self, err_cls: type[Exception], proto: ModuleType
+    ) -> None:
+        def dec_hook(typ: type, obj: Any) -> None:
             assert obj == "some string"
             raise err_cls("Oh no!")
 
@@ -94,8 +98,8 @@ class TestDecoder:
         with pytest.raises(rune.ValidationError, match=r"Oh no! - at `\$\[0\]`"):
             proto.decode(msg, type=list[Custom], dec_hook=dec_hook)
 
-    def test_decode_dec_hook_errors_passthrough(self, proto):
-        def dec_hook(typ, obj):
+    def test_decode_dec_hook_errors_passthrough(self, proto: ModuleType) -> None:
+        def dec_hook(typ: type, obj: Any) -> None:
             assert obj == "some string"
             raise NotImplementedError("Oh no!")
 
@@ -107,7 +111,7 @@ class TestDecoder:
         with pytest.raises(NotImplementedError, match=r"Oh no!"):
             proto.decode(msg, type=list[Custom], dec_hook=dec_hook)
 
-    def test_decode_dec_hook_wrong_type(self, proto):
+    def test_decode_dec_hook_wrong_type(self, proto: ModuleType) -> None:
         dec = proto.Decoder(type=Custom, dec_hook=lambda t, o: o)
 
         msg = proto.encode([1, 2])
@@ -117,7 +121,7 @@ class TestDecoder:
         ):
             dec.decode(msg)
 
-    def test_decode_dec_hook_wrong_type_in_struct(self, proto):
+    def test_decode_dec_hook_wrong_type_in_struct(self, proto: ModuleType) -> None:
         class Test(Struct):
             point: Custom
             other: int
@@ -130,7 +134,7 @@ class TestDecoder:
 
         assert "Expected `Custom`, got `list` - at `$.point`" == str(rec.value)
 
-    def test_decode_dec_hook_wrong_type_generic(self, proto):
+    def test_decode_dec_hook_wrong_type_generic(self, proto: ModuleType) -> None:
         dec = proto.Decoder(type=deque[int], dec_hook=lambda t, o: o)
 
         msg = proto.encode([1, 2, 3])
@@ -139,9 +143,9 @@ class TestDecoder:
 
         assert "Expected `collections.deque`, got `list`" == str(rec.value)
 
-    def test_decode_dec_hook_isinstance_errors(self, proto):
+    def test_decode_dec_hook_isinstance_errors(self, proto: ModuleType) -> None:
         class Metaclass(type):
-            def __instancecheck__(self, obj):
+            def __instancecheck__(self, obj: Any) -> bool:
                 raise TypeError("Oh no!")
 
         class Custom(metaclass=Metaclass):
@@ -154,14 +158,16 @@ class TestDecoder:
             dec.decode(msg)
 
     @pytest.mark.parametrize("base_error_cls", [rune.ValidationError, rune.DecodeError])
-    def test_dec_hook_validation_error_subclass_propagates_directly(self, proto, base_error_cls):
+    def test_dec_hook_validation_error_subclass_propagates_directly(
+        self, proto: ModuleType, base_error_cls: type[Exception]
+    ) -> None:
         class MyError(base_error_cls):
             pass
 
         class Foo:
             pass
 
-        def dec_hook(tp, val):
+        def dec_hook(tp: type, val: Any) -> None:
             raise MyError("custom message")
 
         dec = proto.Decoder(type=Foo, dec_hook=dec_hook)

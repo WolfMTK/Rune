@@ -38,3 +38,17 @@ impl Value {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    IntEnum,
+    StrEnum,
+    IntPlain,
+    StrPlain,
+    StrStrict,
+    Dict,
+    Array,
+    Deque,
+    Custom,
+    Other,
+}

@@ -12,67 +12,95 @@ use pyo3::types::{
     PyAnyMethods, PyBytes, PyDict, PyFrozenSet, PyInt, PyList, PyListMethods, PySet, PyString,
     PyTuple, PyTupleMethods,
 };
-use pyo3::{Bound, PyAny, PyResult};
+use pyo3::{Bound, Py, PyAny, PyResult};
 
-pub(crate) struct Depth {
-    max: usize,
-    current: usize,
+pub(crate) struct EncodeState {
+    max_depth: usize,
+    depth: usize,
+    hook: Option<Py<PyAny>>,
 }
 
-impl Depth {
-    pub(crate) fn new(max: usize) -> Self {
-        Self { max, current: 0 }
+impl EncodeState {
+    pub(crate) fn new(max_depth: usize, hook: Option<Py<PyAny>>) -> Self {
+        Self {
+            max_depth,
+            depth: 0,
+            hook,
+        }
     }
 
     pub(crate) fn enter(&mut self) -> PyResult<()> {
-        self.current += 1;
-        if self.current > self.max {
+        self.depth += 1;
+        if self.depth > self.max_depth {
             return Err(PyRecursionError::new_err("Recursion limit exceeded"));
         }
         Ok(())
     }
 
     pub(crate) fn leave(&mut self) {
-        self.current -= 1;
+        self.depth -= 1;
     }
 }
 
 pub(crate) fn serialize<W: Writer>(
     writer: &mut W,
     obj: &Bound<'_, PyAny>,
-    depth: &mut Depth,
+    ctx: &mut EncodeState,
 ) -> PyResult<()> {
+    if serialize_supported(writer, obj, ctx)? {
+        return Ok(());
+    }
+    let py = obj.py();
+    let hook = match &ctx.hook {
+        Some(hook) => hook.clone_ref(py),
+        None => return unsupported(obj),
+    };
+    let replaced = hook.bind(py).call1((obj,))?;
+    if serialize_supported(writer, &replaced, ctx)? {
+        return Ok(());
+    }
+    unsupported(&replaced)
+}
+
+fn serialize_supported<W: Writer>(
+    writer: &mut W,
+    obj: &Bound<'_, PyAny>,
+    ctx: &mut EncodeState,
+) -> PyResult<bool> {
     if obj.is_none() {
         writer.write(Token::Null);
-        return Ok(());
     } else if obj.is_exact_instance_of::<PyDict>() {
-        return serialize_dict(writer, obj, depth);
+        serialize_dict(writer, obj, ctx)?;
     } else if obj.is_exact_instance_of::<PyList>() {
-        return serialize_sequence(writer, obj.cast::<PyList>()?.iter(), depth);
+        serialize_sequence(writer, obj.cast::<PyList>()?.iter(), ctx)?;
     } else if obj.is_exact_instance_of::<PyString>() {
-        return serialize_str(writer, obj);
+        serialize_str(writer, obj)?;
     } else if obj.is_exact_instance_of::<PyInt>() {
-        return serialize_int(writer, obj);
+        serialize_int(writer, obj)?;
     } else if obj.is_instance_of::<PyBytes>() {
         let value: bool = obj.extract()?;
         writer.write(Token::Bool(value));
-        return Ok(());
     } else if obj.is_instance_of::<PyDict>() {
-        return serialize_dict(writer, obj, depth);
+        serialize_dict(writer, obj, ctx)?;
     } else if obj.is_instance_of::<PyList>() {
-        return serialize_sequence(writer, obj.cast::<PyList>()?.iter(), depth);
+        serialize_sequence(writer, obj.cast::<PyList>()?.iter(), ctx)?;
     } else if obj.is_instance_of::<PyTuple>() {
-        return serialize_sequence(writer, obj.cast::<PyTuple>()?.iter(), depth);
+        serialize_sequence(writer, obj.cast::<PyTuple>()?.iter(), ctx)?;
     } else if let Ok(set) = obj.cast::<PySet>() {
-        return serialize_sequence(writer, set.iter(), depth);
+        serialize_sequence(writer, set.iter(), ctx)?;
     } else if let Ok(set) = obj.cast::<PyFrozenSet>() {
-        return serialize_sequence(writer, set.iter(), depth);
+        serialize_sequence(writer, set.iter(), ctx)?;
     } else if obj.is_instance_of::<PyString>() {
-        return serialize_str(writer, obj);
+        serialize_str(writer, obj)?;
     } else if obj.is_instance_of::<PyInt>() {
-        return serialize_int(writer, obj);
+        serialize_int(writer, obj)?;
+    } else {
+        return Ok(false);
     }
+    Ok(true)
+}
 
+fn unsupported<T>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
     let name = obj.get_type().qualname()?;
     Err(PyTypeError::new_err(format!(
         "Encoding objects of type {name} is unsupported"

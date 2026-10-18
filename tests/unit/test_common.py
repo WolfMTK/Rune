@@ -1,3 +1,4 @@
+import base64
 from collections import deque
 from types import ModuleType
 from typing import Any
@@ -6,6 +7,27 @@ import pytest
 from rune.struct import Struct
 
 import rune
+
+from .utils import PY312, max_call_depth
+
+
+class TestEncodeSubclasses:
+    def test_encode_dict_subclass(self, proto: Any) -> None:
+        class subclass(dict):
+            pass
+
+        for msg in [{}, {"a": 1, "b": 2}]:
+            assert proto.encode(subclass(msg)) == proto.encode(msg)
+
+    @pytest.mark.parametrize("cls", [list, tuple, set, frozenset])
+    def test_encode_sequence_subclass(
+        self, cls: list | tuple | set | frozenset, proto: Any
+    ) -> None:
+        class subclass(cls):
+            pass
+
+        for msg in [[], [1, 2]]:
+            assert proto.encode(subclass(msg)) == proto.encode(cls(msg))
 
 
 class Custom:
@@ -174,3 +196,91 @@ class TestDecoder:
 
         with pytest.raises(MyError, match="custom message"):
             dec.decode(b"[]")
+
+
+@pytest.mark.skipif(
+    PY312,
+    reason=(
+        "Python 3.12 harcodes the C recursion limit, making this behavior harder to test in CI"
+    ),
+)
+class TestRecursion:
+    @staticmethod
+    def nested(n, is_array):
+        if is_array:
+            obj = []
+            for _ in range(n):
+                obj = [obj]
+        else:
+            obj = {}
+            for _ in range(n):
+                obj = {"": obj}
+        return obj
+
+    @pytest.mark.parametrize("is_array", [True, False])
+    def test_encode_highly_recursive_msg_errors(self, is_array, proto):
+        N = 200
+        obj = self.nested(N, is_array)
+
+        # Errors if above the recursion limit
+        with max_call_depth(N // 2):
+            with pytest.raises(RecursionError):
+                proto.encode(obj)
+
+        # Works if below the recursion limit
+        with max_call_depth(N * 2):
+            proto.encode(obj)
+
+    @pytest.mark.parametrize("is_array", [True, False])
+    def test_decode_highly_recursive_msg_errors(self, is_array, proto):
+        """Ensure recursion is properly handled when decoding.
+        Test case seen in https://github.com/ijl/orjson/issues/458."""
+        N = 200
+        obj = self.nested(N, is_array)
+
+        with max_call_depth(N * 2):
+            msg = proto.encode(obj)
+
+        # Errors if above the recursion limit
+        with max_call_depth(N // 2):
+            with pytest.raises(RecursionError):
+                proto.decode(msg)
+
+        # Works if below the recursion limit
+        with max_call_depth(N * 2):
+            obj2 = proto.decode(msg)
+
+        assert obj2
+
+
+class TestThreadSafe:
+    def test_encode_threadsafe(self, proto: ModuleType) -> None:
+        class Nested:
+            def __init__(self, x: int) -> None:
+                self.x = x
+
+        def enc_hook(obj: Nested) -> str:
+            return base64.b64encode(enc.encode(obj.x)).decode("utf-8")
+
+        enc = proto.Encoder(enc_hook=enc_hook)
+        res = enc.encode({"x": Nested(1)})
+        sol = proto.encode({"x": base64.b64encode(proto.encode(1)).decode("utf-8")})
+        assert res == sol
+
+    def test_decode_threadsafe(self, proto: ModuleType) -> None:
+        class Custom:
+            def __init__(self, node: Any) -> None:
+                self.node = node
+
+            def __eq__(self, other: object) -> bool:
+                return type(other) is Custom and self.node == other.node
+
+        def dec_hook(typ: type, obj: str) -> Custom:
+            msg = base64.b64decode(obj)
+            return Custom(dec.decode(msg))
+
+        dec = proto.Decoder(tuple[Custom | None, int], dec_hook=dec_hook)
+        msg = proto.encode((base64.b64encode(proto.encode((None, 1))).decode("utf-8"), 2))
+        sol = (Custom((None, 1)), 2)
+        res = dec.decode(msg)
+        assert res == sol

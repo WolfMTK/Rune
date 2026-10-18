@@ -1,4 +1,4 @@
-use crate::common::dynamic::{Depth, serialize};
+use crate::common::dynamic::{EncodeState, serialize};
 use crate::common::token::Token;
 use crate::common::writer::Writer;
 use pyo3::exceptions::PyTypeError;
@@ -9,10 +9,10 @@ use pyo3::{Bound, PyAny, PyResult};
 pub fn serialize_dict<W: Writer>(
     writer: &mut W,
     obj: &Bound<'_, PyAny>,
-    depth: &mut Depth,
+    ctx: &mut EncodeState,
 ) -> PyResult<()> {
     let dict = obj.cast::<PyDict>()?;
-    depth.enter()?;
+    ctx.enter()?;
     writer.write(Token::MapStart(dict.len()));
 
     for (key, value) in dict.iter() {
@@ -25,9 +25,9 @@ pub fn serialize_dict<W: Writer>(
             PyTypeError::new_err(format!("Only str keys are supported, got {name}"))
         })?;
         writer.write(Token::Str(key.to_str()?));
-        serialize(writer, &value, depth)?;
+        serialize(writer, &value, ctx)?;
     }
     writer.write(Token::End);
-    depth.leave();
+    ctx.leave();
     Ok(())
 }

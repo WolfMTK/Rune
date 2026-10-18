@@ -1,8 +1,188 @@
+use crate::common::builder::{Builder, ValueBuilder};
+use crate::common::converter::Converter;
+use crate::common::stream::{Scalar, Wire, kind};
 use crate::common::token::Value;
 use crate::exceptions::ParseError;
 use crate::json::structures::Parser;
+use pyo3::{Bound, PyAny, Python};
+use std::borrow::Cow;
 
 pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseError> {
+    build(input, max_depth, &mut ValueBuilder::default())
+}
+
+pub(crate) fn decode_fast<'py>(
+    py: Python<'py>,
+    input: &[u8],
+    max_depth: usize,
+    ty: &Bound<'py, PyAny>,
+) -> Option<Bound<'py, PyAny>> {
+    let text = std::str::from_utf8(input).ok()?;
+    let mut parser = Parser {
+        text,
+        src: text.as_bytes(),
+        pos: 0,
+        depth: 0,
+        max_depth,
+    };
+    Converter::new(py, None).decode_one(&mut parser, ty, max_depth)
+}
+
+impl<'a> Wire<'a> for Parser<'a> {
+    fn start(&mut self) {
+        self.skip_whitespace();
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.src.len()
+    }
+
+    fn peek_kind(&mut self) -> Result<u8, ParseError> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'[') => Ok(kind::ARRAY),
+            Some(b'{') => Ok(kind::MAP),
+            Some(b'"') => Ok(kind::STR),
+            Some(b'n') => Ok(kind::NULL),
+            Some(b't' | b'f') => Ok(kind::BOOL),
+            Some(b'-' | b'0'..=b'9') => Ok(if self.number_has_fraction() {
+                kind::FLOAT
+            } else {
+                kind::INT
+            }),
+            _ => Err(self.error_at_pos("Invalid character")),
+        }
+    }
+
+    fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
+        match self.peek() {
+            Some(b'n') => {
+                self.parse_literal("null", Value::Null)?;
+                Ok(Scalar::Null)
+            }
+            Some(b't') => {
+                self.parse_literal("true", Value::Bool(true))?;
+                Ok(Scalar::Bool(true))
+            }
+            Some(b'f') => {
+                self.parse_literal("false", Value::Bool(false))?;
+                Ok(Scalar::Bool(false))
+            }
+            Some(b'"') => Ok(Scalar::Str(self.parse_string()?)),
+            Some(b'-' | b'0'..=b'9') => match self.parse_number()? {
+                Value::Int(i) => Ok(Scalar::Int(i)),
+                Value::Float(f) => Ok(Scalar::Float(f)),
+                _ => Err(self.error_at_pos("Invalid number")),
+            },
+            _ => Err(self.error_at_pos("Invalid character")),
+        }
+    }
+
+    fn open_array(&mut self) -> Result<Option<usize>, ParseError> {
+        self.expect_byte(b'[', "Expected `[`")?;
+        Ok(None)
+    }
+
+    fn next_item(&mut self, _len: Option<usize>, index: usize) -> Result<bool, ParseError> {
+        self.skip_whitespace();
+        if index == 0 {
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        match self.peek() {
+            Some(b',') => {
+                self.pos += 1;
+                self.skip_whitespace();
+                Ok(true)
+            }
+            Some(b']') => {
+                self.pos += 1;
+                Ok(false)
+            }
+            _ => Err(self.error_at_pos("Expected `,` or `]`")),
+        }
+    }
+
+    fn open_map(&mut self) -> Result<Option<usize>, ParseError> {
+        self.expect_byte(b'{', "Expected `{`")?;
+        Ok(None)
+    }
+
+    fn next_key(
+        &mut self,
+        _len: Option<usize>,
+        index: usize,
+    ) -> Result<Option<Cow<'a, str>>, ParseError> {
+        self.skip_whitespace();
+        if index == 0 {
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(None);
+            }
+        } else {
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(None);
+                }
+                _ => return Err(self.error_at_pos("Expected `,` or `}`")),
+            }
+        }
+        self.parse_object_key().map(Some)
+    }
+}
+
+fn has_special_byte(word: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let zero_byte = |v: u64| v.wrapping_sub(ONES) & !v & HIGH;
+    let quote = zero_byte(word ^ (ONES * u64::from(b'"')));
+    let backslash = zero_byte(word ^ (ONES * u64::from(b'\\')));
+    let control = word.wrapping_sub(ONES * 0x20) & !word & HIGH;
+    (quote | backslash | control) != 0
+}
+
+impl Parser<'_> {
+    fn skip_plain_chars(&mut self) {
+        while let Some(word) = self
+            .src
+            .get(self.pos..self.pos + 8)
+            .and_then(|chunk| <[u8; 8]>::try_from(chunk).ok())
+        {
+            if has_special_byte(u64::from_le_bytes(word)) {
+                break;
+            }
+            self.pos += 8;
+        }
+        while let Some(b) = self.peek()
+            && b != b'"'
+            && b != b'\\'
+            && b >= 0x20
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn number_has_fraction(&self) -> bool {
+        self.src[self.pos..]
+            .iter()
+            .take_while(|&&b| !matches!(b, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r'))
+            .any(|&b| matches!(b, b'.' | b'e' | b'E'))
+    }
+}
+
+pub(crate) fn build<'a, B: Builder<'a>>(
+    input: &'a [u8],
+    max_depth: usize,
+    builder: &mut B,
+) -> Result<(B::Output, usize), B::Error> {
     let text = std::str::from_utf8(input)
         .map_err(|e| ParseError::new(format!("Invalid UTF-8 at byte {}", e.valid_up_to())))?;
     let mut parser = Parser {
@@ -13,11 +193,11 @@ pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseErro
         max_depth,
     };
     parser.skip_whitespace();
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(builder)?;
     Ok((value, parser.pos))
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn error_at_pos(&self, msg: &str) -> ParseError {
         ParseError::new(format!("{msg} at byte {}", self.pos))
     }
@@ -40,18 +220,19 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_value(&mut self) -> Result<Value, ParseError> {
-        match self.peek() {
-            None => Err(self.error_at_pos("Unexpected end of input")),
-            Some(b'n') => self.parse_literal("null", Value::Null),
-            Some(b't') => self.parse_literal("true", Value::Bool(true)),
-            Some(b'f') => self.parse_literal("false", Value::Bool(false)),
-            Some(b'"') => self.parse_string().map(Value::Str),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
-            Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            Some(_) => Err(self.error_at_pos("Invalid character")),
-        }
+    fn parse_value<B: Builder<'a>>(&mut self, builder: &mut B) -> Result<B::Output, B::Error> {
+        let scalar = match self.peek() {
+            None => return Err(self.error_at_pos("Unexpected end of input").into()),
+            Some(b'n') => self.parse_literal("null", Value::Null)?,
+            Some(b't') => self.parse_literal("true", Value::Bool(true))?,
+            Some(b'f') => self.parse_literal("false", Value::Bool(false))?,
+            Some(b'"') => return Ok(builder.string(self.parse_string()?)),
+            Some(b'[') => return self.parse_array(builder),
+            Some(b'{') => return self.parse_object(builder),
+            Some(b'-' | b'0'..=b'9') => self.parse_number()?,
+            Some(_) => return Err(self.error_at_pos("Invalid character").into()),
+        };
+        builder.scalar(scalar)
     }
 
     fn parse_literal(&mut self, word: &str, value: Value) -> Result<Value, ParseError> {
@@ -73,27 +254,27 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_array(&mut self) -> Result<Value, ParseError> {
-        let mut items = Vec::new();
-        self.parse_delimited(b']', "Expected `,` or `]`", |p| {
-            items.push(p.parse_value()?);
+    fn parse_array<B: Builder<'a>>(&mut self, builder: &mut B) -> Result<B::Output, B::Error> {
+        let start = builder.items().len();
+        self.parse_delimited::<B::Error>(b']', "Expected `,` or `]`", |p| {
+            let item = p.parse_value(builder)?;
+            builder.items().push(item);
             Ok(())
         })?;
-        Ok(Value::Array(items))
+        builder.finish_array(start)
     }
 
-    fn parse_object(&mut self) -> Result<Value, ParseError> {
-        let mut entries = Vec::new();
-        self.parse_delimited(b'}', "Expected `,` or `}`", |p| {
+    fn parse_object<B: Builder<'a>>(&mut self, builder: &mut B) -> Result<B::Output, B::Error> {
+        let mut map = builder.start_map();
+        self.parse_delimited::<B::Error>(b'}', "Expected `,` or `}`", |p| {
             let key = p.parse_object_key()?;
-            let value = p.parse_value()?;
-            entries.push((key, value));
-            Ok(())
+            let value = p.parse_value(builder)?;
+            builder.insert(&mut map, key, value)
         })?;
-        Ok(Value::Map(entries))
+        Ok(builder.finish_map(map))
     }
 
-    fn parse_object_key(&mut self) -> Result<String, ParseError> {
+    fn parse_object_key(&mut self) -> Result<Cow<'a, str>, ParseError> {
         if self.peek() != Some(b'"') {
             return Err(self.error_at_pos("Expected a string key"));
         }
@@ -104,12 +285,12 @@ impl Parser<'_> {
         Ok(key)
     }
 
-    fn parse_delimited(
+    fn parse_delimited<E: From<ParseError>>(
         &mut self,
         close: u8,
         separator_error: &str,
-        mut parse_item: impl FnMut(&mut Self) -> Result<(), ParseError>,
-    ) -> Result<(), ParseError> {
+        mut parse_item: impl FnMut(&mut Self) -> Result<(), E>,
+    ) -> Result<(), E> {
         self.increase_depth()?;
         self.pos += 1;
         self.skip_whitespace();
@@ -128,7 +309,7 @@ impl Parser<'_> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(self.error_at_pos(separator_error)),
+                _ => return Err(self.error_at_pos(separator_error).into()),
             }
         }
         self.depth -= 1;
@@ -137,16 +318,21 @@ impl Parser<'_> {
 
     fn parse_number(&mut self) -> Result<Value, ParseError> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
+        self.skip_if(|b| b == b'-');
         let int_start = self.pos;
         self.consume_digits()?;
         if self.src[int_start] == b'0' && self.pos - int_start > 1 {
             return Err(self.error_at_pos("Invalid number"));
         }
-        let has_fraction = self.consume_fraction()?;
-        let has_exponent = self.consume_exponent()?;
+        let has_fraction = self.skip_if(|b| b == b'.');
+        if has_fraction {
+            self.consume_digits()?;
+        }
+        let has_exponent = self.skip_if(|b| matches!(b, b'e' | b'E'));
+        if has_exponent {
+            self.skip_if(|b| matches!(b, b'+' | b'-'));
+            self.consume_digits()?;
+        }
         let literal = &self.text[start..self.pos];
         if has_fraction || has_exponent {
             return literal
@@ -160,51 +346,34 @@ impl Parser<'_> {
             .map_err(|_| self.error_at_pos("Integer is out of range"))
     }
 
+    fn skip_if(&mut self, accept: impl Fn(u8) -> bool) -> bool {
+        let matched = self.peek().is_some_and(accept);
+        self.pos += usize::from(matched);
+        matched
+    }
+
     fn consume_digits(&mut self) -> Result<(), ParseError> {
         let start = self.pos;
-        while let Some(b'0'..=b'9') = self.peek() {
-            self.pos += 1;
-        }
+        while self.skip_if(|b| b.is_ascii_digit()) {}
         if self.pos == start {
             return Err(self.error_at_pos("Invalid number"));
         }
         Ok(())
     }
 
-    fn consume_fraction(&mut self) -> Result<bool, ParseError> {
-        if self.peek() != Some(b'.') {
-            return Ok(false);
-        }
+    fn parse_string(&mut self) -> Result<Cow<'a, str>, ParseError> {
         self.pos += 1;
-        self.consume_digits()?;
-        Ok(true)
-    }
-
-    fn consume_exponent(&mut self) -> Result<bool, ParseError> {
-        if !matches!(self.peek(), Some(b'e' | b'E')) {
-            return Ok(false);
-        }
-        self.pos += 1;
-        if let Some(b'+' | b'-') = self.peek() {
-            self.pos += 1;
-        }
-        self.consume_digits()?;
-        Ok(true)
-    }
-
-    fn parse_string(&mut self) -> Result<String, ParseError> {
-        self.pos += 1;
-        let mut out = String::new();
+        let text = self.text;
+        let mut out = Cow::Borrowed("");
         loop {
             let start = self.pos;
-            while let Some(b) = self.peek()
-                && b != b'"'
-                && b != b'\\'
-                && b >= 0x20
-            {
-                self.pos += 1;
+            self.skip_plain_chars();
+            let chunk = &text[start..self.pos];
+            if out.is_empty() {
+                out = Cow::Borrowed(chunk);
+            } else {
+                out.to_mut().push_str(chunk);
             }
-            out.push_str(&self.text[start..self.pos]);
             match self.peek() {
                 None => return Err(self.error_at_pos("Unterminated string")),
                 Some(b'"') => {
@@ -213,7 +382,8 @@ impl Parser<'_> {
                 }
                 Some(b'\\') => {
                     self.pos += 1;
-                    out.push(self.parse_escape_sequence()?);
+                    let escaped = self.parse_escape_sequence()?;
+                    out.to_mut().push(escaped);
                 }
                 Some(_) => return Err(self.error_at_pos("Control character in string")),
             }

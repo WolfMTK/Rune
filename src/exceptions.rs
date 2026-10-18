@@ -1,4 +1,6 @@
-use pyo3::exceptions::PyException;
+use std::fmt::Write as _;
+
+use pyo3::exceptions::{PyException, PyRecursionError};
 use pyo3::{PyErr, create_exception};
 
 create_exception!(
@@ -15,13 +17,13 @@ create_exception!(
     "The message didn't match the expected schema"
 );
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum PathElem {
-    Key(String),
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathElem<'a> {
+    Key(&'a str),
     Index(usize),
 }
 
-pub fn format_path(path: &[PathElem]) -> String {
+pub fn format_path(path: &[PathElem<'_>]) -> String {
     let mut out = String::from("$");
     for elem in path {
         match elem {
@@ -29,16 +31,18 @@ pub fn format_path(path: &[PathElem]) -> String {
                 out.push('.');
                 out.push_str(key);
             }
-            PathElem::Index(i) => out.push_str(&format!("[{i}]")),
+            PathElem::Index(i) => {
+                let _ = write!(out, "[{i}]");
+            }
         }
     }
     out
 }
 
-pub fn validation_error(message: impl Into<String>, path: &[PathElem]) -> PyErr {
+pub fn validation_error(message: impl Into<String>, path: &[PathElem<'_>]) -> PyErr {
     let mut message = message.into();
     if !path.is_empty() {
-        message.push_str(&format!(" - at `{}`", format_path(path)));
+        let _ = write!(message, " - at `{}`", format_path(path));
     }
     ValidationError::new_err(message)
 }
@@ -67,6 +71,15 @@ impl ParseError {
         Self {
             message: message.into(),
             kind: ParseErrorKind::RecursionLimit,
+        }
+    }
+}
+
+impl From<ParseError> for PyErr {
+    fn from(err: ParseError) -> Self {
+        match err.kind {
+            ParseErrorKind::RecursionLimit => PyRecursionError::new_err(err.message),
+            ParseErrorKind::Syntax => DecodeError::new_err(err.message),
         }
     }
 }

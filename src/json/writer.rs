@@ -14,10 +14,6 @@ impl JsonWriter {
         }
     }
 
-    pub fn finish(self) -> Vec<u8> {
-        self.out
-    }
-
     #[inline]
     fn begin_item(&mut self) -> bool {
         if std::mem::take(&mut self.expect_value) {
@@ -180,6 +176,10 @@ impl Writer for JsonWriter {
             Token::MapStart(_) => self.open_container(b'{', true),
             Token::End => self.close_container(),
         }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.out
     }
 }
 

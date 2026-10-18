@@ -4,6 +4,7 @@ import datetime
 import enum
 import gc
 import sys
+import textwrap
 import types
 import typing
 import uuid
@@ -20,7 +21,7 @@ from rune.struct import Struct
 import rune
 from rune import ValidationError
 
-from .utils import PY311, PY312, max_call_depth, py315_or_later_only
+from .utils import PY311, PY312, max_call_depth, py312_plus, py315_or_later_only, temp_module
 
 if sys.version_info >= (3, 15):
     from builtins import frozendict
@@ -1442,3 +1443,512 @@ class TestStructUnion:
         assert len(cache) == MAX_CACHE_SIZE
         assert first not in cache
         assert frozenset(new) in cache
+
+
+T = typing.TypeVar("T")
+
+
+def make_new_alias(alias: Any) -> Any:
+    """Replicate the logic to produce a typing._GenericAlias from a types.GenericAlias"""
+    generic_alias = typing._GenericAlias  # type: ignore[attr-defined]
+    return generic_alias(alias.__origin__, alias.__origin__.__parameters__)[alias.__args__]
+
+
+class TestGenericStruct:
+    def test_generic_struct_info_cached(self, proto: ModuleType) -> None:
+        class Ex(Struct, typing.Generic[T]):
+            x: T
+
+        typ: Any = Ex[int]
+        assert Ex[int] is typ
+
+        dec = proto.Decoder(typ)
+        info = typ.__rune_cache__
+        assert info is not None
+        assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+        dec2 = proto.Decoder(typ)
+        assert typ.__rune_cache__ is info
+        assert sys.getrefcount(info) <= 5
+
+        del dec
+        del dec2
+        assert sys.getrefcount(info) <= 3
+
+    def test_generic_struct_invalid_types_not_cached(self, proto: ModuleType) -> None:
+        class Ex(Struct, typing.Generic[T]):
+            x: list[T] | tuple[float]
+
+        candidates: list[Any] = [Ex, Ex[int]]
+        for typ in candidates:
+            for _ in range(2):
+                with pytest.raises(TypeError, match="not supported"):
+                    proto.Decoder(typ)
+
+            assert not hasattr(typ, "__rune_cache__")
+
+    def test_rune_cache_overwritten(self, proto: ModuleType) -> None:
+        class Ex(Struct, typing.Generic[T]):
+            x: T
+
+        typ: Any = Ex[int]
+        typ.__rune_cache__ = 1
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            proto.Decoder(typ)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_generic_struct(self, proto: ModuleType, array_like: bool) -> None:
+        class Ex(Struct, typing.Generic[T], array_like=array_like):
+            x: T
+            y: list[T]
+
+        sol = Ex(1, [1, 2])
+        msg = proto.encode(sol)
+
+        res = proto.decode(msg, type=Ex)
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int | str])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[float])
+        assert type(res.x) is float
+
+        with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+            proto.decode(msg, type=Ex[str])
+
+    @py312_plus
+    def test_generic_with_typevar_syntax(self, proto: ModuleType) -> None:
+        source = """
+        from rune import Struct
+        class Ex[T](Struct):
+            x: T
+            y: list[T]
+        """
+
+        with temp_module(source) as mod:
+            sol = mod.Ex(1, [1, 2])
+            msg = proto.encode(sol)
+
+            res = proto.decode(msg, type=mod.Ex)
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[int])
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[typing.Union[int, str]])  # noqa
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[int | str])
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[float])
+            assert type(res.x) is float
+
+            with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+                proto.decode(msg, type=mod.Ex[str])
+
+    @pytest.mark.parametrize(
+        "optional_union",
+        [
+            pytest.param("Ex[T] | None", id="native-union"),
+            pytest.param("Optional[Ex[T]]", id="typing.Optional"),
+        ],
+    )
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_recursive_generic_struct(
+        self, proto: ModuleType, array_like: bool, optional_union: str
+    ) -> None:
+        source = f"""
+        from __future__ import annotations
+        from typing import Union, Generic, TypeVar, Optional
+        from rune import Struct
+
+        T = TypeVar("T")
+
+        class Ex(Struct, Generic[T], array_like={array_like}):
+            a: T
+            b: {optional_union}
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            msg2 = mod.Ex(a=1, b=mod.Ex(a="bad", b=None))
+            assert proto.decode(proto.encode(msg), type=mod.Ex) == msg
+            assert proto.decode(proto.encode(msg2), type=mod.Ex) == msg2
+            assert proto.decode(proto.encode(msg), type=mod.Ex[int]) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                proto.decode(proto.encode(msg2), type=mod.Ex[int])
+            if array_like:
+                assert "`$[1][0]`" in str(rec.value)
+            else:
+                assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_generic_struct_union(self, proto: ModuleType, array_like: bool) -> None:
+        class Test1(Struct, typing.Generic[T], tag=True, array_like=array_like):
+            a: T | None
+            b: int
+
+        class Test2(Struct, typing.Generic[T], tag=True, array_like=array_like):
+            x: T
+            y: int
+
+        typ: Any = Test1[T] | Test2[T]
+
+        msg1 = Test1(1, 2)
+        s1 = proto.encode(msg1)
+        msg2 = Test2("three", 4)
+        s2 = proto.encode(msg2)
+        msg3 = Test1(None, 4)
+        s3 = proto.encode(msg3)
+
+        assert proto.decode(s1, type=typ) == msg1
+        assert proto.decode(s2, type=typ) == msg2
+        assert proto.decode(s3, type=typ) == msg3
+
+        assert proto.decode(s1, type=typ[int]) == msg1
+        assert proto.decode(s3, type=typ[int]) == msg3
+        assert proto.decode(s2, type=typ[str]) == msg2
+        assert proto.decode(s3, type=typ[str]) == msg3
+
+        with pytest.raises(ValidationError) as rec:
+            proto.decode(s1, type=typ[str])
+        assert "Expected `str | null`, got `int`" in str(rec.value)
+        loc = "$[1]" if array_like else "$.a"
+        assert loc in str(rec.value)
+
+        with pytest.raises(ValidationError) as rec:
+            proto.decode(s2, type=typ[int])
+        assert "Expected `int`, got `str`" in str(rec.value)
+        loc = "$[1]" if array_like else "$.x"
+        assert loc in str(rec.value)
+
+    def test_unbound_typevars_use_bound_if_set(self, proto: ModuleType) -> None:
+        T_bound: typing.TypeVar = typing.TypeVar("T", bound=int | str)
+
+        dec: Any = proto.Decoder(list[T_bound])
+        sol: list[int | str] = [1, "two", 3, "four"]
+        msg = proto.encode(sol)
+        assert dec.decode(msg) == sol
+
+        bad = proto.encode([1, {}])
+        with pytest.raises(
+            ValidationError,
+            match=r"Expected `int \| str`, got `object` - at `\$\[1\]`",
+        ):
+            dec.decode(bad)
+
+    def test_unbound_typevars_with_constraints_unsupported(self, proto: ModuleType) -> None:
+        T_constr: typing.TypeVar = typing.TypeVar("T", int, str)
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(list[T_constr])
+
+        assert "Unbound TypeVar `~T` has constraints" in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(True, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic(self, mapping_type: str, future: bool) -> None:
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            T = typing.TypeVar("T")
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Foo({mapping_type}[str, T], Struct, typing.Generic[T], metaclass=CombinedMeta):
+                data: dict[str, T]
+
+                def __getitem__(self, x):
+                    return self.data[x]
+
+                def __len__(self):
+                    return len(self.data)
+
+                def __iter__(self):
+                    return iter(self.data)
+            """
+
+        if future:
+            source = "from __future__ import annotations\n" + textwrap.dedent(source)
+
+        with temp_module(source) as mod, pytest.raises(ValidationError):
+            rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": "foo"})), type=mod.Foo[int])
+
+        rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": 1})), type=mod.Foo[int])
+
+    @pytest.mark.parametrize("leaf", ["Child1", "Child2", "Child3"])
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(True, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic_multilevel(
+        self, mapping_type: str, future: bool, leaf: str
+    ) -> None:
+        # the builtin generic must be listed *before* 'typing.Generic[T]'. With
+        # 'Generic' first its '__class_getitem__' wins, so 'Base[U]' resolves to a
+        # 'typing._GenericAlias' instead of a 'types.GenericAlias'
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            T = typing.TypeVar("T")
+            U = typing.TypeVar("U")
+            V = typing.TypeVar("V")
+            W = typing.TypeVar("W")
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Base({mapping_type}[str, T], Struct, typing.Generic[T], metaclass=CombinedMeta):
+                data: dict[str, T]
+
+                def __getitem__(self, x):
+                    return self.data[x]
+
+                def __len__(self):
+                    return len(self.data)
+
+                def __iter__(self):
+                    return iter(self.data)
+
+            class Child1(Base[U], typing.Generic[U]):
+                pass
+
+            class Child2(Child1[V], typing.Generic[V]):
+                pass
+
+            class Child3(Child2[W], typing.Generic[W]):
+                pass
+            """
+
+        if future:
+            source = "from __future__ import annotations\n" + textwrap.dedent(source)
+
+        with temp_module(source) as mod:
+            typ = getattr(mod, leaf)[int]
+            rune.json.decode(b'{"data": {"x": 1}}', type=typ)
+            with pytest.raises(ValidationError):
+                rune.json.decode(b'{"data": {"x": "not_an_int"}}', type=typ)
+
+    @pytest.mark.parametrize("leaf", ["Child1", "Child2", "Child3"])
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_multilevel_typevar_syntax(
+        self, mapping_type: str, leaf: str
+    ) -> None:
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Base[T]({mapping_type}[str, T], Struct, metaclass=CombinedMeta):
+                data: dict[str, T]
+
+                def __getitem__(self, x):
+                    return self.data[x]
+
+                def __len__(self):
+                    return len(self.data)
+
+                def __iter__(self):
+                    return iter(self.data)
+
+            class Child1[U](Base[U]):
+                pass
+
+            class Child2[V](Child1[V]):
+                pass
+
+            class Child3[W](Child2[W]):
+                pass
+            """
+
+        with temp_module(source) as mod:
+            typ = getattr(mod, leaf)[int]
+            rune.json.decode(b'{"data": {"x": 1}}', type=typ)
+            with pytest.raises(ValidationError):
+                rune.json.decode(b'{"data": {"x": "not_an_int"}}', type=typ)
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(False, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_typevar_syntax(
+        self, mapping_type: str, future: bool
+    ) -> None:
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Foo[T]({mapping_type}[str, T], Struct, metaclass=CombinedMeta):
+                data: dict[str, T]
+
+                def __getitem__(self, x):
+                    return self.data[x]
+
+                def __len__(self):
+                    return len(self.data)
+
+                def __iter__(self):
+                    return iter(self.data)
+            """
+
+        if future:
+            source = "from __future__ import annotations\n" + source
+
+        with temp_module(source) as mod, pytest.raises(ValidationError):
+            rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": "foo"})), type=mod.Foo[int])
+
+        rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": 1})), type=mod.Foo[int])
+
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_typevar_syntax_info_cached(self, mapping_type: str) -> None:
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Foo[T]({mapping_type}[str, T], Struct, metaclass=CombinedMeta):
+                data: dict[str, T]
+
+                def __getitem__(self, x):
+                    return self.data[x]
+
+                def __len__(self):
+                    return len(self.data)
+
+                def __iter__(self):
+                    return iter(self.data)
+            """
+
+        with temp_module(source) as mod:
+            typ = mod.Foo[int]
+            dec = rune.json.Decoder(typ)
+            info = make_new_alias(typ).__rune_cache__
+            gc.collect()
+            assert info is not None
+            assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+            dec2 = rune.json.Decoder(typ)
+            gc.collect()
+            assert make_new_alias(typ).__rune_cache__ is info
+            assert sys.getrefcount(info) <= 5
+
+            del dec
+            del dec2
+            gc.collect()
+            assert sys.getrefcount(info) <= 3
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(True, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic_multiple_typevars(
+        self, mapping_type: str, future: bool
+    ) -> None:
+        # struct inheriting a builtin generic with *two* type vars. 'Pair[int, str]'
+        # is a 'types.GenericAlias' carrying two args; the conversion must subscript
+        # the rebuilt alias with the args *tuple* (not spread the args), otherwise
+        # generics with more than one type var raise a 'TypeError'
+        source = f"""
+            from rune import Struct, StructMeta
+            import collections
+            import abc
+            import typing
+
+            K = typing.TypeVar("K")
+            V = typing.TypeVar("V")
+
+            class CombinedMeta(StructMeta, abc.ABCMeta):
+                pass
+
+            class Pair({mapping_type}[K, V], Struct, typing.Generic[K, V], metaclass=CombinedMeta):
+                key: K
+                val: V
+
+                def __getitem__(self, x):
+                    return getattr(self, x)
+
+                def __len__(self):
+                    return 2
+
+                def __iter__(self):
+                    return iter(("key", "val"))
+            """
+
+        if future:
+            source = "from __future__ import annotations\n" + textwrap.dedent(source)
+
+        with temp_module(source) as mod:
+            typ = mod.Pair[int, str]
+            assert type(typ) is types.GenericAlias
+            assert rune.json.decode(b'{"key": 1, "val": "a"}', type=typ) == mod.Pair(1, "a")
+            with pytest.raises(ValidationError, match="Expected `int`"):
+                rune.json.decode(b'{"key": "x", "val": "a"}', type=typ)
+            with pytest.raises(ValidationError, match="Expected `str`"):
+                rune.json.decode(b'{"key": 1, "val": 2}', type=typ)
+
+            # the 'types.GenericAlias' must also be normalised when nested inside a
+            # union (collected via recursion) or a container (collected as its own
+            # node), not just at the top level
+            msg = b'{"key": 1, "val": "a"}'
+            assert rune.json.decode(msg, type=typing.Optional[typ]) == mod.Pair(1, "a")  # noqa
+            assert rune.json.decode(b"[" + msg + b"]", type=list[typ]) == [mod.Pair(1, "a")]
+
+    def test_manual_types_generic_alias_robustness(self) -> None:
+        # 'types.GenericAlias' instances can be built manually around arbitrary
+        # origins (e.g. 'types.GenericAlias(...)' or a C-level 'Py_GenericAlias'),
+        # not just via ordinary subscription. Feeding such aliases to rune used to
+        # segfault when the origin wasn't a regularly-parametrised generic; ensure
+        # they now either decode or raise a clean Python error.
+        class GenericStruct(Struct, typing.Generic[T]):
+            x: T
+
+        class PlainStruct(Struct):
+            x: int
+
+        # well-formed manual alias behaves exactly like the native subscription
+        alias: Any = types.GenericAlias(GenericStruct, (int,))
+        assert rune.json.decode(b'{"x": 1}', type=alias) == GenericStruct(1)
+        with pytest.raises(ValidationError, match="Expected `int`"):
+            rune.json.decode(b'{"x": "bad"}', type=alias)
+
+        # parametrising a non-generic type is meaningless
+        with pytest.raises(TypeError, match="not a generic type"):
+            rune.json.Decoder(types.GenericAlias(PlainStruct, (int,)))
+
+        # too many
+        with pytest.raises(TypeError):
+            rune.json.Decoder(types.GenericAlias(GenericStruct, (int, str)))

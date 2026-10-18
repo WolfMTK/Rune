@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Token<'a> {
     Null,
@@ -20,7 +22,7 @@ pub enum Value {
     Float(f64),
     Str(String),
     Array(Vec<Value>),
-    Map(Vec<(String, Value)>),
+    Map(Vec<(Rc<str>, Value)>),
 }
 
 impl Value {
@@ -35,18 +37,4 @@ impl Value {
             Value::Map(_) => "dict",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    IntEnum,
-    StrEnum,
-    IntPlain,
-    StrPlain,
-    StrStrict,
-    Dict,
-    Array,
-    Deque,
-    Custom,
-    Other,
 }

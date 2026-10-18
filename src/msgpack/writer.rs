@@ -10,10 +10,6 @@ impl MsgpackWriter {
         }
     }
 
-    pub fn finish(self) -> Vec<u8> {
-        self.out
-    }
-
     #[inline]
     fn write_tagged(&mut self, tag: u8, payload: &[u8]) {
         self.out.push(tag);
@@ -101,6 +97,10 @@ impl Writer for MsgpackWriter {
             Token::MapStart(len) => self.write_container_header(len, 0x80, 0xde, 0xdf),
             Token::End => {}
         }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.out
     }
 }
 

@@ -4,8 +4,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import pytest
+
 PY312 = sys.version_info[:2] >= (3, 12)
 PY311 = sys.version_info[:2] >= (3, 11)
+
+py315_or_later_only = pytest.mark.skipif(
+    sys.version_info < (3, 15), reason="frozendict was added in 3.15"
+)
 
 
 @contextmanager

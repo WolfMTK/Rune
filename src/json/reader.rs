@@ -22,14 +22,26 @@ impl Parser<'_> {
         ParseError::new(format!("{msg} at byte {}", self.pos))
     }
 
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
     fn skip_whitespace(&mut self) {
-        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.src.get(self.pos) {
+        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.peek() {
             self.pos += 1;
         }
     }
 
+    fn expect_byte(&mut self, expected: u8, msg: &str) -> Result<(), ParseError> {
+        if self.peek() != Some(expected) {
+            return Err(self.error_at_pos(msg));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
     fn parse_value(&mut self) -> Result<Value, ParseError> {
-        match self.src.get(self.pos).copied() {
+        match self.peek() {
             None => Err(self.error_at_pos("Unexpected end of input")),
             Some(b'n') => self.parse_literal("null", Value::Null),
             Some(b't') => self.parse_literal("true", Value::Bool(true)),
@@ -43,12 +55,11 @@ impl Parser<'_> {
     }
 
     fn parse_literal(&mut self, word: &str, value: Value) -> Result<Value, ParseError> {
-        if self.src[self.pos..].starts_with(word.as_bytes()) {
-            self.pos += word.len();
-            Ok(value)
-        } else {
-            Err(self.error_at_pos("Invalid literal"))
+        if !self.src[self.pos..].starts_with(word.as_bytes()) {
+            return Err(self.error_at_pos("Invalid literal"));
         }
+        self.pos += word.len();
+        Ok(value)
     }
 
     fn increase_depth(&mut self) -> Result<(), ParseError> {
@@ -63,113 +74,95 @@ impl Parser<'_> {
     }
 
     fn parse_array(&mut self) -> Result<Value, ParseError> {
-        self.increase_depth()?;
-        self.pos += 1;
         let mut items = Vec::new();
-        self.skip_whitespace();
-        if self.src.get(self.pos) == Some(&b']') {
-            self.pos += 1;
-        } else {
-            loop {
-                self.skip_whitespace();
-                items.push(self.parse_value()?);
-                self.skip_whitespace();
-                match self.src.get(self.pos) {
-                    Some(b',') => self.pos += 1,
-                    Some(b']') => {
-                        self.pos += 1;
-                        break;
-                    }
-                    _ => return Err(self.error_at_pos("Expected `,` or `]`")),
-                }
-            }
-        }
-        self.depth -= 1;
+        self.parse_delimited(b']', "Expected `,` or `]`", |p| {
+            items.push(p.parse_value()?);
+            Ok(())
+        })?;
         Ok(Value::Array(items))
     }
 
     fn parse_object(&mut self) -> Result<Value, ParseError> {
-        self.increase_depth()?;
-        self.pos += 1;
         let mut entries = Vec::new();
-        self.skip_whitespace();
-        if self.src.get(self.pos) == Some(&b'}') {
-            self.pos += 1;
-        } else {
-            loop {
-                self.skip_whitespace();
-                if self.src.get(self.pos) != Some(&b'"') {
-                    return Err(self.error_at_pos("Expected a string key"));
-                }
-                let key = self.parse_string()?;
-                self.skip_whitespace();
-                if self.src.get(self.pos) != Some(&b':') {
-                    return Err(self.error_at_pos("Expected `:`"));
-                }
-                self.pos += 1;
-                self.skip_whitespace();
-                let value = self.parse_value()?;
-                entries.push((key, value));
-                self.skip_whitespace();
-                match self.src.get(self.pos) {
-                    Some(b',') => self.pos += 1,
-                    Some(b'}') => {
-                        self.pos += 1;
-                        break;
-                    }
-                    _ => return Err(self.error_at_pos("Expected `,` or `}`")),
-                }
-            }
-        }
-        self.depth -= 1;
+        self.parse_delimited(b'}', "Expected `,` or `}`", |p| {
+            let key = p.parse_object_key()?;
+            let value = p.parse_value()?;
+            entries.push((key, value));
+            Ok(())
+        })?;
         Ok(Value::Map(entries))
     }
 
-    fn parse_number(&mut self) -> Result<Value, ParseError> {
-        let text = self.text;
-        let start = self.pos;
-        if self.src[self.pos] == b'-' {
+    fn parse_object_key(&mut self) -> Result<String, ParseError> {
+        if self.peek() != Some(b'"') {
+            return Err(self.error_at_pos("Expected a string key"));
+        }
+        let key = self.parse_string()?;
+        self.skip_whitespace();
+        self.expect_byte(b':', "Expected `:`")?;
+        self.skip_whitespace();
+        Ok(key)
+    }
+
+    fn parse_delimited(
+        &mut self,
+        close: u8,
+        separator_error: &str,
+        mut parse_item: impl FnMut(&mut Self) -> Result<(), ParseError>,
+    ) -> Result<(), ParseError> {
+        self.increase_depth()?;
+        self.pos += 1;
+        self.skip_whitespace();
+        if self.peek() == Some(close) {
             self.pos += 1;
+            self.depth -= 1;
+            return Ok(());
         }
-        let digits = self.pos;
-        while let Some(b'0'..=b'9') = self.src.get(self.pos) {
-            self.pos += 1;
-        }
-        if self.pos == digits {
-            return Err(self.error_at_pos("Invalid number"));
-        }
-        if self.src[digits] == b'0' && self.pos - digits > 1 {
-            return Err(self.error_at_pos("Invalid number"));
-        }
-        let mut is_float = false;
-        if let Some(b'.') = self.src.get(self.pos) {
-            is_float = true;
-            self.pos += 1;
-            self.consume_digits()?;
-        }
-        if let Some(b'e' | b'E') = self.src.get(self.pos) {
-            is_float = true;
-            self.pos += 1;
-            if let Some(b'+' | b'-') = self.src.get(self.pos) {
-                self.pos += 1;
+        loop {
+            self.skip_whitespace();
+            parse_item(self)?;
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b) if b == close => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return Err(self.error_at_pos(separator_error)),
             }
-            self.consume_digits()?;
         }
-        if is_float {
-            return text[start..self.pos]
+        self.depth -= 1;
+        Ok(())
+    }
+
+    fn parse_number(&mut self) -> Result<Value, ParseError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let int_start = self.pos;
+        self.consume_digits()?;
+        if self.src[int_start] == b'0' && self.pos - int_start > 1 {
+            return Err(self.error_at_pos("Invalid number"));
+        }
+        let has_fraction = self.consume_fraction()?;
+        let has_exponent = self.consume_exponent()?;
+        let literal = &self.text[start..self.pos];
+        if has_fraction || has_exponent {
+            return literal
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| self.error_at_pos("Invalid number"));
         }
-        match text[start..self.pos].parse::<i64>() {
-            Ok(v) => Ok(Value::Int(v)),
-            Err(_) => Err(self.error_at_pos("Integer is out of range")),
-        }
+        literal
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| self.error_at_pos("Integer is out of range"))
     }
 
     fn consume_digits(&mut self) -> Result<(), ParseError> {
         let start = self.pos;
-        while let Some(b'0'..=b'9') = self.src.get(self.pos) {
+        while let Some(b'0'..=b'9') = self.peek() {
             self.pos += 1;
         }
         if self.pos == start {
@@ -178,20 +171,41 @@ impl Parser<'_> {
         Ok(())
     }
 
+    fn consume_fraction(&mut self) -> Result<bool, ParseError> {
+        if self.peek() != Some(b'.') {
+            return Ok(false);
+        }
+        self.pos += 1;
+        self.consume_digits()?;
+        Ok(true)
+    }
+
+    fn consume_exponent(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peek(), Some(b'e' | b'E')) {
+            return Ok(false);
+        }
+        self.pos += 1;
+        if let Some(b'+' | b'-') = self.peek() {
+            self.pos += 1;
+        }
+        self.consume_digits()?;
+        Ok(true)
+    }
+
     fn parse_string(&mut self) -> Result<String, ParseError> {
-        let text = self.text;
         self.pos += 1;
         let mut out = String::new();
         loop {
             let start = self.pos;
-            while let Some(&b) = self.src.get(self.pos) {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
+            while let Some(b) = self.peek()
+                && b != b'"'
+                && b != b'\\'
+                && b >= 0x20
+            {
                 self.pos += 1;
             }
-            out.push_str(&text[start..self.pos]);
-            match self.src.get(self.pos) {
+            out.push_str(&self.text[start..self.pos]);
+            match self.peek() {
                 None => return Err(self.error_at_pos("Unterminated string")),
                 Some(b'"') => {
                     self.pos += 1;
@@ -199,51 +213,52 @@ impl Parser<'_> {
                 }
                 Some(b'\\') => {
                     self.pos += 1;
-                    self.parse_escape_sequence(&mut out)?;
+                    out.push(self.parse_escape_sequence()?);
                 }
                 Some(_) => return Err(self.error_at_pos("Control character in string")),
             }
         }
     }
 
-    fn parse_escape_sequence(&mut self, out: &mut String) -> Result<(), ParseError> {
-        let Some(&c) = self.src.get(self.pos) else {
+    fn parse_escape_sequence(&mut self) -> Result<char, ParseError> {
+        let Some(c) = self.peek() else {
             return Err(self.error_at_pos("Unterminated string"));
         };
         self.pos += 1;
         match c {
-            b'"' => out.push('"'),
-            b'\\' => out.push('\\'),
-            b'/' => out.push('/'),
-            b'b' => out.push('\u{8}'),
-            b'f' => out.push('\u{c}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
-            b'u' => {
-                let hi = self.parse_unicode_hex()?;
-                let code = if (0xD800..0xDC00).contains(&hi) {
-                    if !self.src[self.pos..].starts_with(b"\\u") {
-                        return Err(self.error_at_pos("Lone surrogate"));
-                    }
-                    self.pos += 2;
-                    let lo = self.parse_unicode_hex()?;
-                    if !(0xDC00..0xE000).contains(&lo) {
-                        return Err(self.error_at_pos("Invalid surrogate pair"));
-                    }
-                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..0xE000).contains(&hi) {
-                    return Err(self.error_at_pos("Lone surrogate"));
-                } else {
-                    hi
-                };
-                let ch =
-                    char::from_u32(code).ok_or_else(|| self.error_at_pos("Invalid code point"))?;
-                out.push(ch);
-            }
-            _ => return Err(self.error_at_pos("Invalid escape")),
+            b'"' => Ok('"'),
+            b'\\' => Ok('\\'),
+            b'/' => Ok('/'),
+            b'b' => Ok('\u{8}'),
+            b'f' => Ok('\u{c}'),
+            b'n' => Ok('\n'),
+            b'r' => Ok('\r'),
+            b't' => Ok('\t'),
+            b'u' => self.parse_unicode_escape(),
+            _ => Err(self.error_at_pos("Invalid escape")),
         }
-        Ok(())
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<char, ParseError> {
+        let high = self.parse_unicode_hex()?;
+        let code = match high {
+            0xD800..=0xDBFF => self.parse_low_surrogate(high)?,
+            0xDC00..=0xDFFF => return Err(self.error_at_pos("Lone surrogate")),
+            _ => high,
+        };
+        char::from_u32(code).ok_or_else(|| self.error_at_pos("Invalid code point"))
+    }
+
+    fn parse_low_surrogate(&mut self, high: u32) -> Result<u32, ParseError> {
+        if !self.src[self.pos..].starts_with(b"\\u") {
+            return Err(self.error_at_pos("Lone surrogate"));
+        }
+        self.pos += 2;
+        let low = self.parse_unicode_hex()?;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return Err(self.error_at_pos("Invalid surrogate pair"));
+        }
+        Ok(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
     }
 
     fn parse_unicode_hex(&mut self) -> Result<u32, ParseError> {
@@ -251,11 +266,13 @@ impl Parser<'_> {
             .src
             .get(self.pos..self.pos + 4)
             .ok_or_else(|| self.error_at_pos("Invalid \\u escape"))?;
-        let value = std::str::from_utf8(digits)
-            .ok()
-            .filter(|s| s.bytes().all(|b| b.is_ascii_hexdigit()))
-            .and_then(|s| u32::from_str_radix(s, 16).ok())
-            .ok_or_else(|| self.error_at_pos("Invalid \\u escape"))?;
+        let mut value = 0;
+        for &b in digits {
+            let digit = (b as char)
+                .to_digit(16)
+                .ok_or_else(|| self.error_at_pos("Invalid \\u escape"))?;
+            value = value * 16 + digit;
+        }
         self.pos += 4;
         Ok(value)
     }

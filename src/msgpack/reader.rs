@@ -2,6 +2,8 @@ use crate::common::token::Value;
 use crate::exceptions::ParseError;
 use crate::msgpack::structures::Parser;
 
+const MAX_PREALLOCATED_ITEMS: usize = 1024;
+
 pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseError> {
     let mut parser = Parser {
         src: input,
@@ -13,13 +15,23 @@ pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseErro
     Ok((value, parser.pos))
 }
 
+macro_rules! read_big_endian {
+    ($($name:ident: $ty:ty),* $(,)?) => {
+        $(
+            fn $name(&mut self) -> Result<$ty, ParseError> {
+                Ok(<$ty>::from_be_bytes(self.read_fixed_bytes()?))
+            }
+        )*
+    };
+}
+
 impl<'a> Parser<'a> {
     fn error_at_pos(&self, msg: &str) -> ParseError {
         ParseError::new(format!("{msg} at byte {}", self.pos))
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
-        let src: &'a [u8] = self.src;
+        let src = self.src;
         let end = self
             .pos
             .checked_add(n)
@@ -30,97 +42,71 @@ impl<'a> Parser<'a> {
         Ok(bytes)
     }
 
-    fn read_u8(&mut self) -> Result<u8, ParseError> {
-        Ok(self.read_bytes(1)?[0])
-    }
-
     fn read_fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {
         let mut out = [0u8; N];
         out.copy_from_slice(self.read_bytes(N)?);
         Ok(out)
     }
 
-    fn read_len_u16(&mut self) -> Result<usize, ParseError> {
-        Ok(u16::from_be_bytes(self.read_fixed_bytes()?) as usize)
-    }
-
-    fn read_len_u32(&mut self) -> Result<usize, ParseError> {
-        Ok(u32::from_be_bytes(self.read_fixed_bytes()?) as usize)
+    read_big_endian! {
+        read_u8: u8,
+        read_u16: u16,
+        read_u32: u32,
+        read_u64: u64,
+        read_i8: i8,
+        read_i16: i16,
+        read_i32: i32,
+        read_i64: i64,
+        read_f32: f32,
+        read_f64: f64,
     }
 
     fn parse_value(&mut self) -> Result<Value, ParseError> {
         let tag = self.read_u8()?;
         match tag {
-            0x00..=0x7f => Ok(Value::Int(tag as i64)),
-            0x80..=0x8f => self.parse_nested(|p| p.parse_map((tag & 0x0f) as usize)),
-            0x90..=0x9f => self.parse_nested(|p| p.parse_array((tag & 0x0f) as usize)),
+            0x00..=0x7f => Ok(Value::Int(tag.into())),
+            0x80..=0x8f => self.parse_map((tag & 0x0f) as usize),
+            0x90..=0x9f => self.parse_array((tag & 0x0f) as usize),
             0xa0..=0xbf => self.parse_string((tag & 0x1f) as usize),
             0xc0 => Ok(Value::Null),
             0xc2 => Ok(Value::Bool(false)),
             0xc3 => Ok(Value::Bool(true)),
-            0xca => Ok(Value::Float(
-                f32::from_be_bytes(self.read_fixed_bytes()?) as f64
-            )),
-            0xcb => Ok(Value::Float(f64::from_be_bytes(self.read_fixed_bytes()?))),
-            0xcc => Ok(Value::Int(self.read_u8()? as i64)),
-            0xcd => Ok(Value::Int(
-                u16::from_be_bytes(self.read_fixed_bytes()?) as i64
-            )),
-            0xce => Ok(Value::Int(
-                u32::from_be_bytes(self.read_fixed_bytes()?) as i64
-            )),
+            0xca => Ok(Value::Float(self.read_f32()?.into())),
+            0xcb => Ok(Value::Float(self.read_f64()?)),
+            0xcc => Ok(Value::Int(self.read_u8()?.into())),
+            0xcd => Ok(Value::Int(self.read_u16()?.into())),
+            0xce => Ok(Value::Int(self.read_u32()?.into())),
             0xcf => {
-                let value = u64::from_be_bytes(self.read_fixed_bytes()?);
-                Ok(match i64::try_from(value) {
-                    Ok(val) => Value::Int(val),
-                    Err(_) => Value::UInt(value),
-                })
+                let value = self.read_u64()?;
+                Ok(i64::try_from(value).map_or(Value::UInt(value), Value::Int))
             }
-            0xd0 => Ok(Value::Int(self.read_u8()? as i8 as i64)),
-            0xd1 => Ok(Value::Int(
-                i16::from_be_bytes(self.read_fixed_bytes()?) as i64
-            )),
-            0xd2 => Ok(Value::Int(
-                i32::from_be_bytes(self.read_fixed_bytes()?) as i64
-            )),
-            0xd3 => Ok(Value::Int(i64::from_be_bytes(self.read_fixed_bytes()?))),
-            0xd9 => {
-                let n = self.read_u8()? as usize;
-                self.parse_string(n)
-            }
-            0xda => {
-                let n = self.read_len_u16()?;
-                self.parse_string(n)
-            }
-            0xdb => {
-                let n = self.read_len_u32()?;
-                self.parse_string(n)
-            }
-            0xdc => {
-                let n = self.read_len_u16()?;
-                self.parse_nested(|p| p.parse_array(n))
-            }
-            0xdd => {
-                let n = self.read_len_u32()?;
-                self.parse_nested(|p| p.parse_array(n))
-            }
-            0xde => {
-                let n = self.read_len_u16()?;
-                self.parse_nested(|p| p.parse_map(n))
-            }
-            0xdf => {
-                let n = self.read_len_u32()?;
-                self.parse_nested(|p| p.parse_map(n))
-            }
-            0xe0..=0xff => Ok(Value::Int(tag as i8 as i64)),
+            0xd0 => Ok(Value::Int(self.read_i8()?.into())),
+            0xd1 => Ok(Value::Int(self.read_i16()?.into())),
+            0xd2 => Ok(Value::Int(self.read_i32()?.into())),
+            0xd3 => Ok(Value::Int(self.read_i64()?)),
+            0xd9 => self
+                .read_u8()
+                .and_then(|len| self.parse_string(len as usize)),
+            0xda => self
+                .read_u16()
+                .and_then(|len| self.parse_string(len as usize)),
+            0xdb => self
+                .read_u32()
+                .and_then(|len| self.parse_string(len as usize)),
+            0xdc => self
+                .read_u16()
+                .and_then(|len| self.parse_array(len as usize)),
+            0xdd => self
+                .read_u32()
+                .and_then(|len| self.parse_array(len as usize)),
+            0xde => self.read_u16().and_then(|len| self.parse_map(len as usize)),
+            0xdf => self.read_u32().and_then(|len| self.parse_map(len as usize)),
+            0xe0..=0xff => Ok(Value::Int((tag as i8).into())),
             other => Err(self.error_at_pos(&format!("Unsupported MessagePack type 0x{other:02x}"))),
         }
     }
 
-    fn parse_nested(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<Value, ParseError>,
-    ) -> Result<Value, ParseError> {
+    fn increase_depth(&mut self) -> Result<(), ParseError> {
         self.depth += 1;
         if self.depth > self.max_depth {
             return Err(ParseError::recursion_limit(format!(
@@ -128,36 +114,36 @@ impl<'a> Parser<'a> {
                 self.pos
             )));
         }
-        let value = f(self)?;
-        self.depth -= 1;
-        Ok(value)
+        Ok(())
     }
 
-    fn parse_string(&mut self, n: usize) -> Result<Value, ParseError> {
-        let bytes = self.read_bytes(n)?;
-        match std::str::from_utf8(bytes) {
-            Ok(s) => Ok(Value::Str(s.to_owned())),
-            Err(_) => Err(self.error_at_pos("Invalid UTF-8 in string")),
-        }
+    fn parse_string(&mut self, len: usize) -> Result<Value, ParseError> {
+        let bytes = self.read_bytes(len)?;
+        let s =
+            std::str::from_utf8(bytes).map_err(|_| self.error_at_pos("Invalid UTF-8 in string"))?;
+        Ok(Value::Str(s.to_owned()))
     }
 
-    fn parse_array(&mut self, n: usize) -> Result<Value, ParseError> {
-        let mut items = Vec::with_capacity(n.min(1024));
-        for _ in 0..n {
+    fn parse_array(&mut self, len: usize) -> Result<Value, ParseError> {
+        self.increase_depth()?;
+        let mut items = Vec::with_capacity(len.min(MAX_PREALLOCATED_ITEMS));
+        for _ in 0..len {
             items.push(self.parse_value()?);
         }
+        self.depth -= 1;
         Ok(Value::Array(items))
     }
 
-    fn parse_map(&mut self, n: usize) -> Result<Value, ParseError> {
-        let mut entries = Vec::with_capacity(n.min(1024));
-        for _ in 0..n {
-            let key = match self.parse_value()? {
-                Value::Str(key) => key,
-                _ => return Err(self.error_at_pos("Only str keys are supported")),
+    fn parse_map(&mut self, len: usize) -> Result<Value, ParseError> {
+        self.increase_depth()?;
+        let mut entries = Vec::with_capacity(len.min(MAX_PREALLOCATED_ITEMS));
+        for _ in 0..len {
+            let Value::Str(key) = self.parse_value()? else {
+                return Err(self.error_at_pos("Only str keys are supported"));
             };
             entries.push((key, self.parse_value()?));
         }
+        self.depth -= 1;
         Ok(Value::Map(entries))
     }
 }

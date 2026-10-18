@@ -4,11 +4,30 @@ from typing import Any, ClassVar
 
 class Struct:
     __struct_fields__: ClassVar[tuple[tuple[str, Any], ...]] = ()
+    __struct_array_like__: ClassVar[bool] = False
+    __struct_tag__: ClassVar[str | int | None] = None
+    __struct_tag_field__: ClassVar[str] = "type"
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
+    def __init_subclass__(
+        cls,
+        tag: str | int | bool | None = None,
+        tag_field: str = "type",
+        array_like: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init_subclass__(**kwargs)
         hints = inspect.get_annotations(cls, eval_str=True)
         cls.__struct_fields__ = tuple(hints.items())
+        cls.__struct_array_like__ = array_like
+        cls.__struct_tag_field__ = tag_field
+        if tag is True:
+            cls.__struct_tag__ = cls.__name__
+        elif tag is None or tag is False:
+            cls.__struct_tag__ = None
+        elif isinstance(tag, (str, int)):
+            cls.__struct_tag__ = tag
+        else:
+            raise TypeError(f"Struct tag must be a str, an int, True or False, got {tag!r}")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         fields = self.__struct_fields__

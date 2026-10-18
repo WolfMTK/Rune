@@ -4,7 +4,7 @@ use crate::constants::INITIAL_CAPACITY;
 use crate::msgpack::structures::MsgpackWriter;
 
 impl MsgpackWriter {
-    pub fn new() -> MsgpackWriter {
+    pub fn new() -> Self {
         Self {
             out: Vec::with_capacity(INITIAL_CAPACITY),
         }
@@ -15,38 +15,41 @@ impl MsgpackWriter {
     }
 
     #[inline]
-    fn write_int(&mut self, value: i64) {
-        if value >= 0 {
-            let val_u = value as u64;
-            if val_u <= 0x7f {
-                self.out.push(val_u as u8);
-            } else if val_u <= u8::MAX as u64 {
-                self.out.push(0xcc);
-                self.out.push(val_u as u8);
-            } else if val_u <= u16::MAX as u64 {
-                self.out.push(0xcd);
-                self.out.extend_from_slice(&(val_u as u16).to_be_bytes());
-            } else if val_u <= u32::MAX as u64 {
-                self.out.push(0xce);
-                self.out.extend_from_slice(&(val_u as u32).to_be_bytes());
-            } else {
-                self.out.push(0xcf);
-                self.out.extend_from_slice(&val_u.to_be_bytes());
-            }
-        } else if value >= -32 {
+    fn write_tagged(&mut self, tag: u8, payload: &[u8]) {
+        self.out.push(tag);
+        self.out.extend_from_slice(payload);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        if let Ok(unsigned) = u64::try_from(value) {
+            return self.write_u64(unsigned);
+        }
+        if value >= -32 {
             self.out.push(value as i8 as u8);
-        } else if value >= i8::MIN as i64 {
-            self.out.push(0xd0);
-            self.out.push(value as i8 as u8);
-        } else if value >= i16::MIN as i64 {
-            self.out.push(0xd1);
-            self.out.extend_from_slice(&(value as i16).to_be_bytes());
-        } else if value >= i32::MIN as i64 {
-            self.out.push(0xd2);
-            self.out.extend_from_slice(&(value as i32).to_be_bytes());
+        } else if let Ok(v) = i8::try_from(value) {
+            self.write_tagged(0xd0, &v.to_be_bytes());
+        } else if let Ok(v) = i16::try_from(value) {
+            self.write_tagged(0xd1, &v.to_be_bytes());
+        } else if let Ok(v) = i32::try_from(value) {
+            self.write_tagged(0xd2, &v.to_be_bytes());
         } else {
-            self.out.push(0xd3);
-            self.out.extend_from_slice(&value.to_be_bytes());
+            self.write_tagged(0xd3, &value.to_be_bytes());
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        if value <= 0x7f {
+            self.out.push(value as u8);
+        } else if let Ok(v) = u8::try_from(value) {
+            self.write_tagged(0xcc, &[v]);
+        } else if let Ok(v) = u16::try_from(value) {
+            self.write_tagged(0xcd, &v.to_be_bytes());
+        } else if let Ok(v) = u32::try_from(value) {
+            self.write_tagged(0xce, &v.to_be_bytes());
+        } else {
+            self.write_tagged(0xcf, &value.to_be_bytes());
         }
     }
 
@@ -55,42 +58,24 @@ impl MsgpackWriter {
         let len = s.len();
         if len <= 31 {
             self.out.push(0xa0 | len as u8);
-        } else if len <= u8::MAX as usize {
-            self.out.push(0xd9);
-            self.out.push(len as u8);
-        } else if len <= u16::MAX as usize {
-            self.out.push(0xda);
-            self.out.extend_from_slice(&(len as u16).to_be_bytes());
+        } else if let Ok(v) = u8::try_from(len) {
+            self.write_tagged(0xd9, &[v]);
+        } else if let Ok(v) = u16::try_from(len) {
+            self.write_tagged(0xda, &v.to_be_bytes());
         } else {
-            self.out.push(0xdb);
-            self.out.extend_from_slice(&(len as u32).to_be_bytes());
+            self.write_tagged(0xdb, &(len as u32).to_be_bytes());
         }
         self.out.extend_from_slice(s.as_bytes());
     }
 
     #[inline]
-    fn write_array_header(&mut self, len: usize) {
+    fn write_container_header(&mut self, len: usize, fix_tag: u8, tag16: u8, tag32: u8) {
         if len <= 15 {
-            self.out.push(0x90 | len as u8);
-        } else if len <= u16::MAX as usize {
-            self.out.push(0xdc);
-            self.out.extend_from_slice(&(len as u16).to_be_bytes());
+            self.out.push(fix_tag | len as u8);
+        } else if let Ok(v) = u16::try_from(len) {
+            self.write_tagged(tag16, &v.to_be_bytes());
         } else {
-            self.out.push(0xdd);
-            self.out.extend_from_slice(&(len as u32).to_be_bytes());
-        }
-    }
-
-    #[inline]
-    fn write_map_header(&mut self, len: usize) {
-        if len <= 15 {
-            self.out.push(0x80 | len as u8);
-        } else if len <= u16::MAX as usize {
-            self.out.push(0xde);
-            self.out.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            self.out.push(0xdf);
-            self.out.extend_from_slice(&(len as u32).to_be_bytes());
+            self.write_tagged(tag32, &(len as u32).to_be_bytes());
         }
     }
 }
@@ -108,18 +93,12 @@ impl Writer for MsgpackWriter {
             Token::Null => self.out.push(0xc0),
             Token::Bool(false) => self.out.push(0xc2),
             Token::Bool(true) => self.out.push(0xc3),
-            Token::Int(v) => self.write_int(v),
-            Token::UInt(v) => {
-                self.out.push(0xcf);
-                self.out.extend_from_slice(&v.to_be_bytes());
-            }
-            Token::Float(v) => {
-                self.out.push(0xcb);
-                self.out.extend_from_slice(&v.to_be_bytes());
-            }
+            Token::Int(value) => self.write_i64(value),
+            Token::UInt(value) => self.write_tagged(0xcf, &value.to_be_bytes()),
+            Token::Float(value) => self.write_tagged(0xcb, &value.to_be_bytes()),
             Token::Str(s) => self.write_str(s),
-            Token::ArrayStart(len) => self.write_array_header(len),
-            Token::MapStart(len) => self.write_map_header(len),
+            Token::ArrayStart(len) => self.write_container_header(len, 0x90, 0xdc, 0xdd),
+            Token::MapStart(len) => self.write_container_header(len, 0x80, 0xde, 0xdf),
             Token::End => {}
         }
     }

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
-use crate::common::decode::{decode_to_py, get_enum_cache, is_enum_class, type_name};
+use crate::common::decode::{
+    decode_to_py, get_enum_cache, is_enum_class, literal_cache, type_name,
+};
 use crate::common::token::Value;
 use crate::exceptions::{DecodeError, PathElem, ValidationError, validation_error};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyListMethods};
+use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyListMethods};
 use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{Bound, IntoPyObject, PyAny, PyErr, PyResult, Python};
 
@@ -22,6 +24,7 @@ pub struct Converter<'py> {
     pub(crate) str_type: Bound<'py, PyAny>,
     pub(crate) union: Bound<'py, PyAny>,
     pub(crate) union_type: Bound<'py, PyAny>,
+    pub(crate) literal: Bound<'py, PyAny>,
     pub(crate) list_type: Bound<'py, PyAny>,
     pub(crate) set_type: Bound<'py, PyAny>,
     pub(crate) frozenset_type: Bound<'py, PyAny>,
@@ -50,6 +53,7 @@ impl<'py> Converter<'py> {
             str_type: py.get_type::<PyString>().into_any(),
             union: typing.getattr("Union")?,
             union_type: types.getattr("UnionType")?,
+            literal: typing.getattr("Literal")?,
             list_type: py.get_type::<PyList>().into_any(),
             set_type: py.get_type::<PySet>().into_any(),
             frozenset_type: py.get_type::<PyFrozenSet>().into_any(),
@@ -95,6 +99,11 @@ impl<'py> Converter<'py> {
             && (origin.is(&self.union) || origin.is(&self.union_type))
         {
             return self.convert_union(value, ty);
+        }
+        if let Some(origin) = &origin
+            && origin.is(&self.literal)
+        {
+            return self.convert_literal(value, ty);
         }
 
         let base = origin.unwrap_or_else(|| ty.clone());
@@ -238,6 +247,44 @@ impl<'py> Converter<'py> {
         Ok(args.get(index).cloned().unwrap_or_else(|| self.any.clone()))
     }
 
+    fn convert_literal(
+        &mut self,
+        value: &Value,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args = self.type_args(ty)?;
+        let cache = literal_cache(self.py, ty, &args)?;
+        match self.literal_lookup(value, &cache)? {
+            Some(found) => Ok(found),
+            None => Err(self.literal_error(value)?),
+        }
+    }
+
+    fn literal_lookup(
+        &self,
+        value: &Value,
+        cache: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let py = self.py;
+        let typ = match value {
+            Value::Null => &self.none_type,
+            Value::Bool(_) => &self.bool_type,
+            Value::Int(_) => &self.int_type,
+            Value::Str(_) => &self.str_type,
+            _ => return Ok(None),
+        };
+        let key = (typ.clone(), decode_to_py(py, value)?).into_pyobject(py)?;
+        cache.cast::<PyDict>()?.get_item(key)
+    }
+
+    fn literal_error(&self, value: &Value) -> PyResult<PyErr> {
+        let raw = decode_to_py(self.py, value)?;
+        Ok(validation_error(
+            format!("Invalid enum value {}", raw.repr()?),
+            &self.path,
+        ))
+    }
+
     fn convert_union(
         &mut self,
         value: &Value,
@@ -255,12 +302,26 @@ impl<'py> Converter<'py> {
         if options.len() == 1 {
             return self.convert(value, &options[0]);
         }
+        let mut only_literals = true;
         for option in &options {
+            let origin = self.type_origin(option)?;
+            if origin.is_some_and(|o| o.is(&self.literal)) {
+                let option_args = self.type_args(option)?;
+                let cache = literal_cache(py, option, &option_args)?;
+                if let Some(found) = self.literal_lookup(value, &cache)? {
+                    return Ok(found);
+                }
+                continue;
+            }
+            only_literals = false;
             match self.convert(value, option) {
                 Ok(v) => return Ok(v),
                 Err(e) if e.is_instance_of::<ValidationError>(py) => continue,
                 Err(e) => return Err(e),
             }
+        }
+        if only_literals {
+            return Err(self.literal_error(value)?);
         }
         Err(self.type_mismatch_error("union", value.py_type_name()))
     }

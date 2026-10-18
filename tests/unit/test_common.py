@@ -2,11 +2,13 @@ import base64
 import enum
 import gc
 import sys
+import types
+import typing
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from rune.struct import Struct
@@ -742,3 +744,166 @@ class TestEnum:
             roundtrip("error")
         with pytest.raises(ValidationError, match="Invalid enum value 'other'"):
             roundtrip("other")
+
+
+class TestLiterals:
+    def test_empty_errors(self) -> None:
+        with pytest.raises(TypeError, match="Literal types must have at least one item"):
+            rune.msgpack.Decoder(Literal[()])
+
+    def test_native_literal_generic_alias(self) -> None:
+        typ = Literal[1, 2]
+        assert type(typ) is typing._LiteralGenericAlias  # type: ignore[attr-defined]
+        dec: rune.json.Decoder[Any] = rune.json.Decoder(typ)
+        info = typ.__rune_cache__  # type: ignore[attr-defined]
+        assert info is not None
+        # a second decoder reuses the info cached on the alias itself
+        dec2: rune.json.Decoder[Any] = rune.json.Decoder(typ)
+        assert typ.__rune_cache__ is info  # type: ignore[attr-defined]
+        assert dec.decode(b"2") == 2
+        assert dec2.decode(b"1") == 1
+        with pytest.raises(ValidationError):
+            dec.decode(b"3")
+
+    def test_types_generic_alias_literal(self) -> None:
+        typ = types.GenericAlias(typing.Literal, (1, 2))  # type: ignore[arg-type]
+        assert type(typ) is types.GenericAlias
+        dec: rune.json.Decoder[Any] = rune.json.Decoder(typ)
+        assert dec.decode(b"1") == 1
+        assert dec.decode(b"2") == 2
+        with pytest.raises(ValidationError):
+            dec.decode(b"3")
+        # building a second decoder must not error either
+        assert rune.json.Decoder(typ).decode(b"2") == 2
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [0, 1, 2, 2**63],
+            [0, 1, 2, -(2**63) - 1],
+        ],
+    )
+    def test_int_literal_values_out_of_range(self, values: list[int]) -> None:
+        literal = Literal[tuple(values)]  # type: ignore[valid-type]
+
+        with pytest.raises(NotImplementedError):
+            rune.msgpack.Decoder(literal)
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            Literal["ok", b"bad"],
+            Literal[1, object()],
+            Literal[1, 2, list[int]],
+            Literal[1, 2, list],
+        ],
+    )
+    def test_invalid_values(self, typ: Any) -> None:
+        with pytest.raises(TypeError, match="not supported"):
+            rune.msgpack.Decoder(typ)
+
+    def test_decode_literal_int_str_and_none_uncached_and_cached(self) -> None:
+        values: tuple[int | str | None, ...] = (45987, "an_unlikely_string", None)
+        literal = Literal[values]  # type: ignore[valid-type]
+        assert not hasattr(literal, "__rune_cache__")
+        uncached = rune.msgpack.Decoder(literal)
+        assert hasattr(literal, "__rune_cache__")
+        cached = rune.msgpack.Decoder(literal)
+
+        for val in values:
+            assert uncached.decode(rune.msgpack.encode(val)) == val
+            assert cached.decode(rune.msgpack.encode(val)) == val
+
+    def test_cache_refcounts(self) -> None:
+        literal = Literal[1, 2, "three", "four"]
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(literal)  # noqa
+        cache = literal.__rune_cache__  # type: ignore[attr-defined]
+        count = sys.getrefcount(cache)
+        dec2: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(literal)
+        assert sys.getrefcount(cache) == count
+        del dec2
+        gc.collect()
+        assert sys.getrefcount(cache) == count
+
+    @pytest.mark.parametrize("val", [None, (), (1,), (1, 2), (1, 2, 3)])
+    def test_msgspec_cache_overwritten(self, val: object) -> None:
+        literal = Literal["a", "highly", "improbable", "set", "of", "strings"]
+
+        literal.__rune_cache__ = val  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            rune.msgpack.Decoder(literal)
+
+    def test_multiple_literals(self) -> None:
+        integers = Literal[-1, -2, -3]
+        strings = Literal["apple", "banana"]
+        both = integers | strings
+
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(both)
+
+        assert not hasattr(both, "__rune_cache__")
+
+        for val in [-1, -2, -3, "apple", "banana"]:
+            assert dec.decode(rune.msgpack.encode(val)) == val
+
+        with pytest.raises(ValidationError, match="Invalid enum value 4"):
+            dec.decode(rune.msgpack.encode(4))
+
+        with pytest.raises(ValidationError, match="Invalid enum value 'carrot'"):
+            dec.decode(rune.msgpack.encode("carrot"))
+
+    def test_nested_literals(self) -> None:
+        integers = Literal[-1, -2, -3]
+        strings = Literal["apple", "banana"]
+        both = Literal[integers, strings]
+
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(both)
+
+        assert hasattr(both, "__rune_cache__")
+
+        for val in [-1, -2, -3, "apple", "banana"]:
+            assert dec.decode(rune.msgpack.encode(val)) == val
+
+        with pytest.raises(ValidationError, match="Invalid enum value 4"):
+            dec.decode(rune.msgpack.encode(4))
+
+        with pytest.raises(ValidationError, match="Invalid enum value 'carrot'"):
+            dec.decode(rune.msgpack.encode("carrot"))
+
+    @pytest.mark.parametrize(
+        "typ, good, bad",
+        [
+            (Literal[True], [True], [False]),
+            (Literal[False], [False], [True]),
+            (Literal[True, False], [True, False], []),
+            (Literal[1, False], [1, False], [True]),
+            (Literal[True, "yes", None], [True, "yes", None], [False]),
+        ],
+    )
+    def test_literal_bool(self, typ: Any, good: list[Any], bad: list[Any]) -> None:
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(typ)
+        for val in good:
+            assert dec.decode(rune.msgpack.encode(val)) == val
+        for val in bad:
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(val))
+
+    def test_literal_bool_error_message(self) -> None:
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Literal[True])
+        with pytest.raises(ValidationError, match="Invalid enum value False"):
+            dec.decode(rune.msgpack.encode(False))
+
+    def test_mix_bool_and_bool_literal(self) -> None:
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Literal[True] | bool)
+        assert dec.decode(rune.msgpack.encode(True)) is True
+        assert dec.decode(rune.msgpack.encode(False)) is False
+
+    def test_mix_int_and_int_literal(self) -> None:
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Literal[-1, 1] | int)
+        for x in [-1, 1, 10]:
+            assert dec.decode(rune.msgpack.encode(x)) == x
+
+    def test_mix_str_and_str_literal(self) -> None:
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Literal["a", "b"] | str)
+        for x in ["a", "b", "c"]:
+            assert dec.decode(rune.msgpack.encode(x)) == x

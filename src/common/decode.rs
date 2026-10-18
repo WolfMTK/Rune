@@ -121,6 +121,54 @@ pub(crate) fn get_enum_cache<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py,
     Ok(cache.into_any())
 }
 
+pub(crate) fn is_literal_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let typing = ty.py().import("typing")?;
+    let origin = typing.getattr("get_origin")?.call1((ty,))?;
+    Ok(origin.is(&typing.getattr("Literal")?))
+}
+
+pub(crate) fn literal_cache<'py>(
+    py: Python<'py>,
+    ty: &Bound<'py, PyAny>,
+    args: &[Bound<'py, PyAny>],
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(cache) = ty.getattr("__rune_cache__") {
+        if cache.is_instance_of::<PyDict>() {
+            return Ok(cache);
+        }
+        return Err(PyRuntimeError::new_err(
+            "Literal attribute `__rune_cache__` was overwritten by another value",
+        ));
+    }
+    if args.is_empty() {
+        return Err(PyTypeError::new_err(
+            "Literal types must have at least one item",
+        ));
+    }
+    let cache = PyDict::new(py);
+    for arg in args {
+        if arg.is_exact_instance_of::<PyInt>() {
+            if arg.extract::<i64>().is_err() {
+                return Err(PyNotImplementedError::new_err(
+                    "Integer Literal values outside the 64-bit signed integer range are not supported",
+                ));
+            }
+        } else if !(arg.is_none()
+            || arg.is_exact_instance_of::<PyBool>()
+            || arg.is_exact_instance_of::<PyString>())
+        {
+            return Err(PyTypeError::new_err(format!(
+                "Literal value {} is not supported, expected an int, str, bool or None",
+                arg.repr()?
+            )));
+        }
+        let key = (arg.get_type(), arg.clone()).into_pyobject(py)?;
+        cache.set_item(key, arg)?;
+    }
+    let _ = ty.setattr("__rune_cache__", &cache);
+    Ok(cache.into_any())
+}
+
 #[derive(Debug)]
 pub struct DecoderCore {
     pub ty: Option<Py<PyAny>>,
@@ -142,6 +190,17 @@ impl DecoderCore {
             }
             check_enum_values(t)?;
             enum_cache = Some(get_enum_cache(t)?.unbind());
+        }
+        if let Some(t) = &ty
+            && is_literal_type(t)?
+        {
+            let typing = t.py().import("typing")?;
+            let args: Vec<Bound<'_, PyAny>> = typing
+                .getattr("get_args")?
+                .call1((t,))?
+                .try_iter()?
+                .collect::<PyResult<_>>()?;
+            literal_cache(t.py(), t, &args)?;
         }
         let hook = match hook {
             Some(h) if h.is_none() => None,

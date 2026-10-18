@@ -1,8 +1,10 @@
 use crate::common::decode::DecoderCore;
-use crate::common::dynamic::{Depth, serialize};
+use crate::common::dynamic::{EncodeState, serialize};
 use crate::common::recursion_limit;
 use crate::json::reader::parse;
 use crate::json::structures::JsonWriter;
+use pyo3::exceptions::PyTypeError;
+use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{PyBytes, PyType};
 use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pyfunction, pymethods};
 
@@ -13,9 +15,48 @@ pub mod writer;
 #[pyfunction]
 pub fn encode<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
     let mut writer = JsonWriter::new();
-    let mut depth = Depth::new(recursion_limit(py)?);
-    serialize(&mut writer, obj, &mut depth)?;
+    let mut ctx = EncodeState::new(recursion_limit(py)?, None);
+    serialize(&mut writer, obj, &mut ctx)?;
     Ok(PyBytes::new(py, &writer.finish()))
+}
+
+#[pyclass(name = "Encoder", module = "rune.json", frozen)]
+#[derive(Debug)]
+pub struct Encoder {
+    hook: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Encoder {
+    #[new]
+    #[pyo3(signature = (*, enc_hook = None))]
+    fn new(enc_hook: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let hook = match enc_hook {
+            Some(h) if h.is_none() => None,
+            Some(h) if !h.is_callable() => {
+                return Err(PyTypeError::new_err("enc_hook must be callable"));
+            }
+            other => other.map(|h| h.unbind()),
+        };
+        Ok(Self { hook })
+    }
+
+    #[getter]
+    fn enc_hook(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.hook.as_ref().map(|h| h.clone_ref(py))
+    }
+
+    fn encode<'py>(
+        &self,
+        py: Python<'py>,
+        obj: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut writer = JsonWriter::new();
+        let hook = self.hook.as_ref().map(|h| h.clone_ref(py));
+        let mut ctx = EncodeState::new(recursion_limit(py)?, hook);
+        serialize(&mut writer, obj, &mut ctx)?;
+        Ok(PyBytes::new(py, &writer.finish()))
+    }
 }
 
 #[pyfunction]

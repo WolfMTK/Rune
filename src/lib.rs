@@ -11,13 +11,13 @@ mod rune {
     #[pymodule]
     mod json {
         #[pymodule_export]
-        use crate::json::{Decoder, decode, encode};
+        use crate::json::{Decoder, Encoder, decode, encode};
     }
 
     #[pymodule]
     mod msgpack {
         #[pymodule_export]
-        use crate::msgpack::{Decoder, decode, encode};
+        use crate::msgpack::{Decoder, Encoder, decode, encode};
     }
 
     #[pymodule_export]

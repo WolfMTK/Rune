@@ -5,7 +5,7 @@ use crate::common::token::Value;
 use crate::exceptions::{DecodeError, PathElem, ValidationError, validation_error};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyListMethods};
-use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString};
+use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{Bound, IntoPyObject, PyAny, PyErr, PyResult, Python};
 
 pub struct Converter<'py> {
@@ -26,6 +26,8 @@ pub struct Converter<'py> {
     pub(crate) frozenset_type: Bound<'py, PyAny>,
     pub(crate) dict_type: Bound<'py, PyAny>,
     pub(crate) deque_type: Bound<'py, PyAny>,
+    pub(crate) tuple_type: Bound<'py, PyAny>,
+    pub(crate) ellipsis: Bound<'py, PyAny>,
 }
 
 impl<'py> Converter<'py> {
@@ -51,6 +53,8 @@ impl<'py> Converter<'py> {
             frozenset_type: py.get_type::<PyFrozenSet>().into_any(),
             dict_type: py.get_type::<PyDict>().into_any(),
             deque_type: collections.getattr("deque")?,
+            tuple_type: py.get_type::<PyTuple>().into_any(),
+            ellipsis: py.Ellipsis().into_bound(py),
         })
     }
 
@@ -90,12 +94,60 @@ impl<'py> Converter<'py> {
             return self.convert_sequence(value, ty, &base);
         } else if base.is(&self.dict_type) {
             return self.convert_dict(value, ty, &base);
+        } else if base.is(&self.tuple_type) {
+            return self.convert_tuple(value, ty);
         } else if base.is(&self.deque_type) && self.hook.is_none() {
             return self.convert_sequence(value, ty, &base);
         } else if ty.hasattr("__struct_fields__")? {
             return self.convert_struct(value, ty);
         }
         self.convert_with_hook(value, ty, &base)
+    }
+
+    fn convert_tuple(
+        &mut self,
+        value: &Value,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        let Value::Array(items) = value else {
+            return Err(self.type_mismatch_error("tuple", value.py_type_name()));
+        };
+        let args = if ty.is(&self.tuple_type) {
+            Vec::new()
+        } else {
+            self.type_args(ty)?
+        };
+        let any = self.any.clone();
+        let out = PyList::empty(py);
+        match args.as_slice() {
+            [elem, ellipsis] if ellipsis.is(&self.ellipsis) => {
+                for (i, item) in items.iter().enumerate() {
+                    out.append(self.convert_nested(PathElem::Index(i), item, elem)?)?;
+                }
+            }
+            [] if ty.is(&self.tuple_type) => {
+                for (index, item) in items.iter().enumerate() {
+                    out.append(self.convert_nested(PathElem::Index(index), item, &any)?)?;
+                }
+            }
+            _ => {
+                if items.len() != args.len() {
+                    return Err(validation_error(
+                        format!(
+                            "Expected `array` of length {}, got {}",
+                            args.len(),
+                            items.len()
+                        ),
+                        &self.path,
+                    ));
+                }
+                for (i, (item, elem)) in items.iter().zip(args.iter()).enumerate() {
+                    out.append(self.convert_nested(PathElem::Index(i), item, elem)?)?;
+                }
+            }
+        }
+        Ok(out.to_tuple().into_any())
     }
 
     fn convert_nested(

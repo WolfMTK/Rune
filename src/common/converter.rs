@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use crate::common::decode::{decode_to_py, type_name};
+use crate::common::decode::{decode_to_py, get_enum_cache, is_enum_class, type_name};
 use crate::common::token::Value;
 use crate::exceptions::{DecodeError, PathElem, ValidationError, validation_error};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyListMethods};
-use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{Bound, IntoPyObject, PyAny, PyErr, PyResult, Python};
 
 pub struct Converter<'py> {
@@ -18,6 +18,7 @@ pub struct Converter<'py> {
     pub(crate) none_type: Bound<'py, PyAny>,
     pub(crate) bool_type: Bound<'py, PyAny>,
     pub(crate) int_type: Bound<'py, PyAny>,
+    pub(crate) float_type: Bound<'py, PyAny>,
     pub(crate) str_type: Bound<'py, PyAny>,
     pub(crate) union: Bound<'py, PyAny>,
     pub(crate) union_type: Bound<'py, PyAny>,
@@ -45,6 +46,7 @@ impl<'py> Converter<'py> {
             none_type: py.None().bind(py).get_type().into_any(),
             bool_type: py.get_type::<PyBool>().into_any(),
             int_type: py.get_type::<PyInt>().into_any(),
+            float_type: py.get_type::<PyFloat>().into_any(),
             str_type: py.get_type::<PyString>().into_any(),
             union: typing.getattr("Union")?,
             union_type: types.getattr("UnionType")?,
@@ -74,6 +76,13 @@ impl<'py> Converter<'py> {
                 return Ok(PyBool::new(py, *b).to_owned().into_any());
             }
             Value::Int(i) if ty.is(&self.int_type) => return Ok(i.into_pyobject(py)?.into_any()),
+            Value::UInt(u) if ty.is(&self.int_type) => return Ok(u.into_pyobject(py)?.into_any()),
+            Value::Float(f) if ty.is(&self.float_type) => {
+                return Ok(f.into_pyobject(py)?.into_any());
+            }
+            Value::Int(i) if ty.is(&self.float_type) => {
+                return Ok((*i as f64).into_pyobject(py)?.into_any());
+            }
             Value::Str(s) if ty.is(&self.str_type) => return Ok(PyString::new(py, s).into_any()),
             _ => {}
         }
@@ -90,7 +99,12 @@ impl<'py> Converter<'py> {
 
         let base = origin.unwrap_or_else(|| ty.clone());
 
-        if base.is(&self.list_type) || base.is(&self.set_type) || base.is(&self.frozenset_type) {
+        if is_enum_class(&base)? {
+            return self.convert_enum(value, ty);
+        } else if base.is(&self.list_type)
+            || base.is(&self.set_type)
+            || base.is(&self.frozenset_type)
+        {
             return self.convert_sequence(value, ty, &base);
         } else if base.is(&self.dict_type) {
             return self.convert_dict(value, ty, &base);
@@ -102,6 +116,34 @@ impl<'py> Converter<'py> {
             return self.convert_struct(value, ty);
         }
         self.convert_with_hook(value, ty, &base)
+    }
+
+    fn convert_enum(
+        &mut self,
+        value: &Value,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        let raw = match value {
+            Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Str(_) => {
+                decode_to_py(py, value)?
+            }
+            _ => return Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name())),
+        };
+        let cache = get_enum_cache(ty)?;
+        let found = match cache.get_item(&raw) {
+            Ok(member) => Ok(member),
+            Err(e) if e.is_instance_of::<PyKeyError>(py) => ty.call1((&raw,)),
+            Err(e) => Err(e),
+        };
+        match found {
+            Ok(member) => Ok(member),
+            Err(e) if e.is_instance_of::<PyValueError>(py) => Err(validation_error(
+                format!("Invalid enum value {}", raw.repr()?),
+                &self.path,
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     fn convert_tuple(
@@ -169,6 +211,8 @@ impl<'py> Converter<'py> {
             Some("bool")
         } else if ty.is(&self.int_type) {
             Some("int")
+        } else if ty.is(&self.float_type) {
+            Some("float")
         } else if ty.is(&self.str_type) {
             Some("str")
         } else {

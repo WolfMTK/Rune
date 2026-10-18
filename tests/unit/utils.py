@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Any
 
 PY312 = sys.version_info[:2] >= (3, 12)
+PY311 = sys.version_info[:2] >= (3, 11)
 
 
 @contextmanager

@@ -141,13 +141,41 @@ impl Parser<'_> {
         if self.src[digits] == b'0' && self.pos - digits > 1 {
             return Err(self.error_at_pos("Invalid number"));
         }
-        if let Some(b'.' | b'e' | b'E') = self.src.get(self.pos) {
-            return Err(self.error_at_pos("Floats are not supported yet"));
+        let mut is_float = false;
+        if let Some(b'.') = self.src.get(self.pos) {
+            is_float = true;
+            self.pos += 1;
+            self.consume_digits()?;
+        }
+        if let Some(b'e' | b'E') = self.src.get(self.pos) {
+            is_float = true;
+            self.pos += 1;
+            if let Some(b'+' | b'-') = self.src.get(self.pos) {
+                self.pos += 1;
+            }
+            self.consume_digits()?;
+        }
+        if is_float {
+            return text[start..self.pos]
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| self.error_at_pos("Invalid number"));
         }
         match text[start..self.pos].parse::<i64>() {
             Ok(v) => Ok(Value::Int(v)),
             Err(_) => Err(self.error_at_pos("Integer is out of range")),
         }
+    }
+
+    fn consume_digits(&mut self) -> Result<(), ParseError> {
+        let start = self.pos;
+        while let Some(b'0'..=b'9') = self.src.get(self.pos) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err(self.error_at_pos("Invalid number"));
+        }
+        Ok(())
     }
 
     fn parse_string(&mut self) -> Result<String, ParseError> {
@@ -279,11 +307,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::decimal("1.5", "Floats are not supported yet at byte 1")]
-    #[case::exponent("1e5", "Floats are not supported yet at byte 1")]
-    #[case::negative_upper_exponent("-2E3", "Floats are not supported yet at byte 2")]
-    #[case::trailing_dot("-1.", "Floats are not supported yet at byte 2")]
-    fn floats_are_rejected(#[case] input: &str, #[case] message: &str) {
+    #[case::decimal("1.5", 1.5)]
+    #[case::negative_decimal("-0.25", -0.25)]
+    #[case::exponent("1e5", 100_000.0)]
+    #[case::negative_upper_exponent("-2E3", -2000.0)]
+    #[case::signed_exponent("1e-3", 0.001)]
+    fn floats(#[case] input: &str, #[case] expected: f64) {
+        assert_eq!(parse(input.as_bytes()).unwrap().0, Value::Float(expected));
+    }
+
+    #[rstest]
+    #[case::trailing_dot("-1.", "Invalid number at byte 3")]
+    #[case::dot_without_fraction("1.e5", "Invalid number at byte 2")]
+    #[case::exponent_without_digits("1e", "Invalid number at byte 2")]
+    #[case::exponent_sign_without_digits("1e+", "Invalid number at byte 3")]
+    fn invalid_floats(#[case] input: &str, #[case] message: &str) {
         assert_eq!(parse_err(input), message);
     }
 

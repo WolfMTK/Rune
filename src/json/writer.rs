@@ -67,6 +67,25 @@ impl JsonWriter {
     }
 
     #[inline]
+    fn close_scalar_key(&mut self, start: usize, is_key: bool) {
+        if is_key {
+            self.out.insert(start, b'"');
+            self.out.push(b'"');
+            self.out.push(b':');
+            self.expect_value = true;
+        }
+    }
+
+    #[inline]
+    fn write_float(&mut self, value: f64) {
+        if value.is_finite() {
+            self.out.extend_from_slice(format!("{value:?}").as_bytes());
+        } else {
+            self.out.extend_from_slice(b"null");
+        }
+    }
+
+    #[inline]
     fn write_str(&mut self, s: &str) {
         let bytes = s.as_bytes();
         self.out.push(b'"');
@@ -111,17 +130,35 @@ impl Writer for JsonWriter {
     fn write(&mut self, token: Token<'_>) {
         match token {
             Token::Null => {
-                self.begin_item();
+                let is_key = self.begin_item();
+                let start = self.out.len();
                 self.out.extend_from_slice(b"null");
+                self.close_scalar_key(start, is_key);
             }
             Token::Bool(value) => {
-                self.begin_item();
+                let is_key = self.begin_item();
+                let start = self.out.len();
                 self.out
                     .extend_from_slice(if value { b"true" } else { b"false" });
+                self.close_scalar_key(start, is_key);
             }
             Token::Int(value) => {
-                self.begin_item();
+                let is_key = self.begin_item();
+                let start = self.out.len();
                 self.write_int(value);
+                self.close_scalar_key(start, is_key);
+            }
+            Token::UInt(value) => {
+                let is_key = self.begin_item();
+                let start = self.out.len();
+                self.out.extend_from_slice(value.to_string().as_bytes());
+                self.close_scalar_key(start, is_key);
+            }
+            Token::Float(value) => {
+                let is_key = self.begin_item();
+                let start = self.out.len();
+                self.write_float(value);
+                self.close_scalar_key(start, is_key);
             }
             Token::Str(string) => {
                 let is_key = self.begin_item();
@@ -207,6 +244,17 @@ mod tests {
     }
 
     #[rstest]
+    #[case::simple(1.5, "1.5")]
+    #[case::whole(1.0, "1.0")]
+    #[case::negative_zero(-0.0, "-0.0")]
+    #[case::large(1e16, "1e16")]
+    #[case::nan(f64::NAN, "null")]
+    #[case::infinity(f64::INFINITY, "null")]
+    fn floats(#[case] value: f64, #[case] expected: &str) {
+        assert_eq!(run(&[Token::Float(value)]), expected);
+    }
+
+    #[rstest]
     #[case::quote_and_backslash("a\"b\\c", r#""a\"b\\c""#)]
     #[case::control_shortcuts("\n\r\t\u{8}\u{c}", r#""\n\r\t\b\f""#)]
     #[case::control_hex("\u{1}\u{1f}", r#""\u0001\u001f""#)]
@@ -249,5 +297,10 @@ mod tests {
     )]
     fn containers(#[case] tokens: &[Token<'static>], #[case] expected: &str) {
         assert_eq!(run(tokens), expected);
+    }
+
+    #[test]
+    fn uint_above_i64_max() {
+        assert_eq!(run(&[Token::UInt(1 << 63)]), "9223372036854775808");
     }
 }

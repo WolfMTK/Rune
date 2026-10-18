@@ -1,4 +1,5 @@
 import base64
+import collections
 import enum
 import gc
 import sys
@@ -907,3 +908,21 @@ class TestLiterals:
         dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Literal["a", "b"] | str)
         for x in ["a", "b", "c"]:
             assert dec.decode(rune.msgpack.encode(x)) == x
+
+
+class TestCallable:
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            pytest.param(typing.Callable[[int], str], id="typing"),
+            pytest.param(collections.abc.Callable[[int], str], id="collections.abc"),
+        ],
+    )
+    def test_callable_generic_alias(self, typ: Any) -> None:
+        # 'Callable[...]' is a '_CallableGenericAlias'. The 'typing' flavour subclasses
+        # 'typing._GenericAlias' while the 'collections.abc' flavour subclasses
+        # 'types.GenericAlias' - but neither is an *exact* 'types.GenericAlias', so the
+        # conversion leaves both untouched
+        dec: rune.json.Decoder[Any] = rune.json.Decoder(typ)
+        with pytest.raises(ValidationError, match="Expected `Callable`"):
+            dec.decode(b"null")

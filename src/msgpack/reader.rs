@@ -1,17 +1,156 @@
+use crate::common::builder::{Builder, ValueBuilder};
+use crate::common::converter::Converter;
+use crate::common::stream::{Scalar, Wire, kind};
 use crate::common::token::Value;
 use crate::exceptions::ParseError;
 use crate::msgpack::structures::Parser;
-
-const MAX_PREALLOCATED_ITEMS: usize = 1024;
+use pyo3::{Bound, PyAny, Python};
+use std::borrow::Cow;
 
 pub fn parse(input: &[u8], max_depth: usize) -> Result<(Value, usize), ParseError> {
+    build(input, max_depth, &mut ValueBuilder::default())
+}
+
+pub(crate) fn decode_fast<'py>(
+    py: Python<'py>,
+    input: &[u8],
+    max_depth: usize,
+    ty: &Bound<'py, PyAny>,
+) -> Option<Bound<'py, PyAny>> {
     let mut parser = Parser {
         src: input,
         pos: 0,
         depth: 0,
         max_depth,
     };
-    let value = parser.parse_value()?;
+    Converter::new(py, None).decode_one(&mut parser, ty, max_depth)
+}
+
+impl<'a> Wire<'a> for Parser<'a> {
+    fn start(&mut self) {}
+
+    fn at_end(&self) -> bool {
+        self.pos == self.src.len()
+    }
+
+    fn peek_kind(&mut self) -> Result<u8, ParseError> {
+        let tag = self.peek_tag()?;
+        match tag {
+            0x00..=0x7f | 0xcc..=0xce | 0xd0..=0xd3 | 0xe0..=0xff => Ok(kind::INT),
+            0xcf => Ok(if self.peek_uint64()? > i64::MAX as u64 {
+                kind::UINT
+            } else {
+                kind::INT
+            }),
+            0xca | 0xcb => Ok(kind::FLOAT),
+            0xc0 => Ok(kind::NULL),
+            0xc2 | 0xc3 => Ok(kind::BOOL),
+            0xa0..=0xbf | 0xd9..=0xdb => Ok(kind::STR),
+            0x90..=0x9f | 0xdc | 0xdd => Ok(kind::ARRAY),
+            0x80..=0x8f | 0xde | 0xdf => Ok(kind::MAP),
+            other => Err(self.unsupported_type(other)),
+        }
+    }
+
+    fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
+        let tag = self.read_u8()?;
+        if let Some(string) = self.read_string(tag)? {
+            return Ok(Scalar::Str(Cow::Borrowed(string)));
+        }
+        match tag {
+            0x00..=0x7f => Ok(Scalar::Int(tag.into())),
+            0xc0 => Ok(Scalar::Null),
+            0xc2 => Ok(Scalar::Bool(false)),
+            0xc3 => Ok(Scalar::Bool(true)),
+            0xca => Ok(Scalar::Float(self.read_f32()?.into())),
+            0xcb => Ok(Scalar::Float(self.read_f64()?)),
+            0xcc => Ok(Scalar::Int(self.read_u8()?.into())),
+            0xcd => Ok(Scalar::Int(self.read_u16()?.into())),
+            0xce => Ok(Scalar::Int(self.read_u32()?.into())),
+            0xcf => {
+                let value = self.read_u64()?;
+                Ok(i64::try_from(value).map_or(Scalar::UInt(value), Scalar::Int))
+            }
+            0xd0 => Ok(Scalar::Int(self.read_i8()?.into())),
+            0xd1 => Ok(Scalar::Int(self.read_i16()?.into())),
+            0xd2 => Ok(Scalar::Int(self.read_i32()?.into())),
+            0xd3 => Ok(Scalar::Int(self.read_i64()?)),
+            0xe0..=0xff => Ok(Scalar::Int((tag as i8).into())),
+            other => Err(self.unsupported_type(other)),
+        }
+    }
+
+    fn open_array(&mut self) -> Result<Option<usize>, ParseError> {
+        let tag = self.read_u8()?;
+        match self.container_len(tag)? {
+            Some((false, len)) => Ok(Some(len)),
+            _ => Err(self.error_at_pos("Expected array")),
+        }
+    }
+
+    fn next_item(&mut self, len: Option<usize>, index: usize) -> Result<bool, ParseError> {
+        Ok(len.is_some_and(|len| index < len))
+    }
+
+    fn open_map(&mut self) -> Result<Option<usize>, ParseError> {
+        let tag = self.read_u8()?;
+        match self.container_len(tag)? {
+            Some((true, len)) => Ok(Some(len)),
+            _ => Err(self.error_at_pos("Expected map")),
+        }
+    }
+
+    fn next_key(
+        &mut self,
+        len: Option<usize>,
+        index: usize,
+    ) -> Result<Option<Cow<'a, str>>, ParseError> {
+        if len.is_none_or(|len| index >= len) {
+            return Ok(None);
+        }
+        let tag = self.read_u8()?;
+        match self.read_string(tag)? {
+            Some(key) => Ok(Some(Cow::Borrowed(key))),
+            None => Err(self.error_at_pos("Only str keys are supported")),
+        }
+    }
+}
+
+impl Parser<'_> {
+    fn peek_tag(&self) -> Result<u8, ParseError> {
+        self.src
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| self.error_at_pos("Unexpected end of input"))
+    }
+
+    fn peek_uint64(&self) -> Result<u64, ParseError> {
+        let bytes = self
+            .src
+            .get(self.pos + 1..self.pos + 9)
+            .ok_or_else(|| self.error_at_pos("Unexpected end of input"))?;
+        let mut out = [0u8; 8];
+        out.copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(out))
+    }
+
+    fn unsupported_type(&self, tag: u8) -> ParseError {
+        self.error_at_pos(&format!("Unsupported MessagePack type 0x{tag:02x}"))
+    }
+}
+
+pub(crate) fn build<'a, B: Builder<'a>>(
+    input: &'a [u8],
+    max_depth: usize,
+    builder: &mut B,
+) -> Result<(B::Output, usize), B::Error> {
+    let mut parser = Parser {
+        src: input,
+        pos: 0,
+        depth: 0,
+        max_depth,
+    };
+    let value = parser.parse_value(builder)?;
     Ok((value, parser.pos))
 }
 
@@ -61,49 +200,56 @@ impl<'a> Parser<'a> {
         read_f64: f64,
     }
 
-    fn parse_value(&mut self) -> Result<Value, ParseError> {
+    fn parse_value<B: Builder<'a>>(&mut self, builder: &mut B) -> Result<B::Output, B::Error> {
         let tag = self.read_u8()?;
-        match tag {
-            0x00..=0x7f => Ok(Value::Int(tag.into())),
-            0x80..=0x8f => self.parse_map((tag & 0x0f) as usize),
-            0x90..=0x9f => self.parse_array((tag & 0x0f) as usize),
-            0xa0..=0xbf => self.parse_string((tag & 0x1f) as usize),
-            0xc0 => Ok(Value::Null),
-            0xc2 => Ok(Value::Bool(false)),
-            0xc3 => Ok(Value::Bool(true)),
-            0xca => Ok(Value::Float(self.read_f32()?.into())),
-            0xcb => Ok(Value::Float(self.read_f64()?)),
-            0xcc => Ok(Value::Int(self.read_u8()?.into())),
-            0xcd => Ok(Value::Int(self.read_u16()?.into())),
-            0xce => Ok(Value::Int(self.read_u32()?.into())),
+        if let Some(string) = self.read_string(tag)? {
+            return Ok(builder.string(Cow::Borrowed(string)));
+        } else if let Some((is_map, len)) = self.container_len(tag)? {
+            return if is_map {
+                self.parse_map(builder, len)
+            } else {
+                self.parse_array(builder, len)
+            };
+        }
+        let scalar = match tag {
+            0x00..=0x7f => Value::Int(tag.into()),
+            0xc0 => Value::Null,
+            0xc2 => Value::Bool(false),
+            0xc3 => Value::Bool(true),
+            0xca => Value::Float(self.read_f32()?.into()),
+            0xcb => Value::Float(self.read_f64()?),
+            0xcc => Value::Int(self.read_u8()?.into()),
+            0xcd => Value::Int(self.read_u16()?.into()),
+            0xce => Value::Int(self.read_u32()?.into()),
             0xcf => {
                 let value = self.read_u64()?;
-                Ok(i64::try_from(value).map_or(Value::UInt(value), Value::Int))
+                i64::try_from(value).map_or(Value::UInt(value), Value::Int)
             }
-            0xd0 => Ok(Value::Int(self.read_i8()?.into())),
-            0xd1 => Ok(Value::Int(self.read_i16()?.into())),
-            0xd2 => Ok(Value::Int(self.read_i32()?.into())),
-            0xd3 => Ok(Value::Int(self.read_i64()?)),
-            0xd9 => self
-                .read_u8()
-                .and_then(|len| self.parse_string(len as usize)),
-            0xda => self
-                .read_u16()
-                .and_then(|len| self.parse_string(len as usize)),
-            0xdb => self
-                .read_u32()
-                .and_then(|len| self.parse_string(len as usize)),
-            0xdc => self
-                .read_u16()
-                .and_then(|len| self.parse_array(len as usize)),
-            0xdd => self
-                .read_u32()
-                .and_then(|len| self.parse_array(len as usize)),
-            0xde => self.read_u16().and_then(|len| self.parse_map(len as usize)),
-            0xdf => self.read_u32().and_then(|len| self.parse_map(len as usize)),
-            0xe0..=0xff => Ok(Value::Int((tag as i8).into())),
-            other => Err(self.error_at_pos(&format!("Unsupported MessagePack type 0x{other:02x}"))),
-        }
+            0xd0 => Value::Int(self.read_i8()?.into()),
+            0xd1 => Value::Int(self.read_i16()?.into()),
+            0xd2 => Value::Int(self.read_i32()?.into()),
+            0xd3 => Value::Int(self.read_i64()?),
+            0xe0..=0xff => Value::Int((tag as i8).into()),
+            other => {
+                let msg = format!("Unsupported MessagePack type 0x{other:02x}");
+                return Err(self.error_at_pos(&msg).into());
+            }
+        };
+        builder.scalar(scalar)
+    }
+
+    fn read_string(&mut self, tag: u8) -> Result<Option<&'a str>, ParseError> {
+        let len = match tag {
+            0xa0..=0xbf => (tag & 0x1f).into(),
+            0xd9 => self.read_u8()?.into(),
+            0xda => self.read_u16()?.into(),
+            0xdb => self.read_u32()? as usize,
+            _ => return Ok(None),
+        };
+        let bytes = self.read_bytes(len)?;
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| self.error_at_pos("Invalid UTF-8 in string"))
     }
 
     fn increase_depth(&mut self) -> Result<(), ParseError> {
@@ -117,34 +263,58 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_string(&mut self, len: usize) -> Result<Value, ParseError> {
-        let bytes = self.read_bytes(len)?;
-        let s =
-            std::str::from_utf8(bytes).map_err(|_| self.error_at_pos("Invalid UTF-8 in string"))?;
-        Ok(Value::Str(s.to_owned()))
+    fn container_len(&mut self, tag: u8) -> Result<Option<(bool, usize)>, ParseError> {
+        Ok(Some(match tag {
+            0x80..=0x8f => (true, (tag & 0x0f).into()),
+            0x90..=0x9f => (false, (tag & 0x0f).into()),
+            0xdc => (false, self.read_u16()?.into()),
+            0xdd => (false, self.read_u32()? as usize),
+            0xde => (true, self.read_u16()?.into()),
+            0xdf => (true, self.read_u32()? as usize),
+            _ => return Ok(None),
+        }))
     }
 
-    fn parse_array(&mut self, len: usize) -> Result<Value, ParseError> {
+    fn parse_array<B: Builder<'a>>(
+        &mut self,
+        builder: &mut B,
+        len: usize,
+    ) -> Result<B::Output, B::Error> {
         self.increase_depth()?;
-        let mut items = Vec::with_capacity(len.min(MAX_PREALLOCATED_ITEMS));
+        let start = builder.items().len();
         for _ in 0..len {
-            items.push(self.parse_value()?);
+            let item = self.parse_value(builder)?;
+            builder.items().push(item);
         }
         self.depth -= 1;
-        Ok(Value::Array(items))
+        builder.finish_array(start)
     }
 
-    fn parse_map(&mut self, len: usize) -> Result<Value, ParseError> {
+    fn parse_map<B: Builder<'a>>(
+        &mut self,
+        builder: &mut B,
+        len: usize,
+    ) -> Result<B::Output, B::Error> {
         self.increase_depth()?;
-        let mut entries = Vec::with_capacity(len.min(MAX_PREALLOCATED_ITEMS));
+        let mut map = builder.start_map();
         for _ in 0..len {
-            let Value::Str(key) = self.parse_value()? else {
-                return Err(self.error_at_pos("Only str keys are supported"));
-            };
-            entries.push((key, self.parse_value()?));
+            let key = self.parse_key(builder)?;
+            let value = self.parse_value(builder)?;
+            builder.insert(&mut map, Cow::Borrowed(key), value)?;
         }
         self.depth -= 1;
-        Ok(Value::Map(entries))
+        Ok(builder.finish_map(map))
+    }
+
+    fn parse_key<B: Builder<'a>>(&mut self, builder: &mut B) -> Result<&'a str, B::Error> {
+        let start = self.pos;
+        let tag = self.read_u8()?;
+        if let Some(key) = self.read_string(tag)? {
+            return Ok(key);
+        }
+        self.pos = start;
+        self.parse_value(builder)?;
+        Err(self.error_at_pos("Only str keys are supported").into())
     }
 }
 

@@ -1,141 +1,267 @@
-use std::collections::HashMap;
-
-use crate::common::decode::{
-    decode_to_py, get_enum_cache, is_enum_class, literal_cache, type_name,
+use crate::common::RuneMap;
+use crate::common::builder::{KeyCache, decode_to_py};
+use crate::common::py_typing::{
+    any, deque, is_enum_class, is_literal_origin, is_typevar, is_union_origin, struct_lookup_cache,
+    type_args, type_name, type_origin,
 };
+use crate::common::stream::kind;
+use crate::common::struct_schema::{SchemaCache, StructSchema, struct_tag};
 use crate::common::token::Value;
-use crate::common::validate::{is_array_like_struct, struct_tag, struct_tag_field};
+use crate::common::type_cache::{enum_cache, literal_cache};
 use crate::constants::STRUCT_LOOKUP_CACHE_SIZE;
 use crate::exceptions::{DecodeError, PathElem, ValidationError, validation_error};
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyListMethods};
+use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyListMethods, PyStringMethods};
 use pyo3::types::{
-    PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple, PyType,
+    PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple, PyType,
 };
-use pyo3::{Bound, IntoPyObject, PyAny, PyErr, PyResult, Python};
+use pyo3::{Bound, IntoPyObject, PyAny, PyErr, PyResult, PyTypeInfo, Python, intern};
+use std::rc::Rc;
 
-struct UnionOptions<'py> {
-    tagged: Vec<Bound<'py, PyAny>>,
-    plain: Vec<Bound<'py, PyAny>>,
+pub(crate) struct UnionPlan<'py> {
+    pub(crate) has_none: bool,
+    pub(crate) tagged: Vec<Bound<'py, PyAny>>,
+    pub(crate) tagged_mask: u8,
+    pub(crate) tags: Option<TagPlan<'py>>,
+    pub(crate) plain: Vec<Bound<'py, PyAny>>,
+    pub(crate) plain_plans: Vec<Rc<Plan<'py>>>,
+    pub(crate) lookup: Option<Bound<'py, PyDict>>,
 }
 
-pub struct Converter<'py> {
-    py: Python<'py>,
+#[derive(PartialEq)]
+pub(crate) enum TagKey {
+    Str(String),
+    Int(i64),
+}
+
+pub(crate) struct TagPlan<'py> {
+    pub(crate) array_like: bool,
+    pub(crate) field: String,
+    pub(crate) str_tags: bool,
+    pub(crate) entries: Vec<(TagKey, Rc<StructSchema<'py>>)>,
+}
+
+pub(crate) struct EnumPlan<'py> {
+    pub(crate) cache: Bound<'py, PyDict>,
+    pub(crate) by_str: RuneMap<String, Bound<'py, PyAny>>,
+    pub(crate) by_int: RuneMap<i64, Bound<'py, PyAny>>,
+}
+
+pub(crate) enum Shape<'py> {
+    Any,
+    Primitive(&'static str),
+    Union(UnionPlan<'py>),
+    Literal(Bound<'py, PyDict>, u8),
+    Enum(EnumPlan<'py>),
+    Array {
+        items: Vec<Bound<'py, PyAny>>,
+        variadic: bool,
+        base: Bound<'py, PyAny>,
+    },
+    Dict(Bound<'py, PyAny>),
+    Struct(Rc<StructSchema<'py>>, Option<TagPlan<'py>>),
+    Hook(Bound<'py, PyAny>),
+}
+
+pub(crate) struct Plan<'py> {
+    pub(crate) ty: Bound<'py, PyAny>,
+    pub(crate) shape: Shape<'py>,
+    pub(crate) mask: u8,
+}
+
+pub(crate) type FieldPlans<'py> = Rc<[Rc<Plan<'py>>]>;
+
+pub(crate) struct Converter<'py, 'v> {
+    pub(crate) py: Python<'py>,
     pub(crate) hook: Option<Bound<'py, PyAny>>,
-    pub(crate) path: Vec<PathElem>,
-    pub(crate) get_origin: Bound<'py, PyAny>,
-    pub(crate) get_args: Bound<'py, PyAny>,
-    pub(crate) any: Bound<'py, PyAny>,
-    pub(crate) none_type: Bound<'py, PyAny>,
-    pub(crate) bool_type: Bound<'py, PyAny>,
-    pub(crate) int_type: Bound<'py, PyAny>,
-    pub(crate) float_type: Bound<'py, PyAny>,
-    pub(crate) str_type: Bound<'py, PyAny>,
-    pub(crate) union: Bound<'py, PyAny>,
-    pub(crate) union_type: Bound<'py, PyAny>,
-    pub(crate) literal: Bound<'py, PyAny>,
-    pub(crate) list_type: Bound<'py, PyAny>,
-    pub(crate) set_type: Bound<'py, PyAny>,
-    pub(crate) frozenset_type: Bound<'py, PyAny>,
-    pub(crate) dict_type: Bound<'py, PyAny>,
-    pub(crate) deque_type: Bound<'py, PyAny>,
-    pub(crate) tuple_type: Bound<'py, PyAny>,
-    pub(crate) ellipsis: Bound<'py, PyAny>,
+    path: Vec<PathElem<'v>>,
+    schemas: SchemaCache<'py>,
+    plans: RuneMap<usize, Rc<Plan<'py>>>,
+    field_plans: RuneMap<usize, FieldPlans<'py>>,
+    pub(crate) keys: KeyCache<'py>,
+    pub(crate) depth: usize,
+    pub(crate) max_depth: usize,
 }
 
-impl<'py> Converter<'py> {
-    pub fn new(py: Python<'py>, hook: Option<Bound<'py, PyAny>>) -> PyResult<Self> {
-        let typing = py.import("typing")?;
-        let types = py.import("types")?;
-        let collections = py.import("collections")?;
-        Ok(Self {
+impl<'py, 'v> Converter<'py, 'v> {
+    pub(crate) fn new(py: Python<'py>, hook: Option<Bound<'py, PyAny>>) -> Self {
+        Self {
             py,
             hook,
             path: Vec::new(),
-            get_origin: typing.getattr("get_origin")?,
-            get_args: typing.getattr("get_args")?,
-            any: typing.getattr("Any")?,
-            none_type: py.None().bind(py).get_type().into_any(),
-            bool_type: py.get_type::<PyBool>().into_any(),
-            int_type: py.get_type::<PyInt>().into_any(),
-            float_type: py.get_type::<PyFloat>().into_any(),
-            str_type: py.get_type::<PyString>().into_any(),
-            union: typing.getattr("Union")?,
-            union_type: types.getattr("UnionType")?,
-            literal: typing.getattr("Literal")?,
-            list_type: py.get_type::<PyList>().into_any(),
-            set_type: py.get_type::<PySet>().into_any(),
-            frozenset_type: py.get_type::<PyFrozenSet>().into_any(),
-            dict_type: py.get_type::<PyDict>().into_any(),
-            deque_type: collections.getattr("deque")?,
-            tuple_type: py.get_type::<PyTuple>().into_any(),
-            ellipsis: py.Ellipsis().into_bound(py),
+            schemas: SchemaCache::default(),
+            plans: RuneMap::default(),
+            field_plans: RuneMap::default(),
+            keys: KeyCache::default(),
+            depth: 0,
+            max_depth: 0,
+        }
+    }
+
+    pub(crate) fn field_plans(&mut self, schema: &StructSchema<'py>) -> PyResult<FieldPlans<'py>> {
+        let key = std::ptr::from_ref(schema) as usize;
+        if let Some(plans) = self.field_plans.get(&key) {
+            return Ok(Rc::clone(plans));
+        }
+        let plans = schema
+            .fields
+            .iter()
+            .map(|field| self.plan(&field.ty))
+            .collect::<PyResult<FieldPlans<'py>>>()?;
+        self.field_plans.insert(key, Rc::clone(&plans));
+        Ok(plans)
+    }
+
+    fn tag_plan(&mut self, members: &[Bound<'py, PyAny>]) -> PyResult<Option<TagPlan<'py>>> {
+        let first = self.schemas.get(&members[0])?;
+        let mut entries: Vec<(TagKey, Rc<StructSchema<'py>>)> = Vec::with_capacity(members.len());
+        for member in members {
+            let schema = self.schemas.get(member)?;
+            let Some(key) = schema.tag.as_ref().map(tag_key).transpose()?.flatten() else {
+                return Ok(None);
+            };
+            if schema.array_like != first.array_like
+                || schema.tag_field != first.tag_field
+                || schema.fields.iter().any(|f| f.name == first.tag_field)
+                || entries.iter().any(|(existing, _)| *existing == key)
+            {
+                return Ok(None);
+            }
+            entries.push((key, schema));
+        }
+        Ok(Some(TagPlan {
+            array_like: first.array_like,
+            field: first.tag_field.clone(),
+            str_tags: first
+                .tag
+                .as_ref()
+                .is_some_and(|t| t.is_instance_of::<PyString>()),
+            entries,
+        }))
+    }
+
+    pub(crate) fn convert(
+        &mut self,
+        value: &'v Value,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let plan = self.plan(ty)?;
+        self.convert_planned(value, &plan)
+    }
+
+    fn convert_planned(
+        &mut self,
+        value: &'v Value,
+        plan: &Plan<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        match &plan.shape {
+            Shape::Any => decode_to_py(py, value),
+            Shape::Primitive(name) => self.convert_primitive(value, name),
+            Shape::Union(union) => self.convert_union(value, union),
+            Shape::Literal(cache, _) => match self.find_literal(cache, value)? {
+                Some(found) => Ok(found),
+                None => Err(self.invalid_literal_error(value)?),
+            },
+            Shape::Enum(members) => self.convert_enum(value, &plan.ty, &members.cache),
+            Shape::Array {
+                items,
+                variadic,
+                base,
+            } => self.convert_array(value, items, *variadic, base),
+            Shape::Dict(elem) => self.convert_dict(value, elem),
+            Shape::Struct(schema, _) => self.convert_struct(value, schema),
+            Shape::Hook(base) => self.convert_with_hook(value, &plan.ty, base),
+        }
+    }
+
+    fn convert_primitive(&self, value: &Value, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        if let Value::Int(i) = value
+            && name == "float"
+        {
+            return Ok(PyFloat::new(self.py, *i as f64).into_any());
+        } else if primitive_accepts(name, value) {
+            return decode_to_py(self.py, value);
+        }
+        Err(self.type_mismatch_error(name, value.py_type_name()))
+    }
+
+    pub(crate) fn plan(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<Rc<Plan<'py>>> {
+        let key = ty.as_ptr() as usize;
+        if let Some(plan) = self.plans.get(&key) {
+            return Ok(Rc::clone(plan));
+        }
+        let plan = Rc::new(self.classify(ty)?);
+        self.plans.insert(key, Rc::clone(&plan));
+        Ok(plan)
+    }
+
+    fn classify(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<Plan<'py>> {
+        let py = self.py;
+        let shape = if ty.is(&any(py)?) {
+            Shape::Any
+        } else if is_typevar(ty)? {
+            let bound = ty.getattr(intern!(py, "__bound__"))?;
+            if !bound.is_none() {
+                return self.classify(&bound);
+            }
+            Shape::Any
+        } else if let Some(name) = primitive_name(ty) {
+            Shape::Primitive(name)
+        } else {
+            self.classify_generic(ty)?
+        };
+        let mask = shape_mask(&shape);
+        Ok(Plan {
+            ty: ty.clone(),
+            shape,
+            mask,
         })
     }
 
-    pub fn convert(
-        &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn classify_generic(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<Shape<'py>> {
         let py = self.py;
-        if ty.is(&self.any) {
-            return decode_to_py(py, value);
-        }
-
-        match value {
-            Value::Null if ty.is(&self.none_type) => return Ok(py.None().into_bound(py)),
-            Value::Bool(b) if ty.is(&self.bool_type) => {
-                return Ok(PyBool::new(py, *b).to_owned().into_any());
-            }
-            Value::Int(i) if ty.is(&self.int_type) => return Ok(i.into_pyobject(py)?.into_any()),
-            Value::UInt(u) if ty.is(&self.int_type) => return Ok(u.into_pyobject(py)?.into_any()),
-            Value::Float(f) if ty.is(&self.float_type) => {
-                return Ok(f.into_pyobject(py)?.into_any());
-            }
-            Value::Int(i) if ty.is(&self.float_type) => {
-                return Ok((*i as f64).into_pyobject(py)?.into_any());
-            }
-            Value::Str(s) if ty.is(&self.str_type) => return Ok(PyString::new(py, s).into_any()),
-            _ => {}
-        }
-        if let Some(name) = self.primitive_type_name(ty) {
-            return Err(self.type_mismatch_error(name, value.py_type_name()));
-        }
-
-        let origin = self.type_origin(ty)?;
+        let origin = type_origin(ty)?;
         if let Some(origin) = &origin {
-            if origin.is(&self.union) || origin.is(&self.union_type) {
-                return self.convert_union(value, ty);
-            } else if origin.is(&self.literal) {
-                return self.convert_literal(value, ty);
+            if is_union_origin(origin)? {
+                return Ok(Shape::Union(self.union_plan(ty)?));
+            } else if is_literal_origin(origin)? {
+                let mask = literal_mask(&type_args(ty)?);
+                return Ok(Shape::Literal(literal_cache(ty)?, mask));
             }
         }
         let base = origin.unwrap_or_else(|| ty.clone());
-
         if is_enum_class(&base)? {
-            return self.convert_enum(value, ty);
-        } else if base.is(&self.list_type)
-            || base.is(&self.set_type)
-            || base.is(&self.frozenset_type)
+            return Ok(Shape::Enum(enum_plan(ty)?));
+        } else if is_type::<PyList>(&base)
+            || is_type::<PySet>(&base)
+            || is_type::<PyFrozenSet>(&base)
+            || (base.is(&deque(py)?) && self.hook.is_none())
         {
-            return self.convert_sequence(value, ty, &base);
-        } else if base.is(&self.dict_type) {
-            return self.convert_dict(value, ty, &base);
-        } else if base.is(&self.tuple_type) {
-            return self.convert_tuple(value, ty);
-        } else if base.is(&self.deque_type) && self.hook.is_none() {
-            return self.convert_sequence(value, ty, &base);
-        } else if ty.hasattr("__struct_fields__")? {
-            return self.convert_struct(value, ty);
+            let items = vec![type_arg_or_any(ty, 0)?];
+            return Ok(Shape::Array {
+                items,
+                variadic: true,
+                base,
+            });
+        } else if is_type::<PyDict>(&base) {
+            return Ok(Shape::Dict(type_arg_or_any(ty, 1)?));
+        } else if is_type::<PyTuple>(&base) {
+            return tuple_shape(ty, base);
+        } else if let Some(schema) = self.schemas.lookup(ty)? {
+            let tags = match schema.tag {
+                Some(_) => self.tag_plan(std::slice::from_ref(&schema.target))?,
+                None => None,
+            };
+            return Ok(Shape::Struct(schema, tags));
         }
-        self.convert_with_hook(value, ty, &base)
+        Ok(Shape::Hook(base))
     }
 
     fn convert_nested(
         &mut self,
-        elem: PathElem,
-        value: &Value,
+        elem: PathElem<'v>,
+        value: &'v Value,
         ty: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.path.push(elem);
@@ -144,19 +270,20 @@ impl<'py> Converter<'py> {
         result
     }
 
-    fn convert_enum(&self, value: &Value, ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn convert_enum(
+        &self,
+        value: &Value,
+        ty: &Bound<'py, PyAny>,
+        cache: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let py = self.py;
-        if !matches!(
-            value,
-            Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Str(_)
-        ) {
+        if !is_scalar(value) {
             return Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name()));
         }
         let raw = decode_to_py(py, value)?;
-        let cache = get_enum_cache(ty)?;
-        let found = match cache.get_item(&raw) {
-            Err(e) if e.is_instance_of::<PyKeyError>(py) => ty.call1((&raw,)),
-            other => other,
+        let found = match cache.get_item(&raw)? {
+            Some(member) => Ok(member),
+            None => ty.call1((&raw,)),
         };
         found.or_else(|e| {
             if e.is_instance_of::<PyValueError>(py) {
@@ -166,78 +293,61 @@ impl<'py> Converter<'py> {
         })
     }
 
-    fn convert_literal(
+    fn find_literal(
         &self,
+        cache: &Bound<'py, PyDict>,
         value: &Value,
-        ty: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        if let Some(found) = self.find_literal_member(value, ty)? {
-            return Ok(found);
-        }
-        Err(self.invalid_literal_error(value)?)
-    }
-
-    fn find_literal_member(
-        &self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let py = self.py;
-        let args = self.type_args(ty)?;
-        let cache = literal_cache(py, ty, &args)?;
         let value_type = match value {
-            Value::Null => &self.none_type,
-            Value::Bool(_) => &self.bool_type,
-            Value::Int(_) => &self.int_type,
-            Value::Str(_) => &self.str_type,
+            Value::Null => py.get_type::<PyNone>(),
+            Value::Bool(_) => py.get_type::<PyBool>(),
+            Value::Int(_) => py.get_type::<PyInt>(),
+            Value::Str(_) => py.get_type::<PyString>(),
             _ => return Ok(None),
         };
-        let key = (value_type.clone(), decode_to_py(py, value)?).into_pyobject(py)?;
-        cache.cast::<PyDict>()?.get_item(key)
+        let key = (value_type, decode_to_py(py, value)?).into_pyobject(py)?;
+        cache.get_item(key)
     }
 
     fn convert_union(
         &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
+        value: &'v Value,
+        union: &UnionPlan<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = self.py;
-        let args = self.type_args(ty)?;
-        let has_none = args.iter().any(|a| a.is(&self.none_type));
-        if has_none && matches!(value, Value::Null) {
+        if union.has_none && matches!(value, Value::Null) {
             return Ok(py.None().into_bound(py));
-        }
-        let UnionOptions {
-            tagged,
-            plain: options,
-        } = self.split_union_options(args)?;
-        if tagged.len() + options.len() == 1 {
-            let only = if options.is_empty() {
-                &tagged[0]
-            } else {
-                &options[0]
-            };
-            return self.convert(value, only);
+        } else if let Some(only) = single_option(&union.tagged, &union.plain) {
+            return self.convert_single_option(value, only, union.has_none);
         }
 
         let mut tagged_group = None;
-        if !tagged.is_empty() {
-            if let Some(found) = self.convert_tagged(value, &tagged)? {
+        if let Some(first) = union.tagged.first() {
+            if let Some(found) = self.convert_tagged(value, &union.tagged, union.lookup.as_ref())? {
                 return Ok(found);
             }
-            tagged_group = Some(tagged_group_name(&tagged[0])?);
+            tagged_group = Some(if self.schemas.get(first)?.array_like {
+                "array"
+            } else {
+                "object"
+            });
         }
 
-        let mut only_literals = tagged.is_empty();
-        for option in &options {
-            if self.is_literal_type(option)? {
-                if let Some(found) = self.find_literal_member(value, option)? {
+        let mut only_literals = union.tagged.is_empty();
+        let value_kind = value_kind(value);
+        for plan in &union.plain_plans {
+            if let Shape::Literal(cache, _) = &plan.shape {
+                if let Some(found) = self.find_literal(cache, value)? {
                     return Ok(found);
                 }
                 continue;
             }
             only_literals = false;
-            match self.convert(value, option) {
+            if plan.mask & value_kind == 0 {
+                continue;
+            }
+            match self.convert_planned(value, plan) {
                 Ok(v) => return Ok(v),
                 Err(e) if e.is_instance_of::<ValidationError>(py) => continue,
                 Err(e) => return Err(e),
@@ -246,24 +356,67 @@ impl<'py> Converter<'py> {
         if only_literals {
             return Err(self.invalid_literal_error(value)?);
         }
-        Err(self.union_mismatch_error(value, &options, tagged_group, has_none)?)
+        Err(self.union_mismatch_error(value, &union.plain, tagged_group, union.has_none)?)
     }
 
-    fn split_union_options(&self, args: Vec<Bound<'py, PyAny>>) -> PyResult<UnionOptions<'py>> {
-        let mut split = UnionOptions {
-            tagged: Vec::new(),
-            plain: Vec::new(),
-        };
+    fn union_plan(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<UnionPlan<'py>> {
+        let args = type_args(ty)?;
+        let has_none = args.iter().any(is_type::<PyNone>);
+        let (mut tagged, mut plain) = (Vec::new(), Vec::new());
         for arg in args {
-            if arg.is(&self.none_type) {
+            if is_type::<PyNone>(&arg) {
                 continue;
             } else if struct_tag(&arg)?.is_some() {
-                split.tagged.push(arg);
+                tagged.push(arg);
             } else {
-                split.plain.push(arg);
+                plain.push(arg);
             }
         }
-        Ok(split)
+        let tagged_mask = match tagged.first() {
+            Some(first) if self.schemas.get(first)?.array_like => kind::ARRAY,
+            Some(_) => kind::MAP,
+            None => 0,
+        };
+        let plain_plans = plain
+            .iter()
+            .map(|option| self.plan(option))
+            .collect::<PyResult<Vec<_>>>()?;
+        let lookup = (tagged.len() > 1)
+            .then(|| tag_lookup(self.py, &tagged))
+            .transpose()?;
+        let tags = if tagged.is_empty() {
+            None
+        } else {
+            self.tag_plan(&tagged)?
+        };
+        Ok(UnionPlan {
+            has_none,
+            tagged,
+            tagged_mask,
+            tags,
+            plain,
+            plain_plans,
+            lookup,
+        })
+    }
+
+    fn convert_single_option(
+        &mut self,
+        value: &'v Value,
+        only: &Bound<'py, PyAny>,
+        has_none: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match self.convert(value, only) {
+            Err(e)
+                if has_none
+                    && primitive_name(only).is_some()
+                    && e.is_instance_of::<ValidationError>(self.py) =>
+            {
+                let options = std::slice::from_ref(only);
+                Err(self.union_mismatch_error(value, options, None, true)?)
+            }
+            other => other,
+        }
     }
 
     fn union_mismatch_error(
@@ -275,221 +428,189 @@ impl<'py> Converter<'py> {
     ) -> PyResult<PyErr> {
         let mut names = options
             .iter()
-            .map(|option| self.union_member_name(option))
+            .map(union_member_name)
             .collect::<PyResult<Vec<_>>>()?;
         names.extend(tagged_group.map(String::from));
-        if has_none {
-            names.push("null".to_string());
-        }
-        Ok(self.type_mismatch_error(&names.join(" | "), value.py_type_name()))
+        names.extend(has_none.then(|| "null".to_string()));
+        Ok(self.type_mismatch_error(&names.join(" | "), union_value_name(value)))
     }
 
-    fn union_member_name(&self, ty: &Bound<'py, PyAny>) -> PyResult<String> {
-        if self.type_origin(ty)?.is_none() && ty.is_instance_of::<PyType>() {
-            return type_name(ty);
-        }
-        Ok(ty.repr()?.to_string())
-    }
-
-    fn convert_sequence(
+    fn convert_array(
         &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
+        value: &'v Value,
+        types: &[Bound<'py, PyAny>],
+        variadic: bool,
         base: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let Value::Array(items) = value else {
             return Err(self.type_mismatch_error(&type_name(base)?, value.py_type_name()));
         };
-        let elem = self.type_arg_or_any(ty, 0)?;
+        if !variadic && types.len() != items.len() {
+            return Err(self.error(format!(
+                "Expected `array` of length {}, got {}",
+                types.len(),
+                items.len()
+            )));
+        }
         let list = PyList::empty(self.py);
         for (i, item) in items.iter().enumerate() {
-            list.append(self.convert_nested(PathElem::Index(i), item, &elem)?)?;
+            let ty = &types[if variadic { 0 } else { i }];
+            list.append(self.convert_nested(PathElem::Index(i), item, ty)?)?;
         }
-        if base.is(&self.list_type) {
+        if is_type::<PyList>(base) {
             return Ok(list.into_any());
+        } else if is_type::<PyTuple>(base) {
+            return Ok(list.to_tuple().into_any());
         }
         base.call1((list,))
     }
 
-    fn convert_tuple(
-        &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let Value::Array(items) = value else {
-            return Err(self.type_mismatch_error("tuple", value.py_type_name()));
-        };
-        let elem_types = self.tuple_element_types(ty, items.len())?;
-        let out = PyList::empty(self.py);
-        for (i, (item, elem)) in items.iter().zip(&elem_types).enumerate() {
-            out.append(self.convert_nested(PathElem::Index(i), item, elem)?)?;
-        }
-        Ok(out.to_tuple().into_any())
-    }
-
-    fn tuple_element_types(
-        &self,
-        ty: &Bound<'py, PyAny>,
-        len: usize,
-    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        if ty.is(&self.tuple_type) {
-            return Ok(vec![self.any.clone(); len]);
-        }
-        let args = self.type_args(ty)?;
-        if let [elem, ellipsis] = args.as_slice()
-            && ellipsis.is(&self.ellipsis)
-        {
-            return Ok(vec![elem.clone(); len]);
-        } else if args.len() != len {
-            return Err(self.length_mismatch_error(args.len(), len));
-        }
-        Ok(args)
-    }
-
     fn convert_dict(
         &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
-        base: &Bound<'py, PyAny>,
+        value: &'v Value,
+        elem: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let Value::Map(entries) = value else {
-            return Err(self.type_mismatch_error(&type_name(base)?, value.py_type_name()));
+            return Err(self.type_mismatch_error("dict", value.py_type_name()));
         };
-        let elem = self.type_arg_or_any(ty, 1)?;
         let dict = PyDict::new(self.py);
         for (key, item) in entries {
-            let obj = self.convert_nested(PathElem::Key(key.clone()), item, &elem)?;
-            dict.set_item(key, obj)?;
+            let obj = self.convert_nested(PathElem::Key(key), item, elem)?;
+            dict.set_item(&**key, obj)?;
         }
         Ok(dict.into_any())
     }
 
     fn convert_struct(
         &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
+        value: &'v Value,
+        schema: &StructSchema<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if struct_tag(ty)?.is_some() {
-            if let Some(found) = self.convert_tagged(value, std::slice::from_ref(ty))? {
+        let ty = &schema.target;
+        if schema.tag.is_some() {
+            if let Some(found) = self.convert_tagged(value, std::slice::from_ref(ty), None)? {
                 return Ok(found);
             }
             return Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name()));
         }
-        let fields = struct_fields(ty)?;
-        if is_array_like_struct(ty)? {
-            return self.convert_struct_from_array(value, ty, &fields);
+        match value {
+            Value::Array(items) if schema.array_like => {
+                if items.len() != schema.fields.len() {
+                    return Err(self.error(format!(
+                        "Expected `array` of length {}, got {}",
+                        schema.fields.len(),
+                        items.len()
+                    )));
+                }
+                self.build_struct_from_array(items, schema, 0)
+            }
+            Value::Map(entries) if !schema.array_like => {
+                self.build_struct_from_map(entries, schema)
+            }
+            _ => Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name())),
         }
-        let Value::Map(entries) = value else {
-            return Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name()));
-        };
-        self.build_struct_from_map(entries, ty, &fields)
     }
 
     fn build_struct_from_map(
         &mut self,
-        entries: &[(String, Value)],
-        ty: &Bound<'py, PyAny>,
-        fields: &[(String, Bound<'py, PyAny>)],
+        entries: &'v [(Rc<str>, Value)],
+        schema: &StructSchema<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let by_name: HashMap<&str, &Value> = entries
-            .iter()
-            .map(|(key, item)| (key.as_str(), item))
-            .collect();
-        let kwargs = PyDict::new(self.py);
-        for (name, field_ty) in fields {
-            let Some(item) = by_name.get(name.as_str()) else {
-                if ty.hasattr(name.as_str())? {
-                    continue;
+        let mut values = Vec::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            let Some((key, item)) = entries.iter().rfind(|(key, _)| **key == *field.name) else {
+                if !schema.has_default(field)? {
+                    return Err(
+                        self.error(format!("Object missing required field `{}`", field.name))
+                    );
                 }
-                return Err(self.missing_field_error(name));
+                values.push(None);
+                continue;
             };
-            let obj = self.convert_nested(PathElem::Key(name.clone()), item, field_ty)?;
-            kwargs.set_item(name, obj)?;
+            values.push(Some(self.convert_nested(
+                PathElem::Key(key),
+                item,
+                &field.ty,
+            )?));
         }
-        ty.call((), Some(&kwargs))
+        schema.instantiate(values)
     }
 
-    fn convert_struct_from_array(
+    fn build_struct_from_array(
         &mut self,
-        value: &Value,
-        ty: &Bound<'py, PyAny>,
-        fields: &[(String, Bound<'py, PyAny>)],
+        items: &'v [Value],
+        schema: &StructSchema<'py>,
+        offset: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let Value::Array(items) = value else {
-            return Err(self.type_mismatch_error(&type_name(ty)?, value.py_type_name()));
-        };
-        if items.len() != fields.len() {
-            return Err(self.length_mismatch_error(fields.len(), items.len()));
+        let mut values = Vec::with_capacity(schema.fields.len());
+        for (i, field) in schema.fields.iter().enumerate() {
+            values.push(match items.get(offset + i) {
+                Some(item) => {
+                    Some(self.convert_nested(PathElem::Index(offset + i), item, &field.ty)?)
+                }
+                None => None,
+            });
         }
-        let kwargs = PyDict::new(self.py);
-        for (i, ((name, field_ty), item)) in fields.iter().zip(items).enumerate() {
-            let obj = self.convert_nested(PathElem::Index(i), item, field_ty)?;
-            kwargs.set_item(name, obj)?;
-        }
-        ty.call((), Some(&kwargs))
+        schema.instantiate(values)
     }
 
     fn convert_tagged(
         &mut self,
-        value: &Value,
+        value: &'v Value,
         members: &[Bound<'py, PyAny>],
+        lookup: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let array_like = is_array_like_struct(&members[0])?;
+        let first = self.schemas.get(&members[0])?;
+        let (elem, raw) = match value {
+            Value::Map(entries) if !first.array_like => {
+                let Some((key, raw)) = entries.iter().find(|(key, _)| **key == *first.tag_field)
+                else {
+                    return Err(self.error(format!(
+                        "Object missing required field `{}`",
+                        first.tag_field
+                    )));
+                };
+                (PathElem::Key(key), raw)
+            }
+            Value::Array(items) if first.array_like => {
+                let Some(raw) = items.first() else {
+                    return Err(self.error("Expected `array` of at least length 1, got 0".into()));
+                };
+                (PathElem::Index(0), raw)
+            }
+            _ => return Ok(None),
+        };
+        let cls = self.resolve_tagged_struct(raw, &first, members, lookup, elem)?;
+        let schema = self.schemas.get(&cls)?;
         match value {
-            Value::Map(entries) if !array_like => {
-                self.convert_tagged_map(entries, members).map(Some)
+            Value::Array(items) => {
+                let min_len = count_required_fields(&schema)? + 1;
+                if items.len() < min_len {
+                    return Err(self.error(format!(
+                        "Expected `array` of at least length {}, got {}",
+                        min_len,
+                        items.len()
+                    )));
+                }
+                self.build_struct_from_array(items, &schema, 1).map(Some)
             }
-            Value::Array(items) if array_like => {
-                self.convert_tagged_array(items, members).map(Some)
-            }
+            Value::Map(entries) => self.build_struct_from_map(entries, &schema).map(Some),
             _ => Ok(None),
         }
-    }
-
-    fn convert_tagged_map(
-        &mut self,
-        entries: &[(String, Value)],
-        members: &[Bound<'py, PyAny>],
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let tag_field = struct_tag_field(&members[0])?;
-        let Some((_, raw)) = entries.iter().find(|(key, _)| *key == tag_field) else {
-            return Err(self.missing_field_error(&tag_field));
-        };
-        let cls = self.resolve_tagged_struct(raw, members, PathElem::Key(tag_field))?;
-        let fields = struct_fields(&cls)?;
-        self.build_struct_from_map(entries, &cls, &fields)
-    }
-
-    fn convert_tagged_array(
-        &mut self,
-        items: &[Value],
-        members: &[Bound<'py, PyAny>],
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let Some(raw) = items.first() else {
-            return Err(self.min_length_error(1, 0));
-        };
-        let cls = self.resolve_tagged_struct(raw, members, PathElem::Index(0))?;
-        let fields = struct_fields(&cls)?;
-        let min_len = count_required_fields(&cls, &fields)? + 1;
-        if items.len() < min_len {
-            return Err(self.min_length_error(min_len, items.len()));
-        }
-        let kwargs = PyDict::new(self.py);
-        for (i, ((name, field_ty), item)) in fields.iter().zip(&items[1..]).enumerate() {
-            let obj = self.convert_nested(PathElem::Index(i + 1), item, field_ty)?;
-            kwargs.set_item(name, obj)?;
-        }
-        cls.call((), Some(&kwargs))
     }
 
     fn resolve_tagged_struct(
         &self,
         raw: &Value,
+        first: &StructSchema<'py>,
         members: &[Bound<'py, PyAny>],
-        elem: PathElem,
+        lookup: Option<&Bound<'py, PyDict>>,
+        elem: PathElem<'v>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let py = self.py;
-        let str_tags = struct_tag(&members[0])?.is_some_and(|t| t.is_instance_of::<PyString>());
+        let str_tags = first
+            .tag
+            .as_ref()
+            .is_some_and(|t| t.is_instance_of::<PyString>());
         let (expected, matches) = if str_tags {
             ("str", matches!(raw, Value::Str(_)))
         } else {
@@ -501,8 +622,13 @@ impl<'py> Converter<'py> {
                 format!("Expected `{expected}`, got `{}`", raw.py_type_name()),
             ));
         }
-        let key = decode_to_py(py, raw)?;
-        match tag_lookup(py, members)?.get_item(&key)? {
+        let key = decode_to_py(self.py, raw)?;
+        let found = match (lookup, &first.tag) {
+            (Some(lookup), _) => lookup.get_item(&key)?,
+            (None, Some(tag)) if tag.eq(&key)? => Some(members[0].clone()),
+            (None, _) => None,
+        };
+        match found {
             Some(cls) => Ok(cls),
             None => Err(self.error_at(elem, format!("Invalid value {}", key.repr()?))),
         }
@@ -539,76 +665,22 @@ impl<'py> Converter<'py> {
         err
     }
 
-    fn primitive_type_name(&self, ty: &Bound<'py, PyAny>) -> Option<&'static str> {
-        if ty.is(&self.none_type) {
-            Some("None")
-        } else if ty.is(&self.bool_type) {
-            Some("bool")
-        } else if ty.is(&self.int_type) {
-            Some("int")
-        } else if ty.is(&self.float_type) {
-            Some("float")
-        } else if ty.is(&self.str_type) {
-            Some("str")
-        } else {
-            None
-        }
-    }
-
-    fn is_literal_type(&self, ty: &Bound<'py, PyAny>) -> PyResult<bool> {
-        Ok(self.type_origin(ty)?.is_some_and(|o| o.is(&self.literal)))
-    }
-
-    fn type_origin(&self, ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let origin = self.get_origin.call1((ty,))?;
-        Ok(if origin.is_none() { None } else { Some(origin) })
-    }
-
-    fn type_args(&self, ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        self.get_args.call1((ty,))?.try_iter()?.collect()
-    }
-
-    fn type_arg_or_any(&self, ty: &Bound<'py, PyAny>, index: usize) -> PyResult<Bound<'py, PyAny>> {
-        let args = self.type_args(ty)?;
-        Ok(args.get(index).cloned().unwrap_or_else(|| self.any.clone()))
-    }
-
-    fn error_at(&self, elem: PathElem, message: String) -> PyErr {
+    fn error_at(&self, elem: PathElem<'v>, message: String) -> PyErr {
         let mut path = self.path.clone();
         path.push(elem);
         validation_error(message, &path)
     }
 
     fn type_mismatch_error(&self, expected: &str, got: &str) -> PyErr {
-        validation_error(format!("Expected `{expected}`, got `{got}`"), &self.path)
+        self.error(format!("Expected `{expected}`, got `{got}`"))
     }
 
-    fn length_mismatch_error(&self, expected: usize, got: usize) -> PyErr {
-        validation_error(
-            format!("Expected `array` of length {expected}, got {got}"),
-            &self.path,
-        )
-    }
-
-    fn min_length_error(&self, expected: usize, got: usize) -> PyErr {
-        validation_error(
-            format!("Expected `array` of at least length {expected}, got {got}"),
-            &self.path,
-        )
-    }
-
-    fn missing_field_error(&self, name: &str) -> PyErr {
-        validation_error(
-            format!("Object missing required field `{name}`"),
-            &self.path,
-        )
+    pub(crate) fn error(&self, message: String) -> PyErr {
+        validation_error(message, &self.path)
     }
 
     fn invalid_value_error(&self, raw: &Bound<'py, PyAny>) -> PyResult<PyErr> {
-        Ok(validation_error(
-            format!("Invalid enum value {}", raw.repr()?),
-            &self.path,
-        ))
+        Ok(self.error(format!("Invalid enum value {}", raw.repr()?)))
     }
 
     fn invalid_literal_error(&self, value: &Value) -> PyResult<PyErr> {
@@ -617,62 +689,189 @@ impl<'py> Converter<'py> {
     }
 }
 
-fn struct_fields<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<(String, Bound<'py, PyAny>)>> {
-    ty.getattr("__struct_fields__")?
-        .try_iter()?
-        .map(|field| field?.extract())
-        .collect()
+pub(crate) fn is_type<T: PyTypeInfo>(ty: &Bound<'_, PyAny>) -> bool {
+    ty.is(ty.py().get_type::<T>())
 }
 
-fn tagged_group_name(member: &Bound<'_, PyAny>) -> PyResult<&'static str> {
-    if is_array_like_struct(member)? {
-        return Ok("array");
+fn is_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Str(_)
+    )
+}
+
+fn value_kind(value: &Value) -> u8 {
+    match value {
+        Value::Null => kind::NULL,
+        Value::Bool(_) => kind::BOOL,
+        Value::Int(_) => kind::INT,
+        Value::UInt(_) => kind::UINT,
+        Value::Float(_) => kind::FLOAT,
+        Value::Str(_) => kind::STR,
+        Value::Array(_) => kind::ARRAY,
+        Value::Map(_) => kind::MAP,
     }
-    Ok("object")
 }
 
-fn count_required_fields(
-    cls: &Bound<'_, PyAny>,
-    fields: &[(String, Bound<'_, PyAny>)],
-) -> PyResult<usize> {
-    let mut required = 0;
-    for (name, _) in fields {
-        if !cls.hasattr(name.as_str())? {
-            required += 1;
+fn shape_mask(shape: &Shape<'_>) -> u8 {
+    match shape {
+        Shape::Any | Shape::Hook(_) | Shape::Union(_) => kind::ANY,
+        Shape::Primitive(name) => primitive_mask(name),
+        Shape::Literal(_, mask) => *mask,
+        Shape::Enum(_) => kind::INT | kind::UINT | kind::FLOAT | kind::STR,
+        Shape::Array { .. } => kind::ARRAY,
+        Shape::Dict(_) => kind::MAP,
+        Shape::Struct(schema, _) if schema.array_like => kind::ARRAY,
+        Shape::Struct(..) => kind::MAP,
+    }
+}
+
+fn enum_plan<'py>(ty: &Bound<'py, PyAny>) -> PyResult<EnumPlan<'py>> {
+    let cache = enum_cache(ty)?;
+    let mut by_str = RuneMap::default();
+    let mut by_int = RuneMap::default();
+    for (value, member) in cache.iter() {
+        if let Ok(text) = value.cast::<PyString>() {
+            by_str.insert(text.to_str()?.to_owned(), member);
+        } else if value.is_instance_of::<PyInt>()
+            && let Ok(number) = value.extract::<i64>()
+        {
+            by_int.insert(number, member);
         }
     }
-    Ok(required)
+    Ok(EnumPlan {
+        cache,
+        by_str,
+        by_int,
+    })
+}
+
+fn tag_key(tag: &Bound<'_, PyAny>) -> PyResult<Option<TagKey>> {
+    if let Ok(text) = tag.cast::<PyString>() {
+        return Ok(Some(TagKey::Str(text.to_str()?.to_owned())));
+    } else if tag.is_instance_of::<PyInt>()
+        && let Ok(number) = tag.extract::<i64>()
+    {
+        return Ok(Some(TagKey::Int(number)));
+    }
+    Ok(None)
+}
+
+fn primitive_mask(name: &str) -> u8 {
+    match name {
+        "None" => kind::NULL,
+        "bool" => kind::BOOL,
+        "int" => kind::INT | kind::UINT,
+        "float" => kind::FLOAT | kind::INT,
+        _ => kind::STR,
+    }
+}
+
+fn literal_mask(args: &[Bound<'_, PyAny>]) -> u8 {
+    args.iter().fold(0, |mask, arg| {
+        mask | if arg.is_none() {
+            kind::NULL
+        } else if arg.is_instance_of::<PyBool>() {
+            kind::BOOL
+        } else if arg.is_instance_of::<PyInt>() {
+            kind::INT
+        } else {
+            kind::STR
+        }
+    })
+}
+
+fn primitive_name(ty: &Bound<'_, PyAny>) -> Option<&'static str> {
+    [
+        (is_type::<PyNone>(ty), "None"),
+        (is_type::<PyBool>(ty), "bool"),
+        (is_type::<PyInt>(ty), "int"),
+        (is_type::<PyFloat>(ty), "float"),
+        (is_type::<PyString>(ty), "str"),
+    ]
+    .into_iter()
+    .find_map(|(matched, name)| matched.then_some(name))
+}
+
+fn primitive_accepts(name: &str, value: &Value) -> bool {
+    match value {
+        Value::Null => name == "None",
+        Value::Int(_) => name == "int" || name == "float",
+        other => other.py_type_name() == name,
+    }
+}
+
+fn type_arg_or_any<'py>(ty: &Bound<'py, PyAny>, index: usize) -> PyResult<Bound<'py, PyAny>> {
+    match type_args(ty)?.into_iter().nth(index) {
+        Some(arg) => Ok(arg),
+        None => any(ty.py()),
+    }
+}
+
+fn tuple_shape<'py>(ty: &Bound<'py, PyAny>, base: Bound<'py, PyAny>) -> PyResult<Shape<'py>> {
+    let py = ty.py();
+    let mut items = type_args(ty)?;
+    let variadic = match items.as_slice() {
+        [] if is_type::<PyTuple>(ty) => {
+            items.push(any(py)?);
+            true
+        }
+        [_, ellipsis] if ellipsis.is(py.Ellipsis()) => {
+            items.pop();
+            true
+        }
+        _ => false,
+    };
+    Ok(Shape::Array {
+        items,
+        variadic,
+        base,
+    })
+}
+
+fn union_member_name(ty: &Bound<'_, PyAny>) -> PyResult<String> {
+    if type_origin(ty)?.is_none() && ty.is_instance_of::<PyType>() {
+        return type_name(ty);
+    }
+    Ok(ty.repr()?.to_string())
+}
+
+fn single_option<'a, T>(tagged: &'a [T], plain: &'a [T]) -> Option<&'a T> {
+    match (tagged, plain) {
+        ([only], []) | ([], [only]) => Some(only),
+        _ => None,
+    }
+}
+
+fn union_value_name(value: &Value) -> &'static str {
+    match value {
+        Value::Map(_) => "object",
+        Value::Array(_) => "array",
+        other => other.py_type_name(),
+    }
+}
+
+fn count_required_fields(schema: &StructSchema<'_>) -> PyResult<usize> {
+    schema.fields.iter().try_fold(0, |required, field| {
+        Ok(required + usize::from(!schema.has_default(field)?))
+    })
 }
 
 fn tag_lookup<'py>(py: Python<'py>, members: &[Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyDict>> {
-    if members.len() < 2 {
-        return build_tag_lookup(py, members);
-    }
-    let cache = py
-        .import("rune.rune")?
-        .getattr("_struct_lookup_cache")?
-        .cast_into::<PyDict>()?;
+    let cache = struct_lookup_cache(py)?.cast_into::<PyDict>()?;
     let key = PyFrozenSet::new(py, members)?;
     if let Some(found) = cache.get_item(&key)? {
         return Ok(found.cast_into::<PyDict>()?);
     }
-    let lookup = build_tag_lookup(py, members)?;
+    let lookup = PyDict::new(py);
+    for member in members {
+        lookup.set_item(struct_tag(member)?, member)?;
+    }
     if cache.len() >= STRUCT_LOOKUP_CACHE_SIZE
         && let Some((oldest, _)) = cache.iter().next()
     {
         cache.del_item(oldest)?;
     }
     cache.set_item(key, &lookup)?;
-    Ok(lookup)
-}
-
-fn build_tag_lookup<'py>(
-    py: Python<'py>,
-    members: &[Bound<'py, PyAny>],
-) -> PyResult<Bound<'py, PyDict>> {
-    let lookup = PyDict::new(py);
-    for member in members {
-        lookup.set_item(member.getattr("__struct_tag__")?, member)?;
-    }
     Ok(lookup)
 }

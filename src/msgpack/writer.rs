@@ -113,6 +113,10 @@ impl Writer for MsgpackWriter {
                 self.out.push(0xcf);
                 self.out.extend_from_slice(&v.to_be_bytes());
             }
+            Token::Float(v) => {
+                self.out.push(0xcb);
+                self.out.extend_from_slice(&v.to_be_bytes());
+            }
             Token::Str(s) => self.write_str(s),
             Token::ArrayStart(len) => self.write_array_header(len),
             Token::MapStart(len) => self.write_map_header(len),

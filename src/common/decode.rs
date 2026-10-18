@@ -41,6 +41,7 @@ pub fn decode_to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, 
         Value::Bool(value) => Ok(PyBool::new(py, *value).to_owned().into_any()),
         Value::Int(value) => Ok(value.into_pyobject(py)?.into_any()),
         Value::UInt(v) => Ok(v.into_pyobject(py)?.into_any()),
+        Value::Float(value) => Ok(value.into_pyobject(py)?.into_any()),
         Value::Str(value) => Ok(PyString::new(py, value).into_any()),
         Value::Array(items) => {
             let list = PyList::empty(py);
@@ -77,6 +78,23 @@ pub(crate) fn is_enum_class(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     let enum_type = py.import("enum")?.getattr("Enum")?;
     let issubclass = py.import("builtins")?.getattr("issubclass")?;
     issubclass.call1((ty, &enum_type))?.is_truthy()
+}
+
+fn check_enum_values(ty: &Bound<'_, PyAny>) -> PyResult<()> {
+    let mut all_str = true;
+    let mut all_int = true;
+    for member in ty.try_iter()? {
+        let value = member?.getattr("value")?;
+        all_str &= value.is_instance_of::<PyString>();
+        all_int &= value.is_instance_of::<PyInt>();
+    }
+    if all_str || all_int {
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!(
+        "Enums must contain either all str or all int values, got {}",
+        ty.repr()?
+    )))
 }
 
 pub(crate) fn get_enum_cache<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
@@ -122,6 +140,7 @@ impl DecoderCore {
                     "Enum types must have at least one item",
                 ));
             }
+            check_enum_values(t)?;
             enum_cache = Some(get_enum_cache(t)?.unbind());
         }
         let hook = match hook {

@@ -1,4 +1,5 @@
 use crate::common::py_types::dict::serialize_dict;
+use crate::common::py_types::float::serialize_float;
 use crate::common::py_types::int::serialize_int;
 use crate::common::py_types::py_enum::serialize_enum;
 use crate::common::py_types::sequence::serialize_sequence;
@@ -7,12 +8,12 @@ use crate::common::token::Token;
 use crate::common::writer::Writer;
 use pyo3::exceptions::{PyRecursionError, PyTypeError};
 use pyo3::prelude::PyTypeMethods;
-use pyo3::types::PyFrozenSetMethods;
 use pyo3::types::PySetMethods;
 use pyo3::types::{
-    PyAnyMethods, PyBytes, PyDict, PyFrozenSet, PyInt, PyList, PyListMethods, PySet, PyString,
+    PyAnyMethods, PyBool, PyDict, PyFrozenSet, PyInt, PyList, PyListMethods, PySet, PyString,
     PyTuple, PyTupleMethods,
 };
+use pyo3::types::{PyFloat, PyFrozenSetMethods};
 use pyo3::{Bound, Py, PyAny, PyResult};
 
 pub(crate) struct EncodeState {
@@ -80,7 +81,9 @@ fn serialize_py_types<W: Writer>(
         serialize_str(writer, obj)?;
     } else if obj.is_exact_instance_of::<PyInt>() {
         serialize_int(writer, obj)?;
-    } else if obj.is_instance_of::<PyBytes>() {
+    } else if obj.is_exact_instance_of::<PyFloat>() {
+        serialize_float(writer, obj)?;
+    } else if obj.is_instance_of::<PyBool>() {
         let value: bool = obj.extract()?;
         writer.write(Token::Bool(value));
     } else if obj.is_instance_of::<PyDict>() {
@@ -97,6 +100,8 @@ fn serialize_py_types<W: Writer>(
         serialize_str(writer, obj)?;
     } else if obj.is_instance_of::<PyInt>() {
         serialize_int(writer, obj)?;
+    } else if obj.is_instance_of::<PyFloat>() {
+        serialize_float(writer, obj)?;
     } else {
         return Ok(false);
     }
@@ -110,7 +115,7 @@ fn unsupported<T>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
     )))
 }
 
-fn is_enum(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+pub(crate) fn is_enum(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     let enum_type = obj.py().import("enum")?.getattr("Enum")?;
     obj.is_instance(&enum_type)
 }

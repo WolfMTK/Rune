@@ -58,6 +58,10 @@ impl<'a> Parser<'a> {
             0xc0 => Ok(Value::Null),
             0xc2 => Ok(Value::Bool(false)),
             0xc3 => Ok(Value::Bool(true)),
+            0xca => Ok(Value::Float(
+                f32::from_be_bytes(self.read_fixed_bytes()?) as f64
+            )),
+            0xcb => Ok(Value::Float(f64::from_be_bytes(self.read_fixed_bytes()?))),
             0xcc => Ok(Value::Int(self.read_u8()? as i64)),
             0xcd => Ok(Value::Int(
                 u16::from_be_bytes(self.read_fixed_bytes()?) as i64
@@ -210,6 +214,14 @@ mod tests {
     }
 
     #[rstest]
+    #[case::float32(&[0xca, 0x3f, 0xc0, 0x00, 0x00], 1.5)]
+    #[case::float64(&[0xcb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0], 1.5)]
+    #[case::float64_negative(&[0xcb, 0xbf, 0xf8, 0, 0, 0, 0, 0, 0], -1.5)]
+    fn floats(#[case] input: &[u8], #[case] expected: f64) {
+        assert_eq!(parse(input).unwrap().0, Value::Float(expected));
+    }
+
+    #[rstest]
     #[case::fixstr_empty(&[0xa0], "")]
     #[case::fixstr(&[0xa1, b'a'], "a")]
     #[case::str8(&[0xd9, 0x03, b'a', b'b', b'c'], "abc")]
@@ -260,24 +272,36 @@ mod tests {
     #[rstest]
     #[case::reserved(&[0xc1], "Unsupported MessagePack type 0xc1 at byte 1")]
     #[case::bin8(&[0xc4, 0x00], "Unsupported MessagePack type 0xc4 at byte 1")]
-    #[case::float32(&[0xca, 0x00, 0x00, 0x00, 0x00], "Unsupported MessagePack type 0xca at byte 1")]
     #[case::fixext(&[0xd4, 0x01, 0x00], "Unsupported MessagePack type 0xd4 at byte 1")]
     fn unsupported_types(#[case] input: &[u8], #[case] message: &str) {
         assert_eq!(parse_err(input), message);
     }
 
+    fn with_deep_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("failed to spawn thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+
     #[test]
     fn nesting_at_limit_is_accepted() {
-        let mut input = vec![0x91; MAX_DEPTH - 1];
-        input.push(0x90);
-        assert!(parse(&input).is_ok());
+        with_deep_stack(|| {
+            let mut input = vec![0x91; MAX_DEPTH - 1];
+            input.push(0x90);
+            assert!(parse(&input).is_ok());
+        });
     }
 
     #[test]
     fn nesting_past_limit_is_rejected() {
-        let mut input = vec![0x91; MAX_DEPTH];
-        input.push(0x90);
-        assert_eq!(parse_err(&input), "Recursion limit exceeded at byte 513");
+        with_deep_stack(|| {
+            let mut input = vec![0x91; MAX_DEPTH];
+            input.push(0x90);
+            assert_eq!(parse_err(&input), "Recursion limit exceeded at byte 513");
+        });
     }
 
     #[rstest]

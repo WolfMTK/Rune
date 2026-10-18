@@ -4,6 +4,7 @@ import gc
 import sys
 import weakref
 from collections import deque
+from collections.abc import Callable, Iterator
 from types import ModuleType
 from typing import Any
 
@@ -13,7 +14,7 @@ from rune.struct import Struct
 import rune
 from rune import ValidationError
 
-from .utils import PY312, max_call_depth
+from .utils import PY311, PY312, max_call_depth
 
 
 class TestEncodeSubclasses:
@@ -502,3 +503,242 @@ class TestIntEnum:
         for bad in [0, 7, 9, 56, -min(values), -max(values), 2**64 - 1, -(2**63)]:
             with pytest.raises(ValidationError):
                 dec.decode(rune.msgpack.encode(bad))
+
+
+class FruitStr(enum.Enum):
+    APPLE = "apple"
+    BANANA = "banana"
+
+
+class TestEnum:
+    def test_empty_errors(self, proto: ModuleType) -> None:
+        class Empty(enum.Enum):
+            pass
+
+        with pytest.raises(TypeError, match="Enum types must have at least one item"):
+            proto.Decoder(Empty)
+
+    def test_encode_complex(self, proto: ModuleType) -> None:
+        class Complex(enum.Enum):
+            A = 1.5
+
+        res = proto.encode(Complex.A)
+        sol = proto.encode(1.5)
+        assert res == sol
+
+        res = proto.encode({Complex.A: 1})
+        sol = proto.encode({1.5: 1})
+        assert res == sol
+
+    def test_decode_complex_errors(self, proto: ModuleType) -> None:
+        class Complex(enum.Enum):
+            A = 1.5
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(Complex)
+
+        assert "Enums must contain either all str or all int values" in str(rec.value)
+        assert repr(Complex) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [("A", 1), ("B", 2), ("C", "c")],
+            [("A", "a"), ("B", "b"), ("C", 3)],
+        ],
+    )
+    def test_mixed_value_types_errors(
+        self, values: list[tuple[str, int | str]], proto: ModuleType
+    ) -> None:
+        Bad = enum.Enum("Bad", values)  # type: ignore[misc]
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(Bad)
+
+        assert "Enums must contain either all str or all int values" in str(rec.value)
+        assert repr(Bad) in str(rec.value)
+
+    @pytest.mark.parametrize("base_cls", [enum.StrEnum, enum.Enum])
+    def test_encode(self, proto: ModuleType, base_cls: type[enum.Enum]) -> None:
+        class Test(base_cls):  # type: ignore[misc, valid-type]
+            A = "apple"
+            B = "banana"
+
+        assert proto.encode(Test.A) == proto.encode("apple")
+
+    @pytest.mark.parametrize("base_metacls", [enum.EnumMeta] + ([enum.EnumType] if PY311 else []))
+    def test_enum_with_custom_enum_metaclass(
+        self, proto: ModuleType, base_metacls: type[enum.EnumMeta]
+    ) -> None:
+        class ChoicesMeta(base_metacls):  # type: ignore[misc, valid-type]
+            """My custom enum metaclass"""
+
+        class Test(enum.Enum, metaclass=ChoicesMeta):
+            A = "apple"
+            B = "banana"
+
+        assert proto.encode(Test.A) == proto.encode("apple")
+        assert proto.decode(proto.encode("apple"), type=Test) is Test.A
+
+    @pytest.mark.parametrize("base_cls", [enum.StrEnum, enum.Enum])
+    def test_decode(self, proto: ModuleType, base_cls: type[enum.Enum]) -> None:
+        class Test(base_cls):  # type: ignore[misc, valid-type]
+            A = "apple"
+            B = "banana"
+
+        dec = proto.Decoder(Test)
+        assert dec.decode(proto.encode("apple")) is Test.A
+        assert dec.decode(proto.encode("banana")) is Test.B
+
+        with pytest.raises(ValidationError, match="Invalid enum value 'cherry'"):
+            dec.decode(proto.encode("cherry"))
+
+    def test_decode_nested(self, proto: ModuleType) -> None:
+        class Test(Struct):
+            fruit: FruitStr
+
+        dec = proto.Decoder(Test)
+
+        assert dec.decode(proto.encode({"fruit": "apple"})) == Test(FruitStr.APPLE)
+
+        with pytest.raises(
+            ValidationError,
+            match=r"Invalid enum value 'cherry' - at `\$.fruit`",
+        ):
+            dec.decode(proto.encode({"fruit": "cherry"}))
+
+    def test_str_lookup_reused(self) -> None:
+        class Test(enum.Enum):
+            A = "a"
+            B = "b"
+
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Test)  # noqa
+        count = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        dec2: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Test)
+        count2 = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        assert count2 == count + 1
+
+        # Reference count decreases when decoder is dropped
+        del dec2
+        gc.collect()
+        count3 = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        assert count == count3
+
+    def test_str_lookup_gc(self) -> None:
+        class Test(enum.Enum):
+            A = "a"
+            B = "b"
+
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(Test)
+        assert gc.is_tracked(Test.__rune_cache__)  # type: ignore[attr-defined]
+
+        # Deleting all references and running GC cleans up cycle
+        ref = weakref.ref(Test)
+        del Test
+        del dec
+        gc.collect()
+        assert ref() is None
+
+    def test_msgspec_cache_overwritten(self) -> None:
+        class Test(enum.Enum):
+            A = 1
+
+        Test.__rune_cache__ = 1  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            rune.msgpack.Decoder(Test)
+
+    @pytest.mark.parametrize("length", [2, 8, 16])
+    @pytest.mark.parametrize("nitems", [1, 3, 6, 12, 24, 48])
+    def test_random_enum_same_lengths(self, rand: Any, length: int, nitems: int) -> None:
+        def strgen(length: int) -> Iterator[str]:
+            """Yields unique random fixed-length strings"""
+            seen: set[str] = set()
+            while True:
+                x = rand.str(length)
+                if x in seen:
+                    continue
+                seen.add(x)
+                yield x
+
+        unique_str: Callable[[], str] = strgen(length).__next__
+
+        myenum = enum.Enum(  # type: ignore[misc]
+            "myenum", [(unique_str(), unique_str()) for _ in range(nitems)]
+        )
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(myenum)
+
+        for val in myenum:
+            msg = rune.msgpack.encode(val.value)
+            val2 = dec.decode(msg)
+            assert val == val2
+
+        for _ in range(10):
+            key = unique_str()
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(key))
+
+        # Try bad of different lengths
+        for bad_length in [1, 7, 15, 30]:
+            assert bad_length != length
+            key = rand.str(bad_length)
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(key))
+
+    @pytest.mark.parametrize("nitems", [1, 3, 6, 12, 24, 48])
+    def test_random_enum_different_lengths(self, rand: Any, nitems: int) -> None:
+        def strgen() -> Iterator[str]:
+            """Yields unique random strings"""
+            seen: set[str] = set()
+            while True:
+                x = rand.str(1, 32)
+                if x in seen:
+                    continue
+                seen.add(x)
+                yield x
+
+        unique_str: Callable[[], str] = strgen().__next__
+
+        myenum = enum.Enum(  # type: ignore[misc]
+            "myenum", [(unique_str(), unique_str()) for _ in range(nitems)]
+        )
+        dec: rune.msgpack.Decoder[Any] = rune.msgpack.Decoder(myenum)
+
+        for val in myenum:
+            msg = rune.msgpack.encode(val.value)
+            val2 = dec.decode(msg)
+            assert val == val2
+
+        for _ in range(10):
+            key = unique_str()
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(key))
+
+    def test_enum_missing(self, proto: ModuleType) -> None:
+        class Ex(enum.Enum):
+            A = "a"
+            B = "b"
+
+            @classmethod
+            def _missing_(cls, val: object) -> "Ex | None":
+                if val == "return-A":
+                    return cls.A
+                elif val == "return-B":
+                    return cls.B
+                elif val == "error":
+                    raise ValueError("oh no!")
+                else:
+                    return None
+
+        dec = proto.Decoder(Ex)
+
+        def roundtrip(msg: str) -> Any:
+            return dec.decode(proto.encode(msg))
+
+        assert roundtrip("a") is Ex.A
+        assert roundtrip("return-A") is Ex.A
+        assert roundtrip("return-B") is Ex.B
+        with pytest.raises(ValidationError, match="Invalid enum value 'error'"):
+            roundtrip("error")
+        with pytest.raises(ValidationError, match="Invalid enum value 'other'"):
+            roundtrip("other")

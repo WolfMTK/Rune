@@ -66,10 +66,11 @@ impl<'a> Parser<'a> {
                 u32::from_be_bytes(self.read_fixed_bytes()?) as i64
             )),
             0xcf => {
-                let v = u64::from_be_bytes(self.read_fixed_bytes()?);
-                i64::try_from(v)
-                    .map(Value::Int)
-                    .map_err(|_| self.error_at_pos("Integer is out of range"))
+                let value = u64::from_be_bytes(self.read_fixed_bytes()?);
+                Ok(match i64::try_from(value) {
+                    Ok(val) => Value::Int(val),
+                    Err(_) => Value::UInt(value),
+                })
             }
             0xd0 => Ok(Value::Int(self.read_u8()? as i8 as i64)),
             0xd1 => Ok(Value::Int(
@@ -203,9 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn uint64_above_i64_max_is_rejected() {
+    fn uint64_above_i64_max_is_unsigned() {
         let input = [0xcf, 0x80, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(parse_err(&input), "Integer is out of range at byte 9");
+        assert_eq!(parse(&input).unwrap().0, Value::UInt(1 << 63));
     }
 
     #[rstest]

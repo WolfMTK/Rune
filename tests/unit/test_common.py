@@ -1,4 +1,8 @@
 import base64
+import enum
+import gc
+import sys
+import weakref
 from collections import deque
 from types import ModuleType
 from typing import Any
@@ -7,6 +11,7 @@ import pytest
 from rune.struct import Struct
 
 import rune
+from rune import ValidationError
 
 from .utils import PY312, max_call_depth
 
@@ -284,3 +289,216 @@ class TestThreadSafe:
         sol = (Custom((None, 1)), 2)
         res = dec.decode(msg)
         assert res == sol
+
+
+class FruitInt(enum.IntEnum):
+    APPLE = 1
+    BANANA = 2
+
+
+class TestIntEnum:
+    def test_empty_errors(self, proto: ModuleType) -> None:
+        class Empty(enum.IntEnum):
+            pass
+
+        with pytest.raises(TypeError, match="Enum types must have at least one item"):
+            proto.Decoder(Empty)
+
+    @pytest.mark.parametrize("base_cls", [enum.IntEnum, enum.Enum])
+    def test_encode(self, proto: ModuleType, base_cls: type[enum.Enum]) -> None:
+        class Test(base_cls):  # type: ignore[misc, valid-type]
+            A = 1
+            B = 2
+
+        assert proto.encode(Test.A) == proto.encode(1)
+
+    @pytest.mark.parametrize("base_cls", [enum.IntEnum, enum.Enum])
+    def test_decode(self, proto: ModuleType, base_cls: type[enum.Enum]) -> None:
+        class Test(base_cls):  # type: ignore[misc, valid-type]
+            A = 1
+            B = 2
+
+        dec = proto.Decoder(Test)
+        assert dec.decode(proto.encode(1)) is Test.A
+        assert dec.decode(proto.encode(2)) is Test.B
+
+        with pytest.raises(ValidationError, match="Invalid enum value 3"):
+            dec.decode(proto.encode(3))
+
+    def test_decode_nested(self, proto: ModuleType) -> None:
+        class Test(Struct):
+            fruit: FruitInt
+
+        dec = proto.Decoder(Test)
+
+        assert dec.decode(proto.encode({"fruit": 1})) == Test(FruitInt.APPLE)
+
+        with pytest.raises(ValidationError, match=r"Invalid enum value 3 - at `\$.fruit`"):
+            dec.decode(proto.encode({"fruit": 3}))
+
+    def test_intenum_missing(self, proto: ModuleType) -> None:
+        class Ex(enum.IntEnum):
+            A = 1
+            B = 2
+
+            @classmethod
+            def _missing_(cls, val: object) -> Any:
+                if val == 3:
+                    return cls.A
+                elif val == -4:
+                    return cls.B
+                elif val == 5:
+                    raise ValueError("oh no!")
+                else:
+                    return None
+
+        dec = proto.Decoder(Ex)
+
+        def roundtrip(msg: int) -> Any:
+            return dec.decode(proto.encode(msg))
+
+        assert roundtrip(1) is Ex.A
+        assert roundtrip(3) is Ex.A
+        assert roundtrip(-4) is Ex.B
+        with pytest.raises(ValidationError, match="Invalid enum value 5"):
+            roundtrip(5)
+        with pytest.raises(ValidationError, match="Invalid enum value 6"):
+            roundtrip(6)
+
+    def test_intflag(self, proto: ModuleType) -> None:
+        class Ex(enum.IntFlag):
+            A = 0b001
+            B = 0b010
+            C = 0b100
+
+        obj = Ex.A | Ex.C
+        msg = proto.encode(obj)
+        assert msg == proto.encode(int(obj))
+        assert proto.decode(msg, type=Ex) == obj
+
+    def test_int_lookup_reused(self) -> None:
+        class Test(enum.IntEnum):
+            A = 1
+            B = 2
+
+        dec = rune.msgpack.Decoder(Test)  # noqa: F841
+        count = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        dec2 = rune.msgpack.Decoder(Test)
+        count2 = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        assert count2 == count + 1
+
+        # Reference count decreases when decoder is dropped
+        del dec2
+        gc.collect()
+        count3 = sys.getrefcount(Test.__rune_cache__)  # type: ignore[attr-defined]
+        assert count == count3
+
+    def test_int_lookup_gc(self) -> None:
+        class Test(enum.IntEnum):
+            A = 1
+            B = 2
+
+        dec = rune.msgpack.Decoder(Test)
+        assert gc.is_tracked(Test.__rune_cache__)  # type: ignore[attr-defined]
+
+        # Deleting all references and running GC cleans up cycle
+        ref = weakref.ref(Test)
+        del Test
+        del dec
+        gc.collect()
+        assert ref() is None
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [0, 1, 2, -(2**63) - 1],
+            [0, 1, 2, 2**63],
+        ],
+    )
+    def test_int_lookup_values_out_of_range(self, values: list[int]) -> None:
+        myenum = enum.IntEnum("myenum", [(f"x{i}", v) for i, v in enumerate(values)])
+
+        with pytest.raises(NotImplementedError):
+            rune.msgpack.Decoder(myenum)
+
+    def test_msgspec_cache_overwritten(self) -> None:
+        class Test(enum.IntEnum):
+            A = 1
+
+        Test.__rune_cache__ = 1  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            rune.msgpack.Decoder(Test)
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [0],
+            [1],
+            [-1],
+            [3, 4, 5, 2, 1],
+            [4, 3, 1, 2, 7],
+            [-4, -3, -2, -1, 0, 1, 2, 3, 4],
+            [-4, -3, -1, -2, -7],
+            [-4, -3, 1, 0, -2, -1],
+            [2**63 - 1, 2**63 - 2, 2**63 - 3],
+            [-(2**63) + 1, -(2**63) + 2, -(2**63) + 3],
+        ],
+    )
+    def test_compact(self, values: list[int]) -> None:
+        myenum = enum.IntEnum("myenum", [(f"x{i}", v) for i, v in enumerate(values)])
+        dec = rune.msgpack.Decoder(myenum)
+
+        assert hasattr(myenum, "__rune_cache__")
+
+        for val in myenum:
+            msg = rune.msgpack.encode(val)
+            val2 = dec.decode(msg)
+            assert val == val2
+
+        for bad in [-1000, min(values) - 1, max(values) + 1, 1000]:
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(bad))
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [-(2**63), 2**63 - 1, 0],
+            [2**63 - 2, 2**63 - 3, 2**63 - 1],
+            [2**63 - 2, 2**63 - 3, 2**63 - 1, 0, 2, 3, 4, 5, 6],
+        ],
+    )
+    def test_hashtable(self, values: list[int]) -> None:
+        myenum = enum.IntEnum("myenum", [(f"x{i}", v) for i, v in enumerate(values)])
+        dec = rune.msgpack.Decoder(myenum)
+
+        assert hasattr(myenum, "__rune_cache__")
+
+        for val in myenum:
+            msg = rune.msgpack.encode(val)
+            val2 = dec.decode(msg)
+            assert val == val2
+
+        for bad in [-2000, -1, 1, 2000]:
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(bad))
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [8, 16, 24, 32, 40, 48],
+            [-8, -16, -24, -32, -40, -48],
+        ],
+    )
+    def test_hashtable_collisions(self, values: list[int]) -> None:
+        myenum = enum.IntEnum("myenum", [(f"x{i}", v) for i, v in enumerate(values)])
+        dec = rune.msgpack.Decoder(myenum)
+
+        for val in myenum:
+            msg = rune.msgpack.encode(val)
+            val2 = dec.decode(msg)
+            assert val == val2
+
+        for bad in [0, 7, 9, 56, -min(values), -max(values), 2**64 - 1, -(2**63)]:
+            with pytest.raises(ValidationError):
+                dec.decode(rune.msgpack.encode(bad))

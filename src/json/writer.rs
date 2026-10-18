@@ -123,6 +123,10 @@ impl Writer for JsonWriter {
                 self.begin_item();
                 self.write_int(value);
             }
+            Token::UInt(value) => {
+                self.begin_item();
+                self.out.extend_from_slice(value.to_string().as_bytes());
+            }
             Token::Str(string) => {
                 let is_key = self.begin_item();
                 self.write_str(string);
@@ -249,5 +253,10 @@ mod tests {
     )]
     fn containers(#[case] tokens: &[Token<'static>], #[case] expected: &str) {
         assert_eq!(run(tokens), expected);
+    }
+
+    #[test]
+    fn uint_above_i64_max() {
+        assert_eq!(run(&[Token::UInt(1 << 63)]), "9223372036854775808");
     }
 }

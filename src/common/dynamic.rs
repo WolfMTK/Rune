@@ -1,5 +1,6 @@
 use crate::common::py_types::dict::serialize_dict;
 use crate::common::py_types::int::serialize_int;
+use crate::common::py_types::py_enum::serialize_enum;
 use crate::common::py_types::sequence::serialize_sequence;
 use crate::common::py_types::string::serialize_str;
 use crate::common::token::Token;
@@ -47,8 +48,10 @@ pub(crate) fn serialize<W: Writer>(
     obj: &Bound<'_, PyAny>,
     ctx: &mut EncodeState,
 ) -> PyResult<()> {
-    if serialize_supported(writer, obj, ctx)? {
+    if serialize_py_types(writer, obj, ctx)? {
         return Ok(());
+    } else if is_enum(obj)? {
+        return serialize_enum(writer, obj, ctx);
     }
     let py = obj.py();
     let hook = match &ctx.hook {
@@ -56,13 +59,13 @@ pub(crate) fn serialize<W: Writer>(
         None => return unsupported(obj),
     };
     let replaced = hook.bind(py).call1((obj,))?;
-    if serialize_supported(writer, &replaced, ctx)? {
+    if serialize_py_types(writer, &replaced, ctx)? {
         return Ok(());
     }
     unsupported(&replaced)
 }
 
-fn serialize_supported<W: Writer>(
+fn serialize_py_types<W: Writer>(
     writer: &mut W,
     obj: &Bound<'_, PyAny>,
     ctx: &mut EncodeState,
@@ -105,4 +108,9 @@ fn unsupported<T>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
     Err(PyTypeError::new_err(format!(
         "Encoding objects of type {name} is unsupported"
     )))
+}
+
+fn is_enum(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let enum_type = obj.py().import("enum")?.getattr("Enum")?;
+    obj.is_instance(&enum_type)
 }

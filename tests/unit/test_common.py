@@ -745,11 +745,10 @@ class TestEnum:
         with pytest.raises(ValidationError, match="Invalid enum value 'other'"):
             roundtrip("other")
 
+
 class TestLiterals:
     def test_empty_errors(self) -> None:
-        with pytest.raises(
-                TypeError, match="Literal types must have at least one item"
-        ):
+        with pytest.raises(TypeError, match="Literal types must have at least one item"):
             rune.msgpack.Decoder(Literal[()])
 
     def test_native_literal_generic_alias(self) -> None:

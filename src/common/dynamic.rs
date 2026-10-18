@@ -4,16 +4,15 @@ use crate::common::py_types::int::serialize_int;
 use crate::common::py_types::py_enum::serialize_enum;
 use crate::common::py_types::sequence::serialize_sequence;
 use crate::common::py_types::string::serialize_str;
+use crate::common::py_types::structs::serialize_struct;
 use crate::common::token::Token;
+use crate::common::validate::is_struct_class;
 use crate::common::writer::Writer;
 use pyo3::exceptions::{PyRecursionError, PyTypeError};
-use pyo3::prelude::PyTypeMethods;
-use pyo3::types::PySetMethods;
 use pyo3::types::{
-    PyAnyMethods, PyBool, PyDict, PyFrozenSet, PyInt, PyList, PyListMethods, PySet, PyString,
-    PyTuple, PyTupleMethods,
+    PyAnyMethods, PyBool, PyDict, PyFloat, PyFrozenSet, PyFrozenSetMethods, PyInt, PyList,
+    PyListMethods, PySet, PySetMethods, PyString, PyTuple, PyTupleMethods, PyTypeMethods,
 };
-use pyo3::types::{PyFloat, PyFrozenSetMethods};
 use pyo3::{Bound, Py, PyAny, PyResult};
 
 pub(crate) struct EncodeState {
@@ -47,55 +46,52 @@ impl EncodeState {
 pub(crate) fn serialize<W: Writer>(
     writer: &mut W,
     obj: &Bound<'_, PyAny>,
-    ctx: &mut EncodeState,
+    state: &mut EncodeState,
 ) -> PyResult<()> {
-    if serialize_py_types(writer, obj, ctx)? {
+    if try_serialize_builtin(writer, obj, state)? {
         return Ok(());
     } else if is_enum(obj)? {
-        return serialize_enum(writer, obj, ctx);
+        return serialize_enum(writer, obj, state);
+    } else if is_struct_instance(obj)? {
+        return serialize_struct(writer, obj, state);
     }
-    let py = obj.py();
-    let hook = match &ctx.hook {
-        Some(hook) => hook.clone_ref(py),
-        None => return unsupported(obj),
-    };
-    let replaced = hook.bind(py).call1((obj,))?;
-    if serialize_py_types(writer, &replaced, ctx)? {
-        return Ok(());
-    }
-    unsupported(&replaced)
+    serialize_with_hook(writer, obj, state)
 }
 
-fn serialize_py_types<W: Writer>(
+fn serialize_with_hook<W: Writer>(
     writer: &mut W,
     obj: &Bound<'_, PyAny>,
-    ctx: &mut EncodeState,
+    state: &mut EncodeState,
+) -> PyResult<()> {
+    let Some(hook) = &state.hook else {
+        return unsupported_type_error(obj);
+    };
+    let replaced = hook.bind(obj.py()).call1((obj,))?;
+    if try_serialize_builtin(writer, &replaced, state)? {
+        return Ok(());
+    }
+    unsupported_type_error(&replaced)
+}
+
+fn try_serialize_builtin<W: Writer>(
+    writer: &mut W,
+    obj: &Bound<'_, PyAny>,
+    state: &mut EncodeState,
 ) -> PyResult<bool> {
     if obj.is_none() {
         writer.write(Token::Null);
-    } else if obj.is_exact_instance_of::<PyDict>() {
-        serialize_dict(writer, obj, ctx)?;
-    } else if obj.is_exact_instance_of::<PyList>() {
-        serialize_sequence(writer, obj.cast::<PyList>()?.iter(), ctx)?;
-    } else if obj.is_exact_instance_of::<PyString>() {
-        serialize_str(writer, obj)?;
-    } else if obj.is_exact_instance_of::<PyInt>() {
-        serialize_int(writer, obj)?;
-    } else if obj.is_exact_instance_of::<PyFloat>() {
-        serialize_float(writer, obj)?;
     } else if obj.is_instance_of::<PyBool>() {
-        let value: bool = obj.extract()?;
-        writer.write(Token::Bool(value));
+        writer.write(Token::Bool(obj.extract()?));
     } else if obj.is_instance_of::<PyDict>() {
-        serialize_dict(writer, obj, ctx)?;
-    } else if obj.is_instance_of::<PyList>() {
-        serialize_sequence(writer, obj.cast::<PyList>()?.iter(), ctx)?;
-    } else if obj.is_instance_of::<PyTuple>() {
-        serialize_sequence(writer, obj.cast::<PyTuple>()?.iter(), ctx)?;
+        serialize_dict(writer, obj, state)?;
+    } else if let Ok(list) = obj.cast::<PyList>() {
+        serialize_sequence(writer, list.iter(), state)?;
+    } else if let Ok(tuple) = obj.cast::<PyTuple>() {
+        serialize_sequence(writer, tuple.iter(), state)?;
     } else if let Ok(set) = obj.cast::<PySet>() {
-        serialize_sequence(writer, set.iter(), ctx)?;
+        serialize_sequence(writer, set.iter(), state)?;
     } else if let Ok(set) = obj.cast::<PyFrozenSet>() {
-        serialize_sequence(writer, set.iter(), ctx)?;
+        serialize_sequence(writer, set.iter(), state)?;
     } else if obj.is_instance_of::<PyString>() {
         serialize_str(writer, obj)?;
     } else if obj.is_instance_of::<PyInt>() {
@@ -108,14 +104,18 @@ fn serialize_py_types<W: Writer>(
     Ok(true)
 }
 
-fn unsupported<T>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
-    let name = obj.get_type().qualname()?;
-    Err(PyTypeError::new_err(format!(
-        "Encoding objects of type {name} is unsupported"
-    )))
+fn is_struct_instance(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    is_struct_class(obj.get_type().as_any())
 }
 
 pub(crate) fn is_enum(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     let enum_type = obj.py().import("enum")?.getattr("Enum")?;
     obj.is_instance(&enum_type)
+}
+
+fn unsupported_type_error<T>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
+    let name = obj.get_type().qualname()?;
+    Err(PyTypeError::new_err(format!(
+        "Encoding objects of type {name} is unsupported"
+    )))
 }

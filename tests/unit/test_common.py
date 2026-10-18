@@ -1,13 +1,16 @@
 import base64
 import collections
+import datetime
 import enum
 import gc
 import sys
 import types
 import typing
+import uuid
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Literal
 
@@ -17,7 +20,10 @@ from rune.struct import Struct
 import rune
 from rune import ValidationError
 
-from .utils import PY311, PY312, max_call_depth
+from .utils import PY311, PY312, max_call_depth, py315_or_later_only
+
+if sys.version_info >= (3, 15):
+    from builtins import frozendict
 
 
 class TestEncodeSubclasses:
@@ -926,3 +932,513 @@ class TestCallable:
         dec: rune.json.Decoder[Any] = rune.json.Decoder(typ)
         with pytest.raises(ValidationError, match="Expected `Callable`"):
             dec.decode(b"null")
+
+
+class Person(Struct):
+    first: str
+    last: str
+    age: int
+
+
+class PersonDict(typing.TypedDict):
+    first: str
+    last: str
+    age: int
+
+
+@dataclass
+class PersonDataclass:
+    first: str
+    last: str
+    age: int
+
+
+class PersonArray(Struct, array_like=True):
+    first: str
+    last: str
+    age: int
+
+
+class PersonTuple(typing.NamedTuple):
+    first: str
+    last: str
+    age: int
+
+
+class VeggieInt(enum.IntEnum):
+    CARROT = 1
+    LETTUCE = 2
+
+
+class VeggieStr(enum.Enum):
+    CARROT = "carrot"
+    LETTUCE = "banana"
+
+
+class TestUnionTypeErrors:
+    def test_decoder_unsupported_type(self, proto: ModuleType) -> None:
+        with pytest.raises(TypeError):
+            proto.Decoder(1)
+
+    def test_decoder_validates_struct_definition_unsupported_types(self, proto: ModuleType) -> None:
+        """Struct definitions aren't validated until first use"""
+
+        class Test(Struct):
+            a: 1  # type: ignore[valid-type]
+
+        with pytest.raises(TypeError):
+            proto.Decoder(Test)
+
+    @pytest.mark.parametrize("typ", [int | deque, deque | int])
+    def test_err_union_with_custom_type(self, typ: Any, proto: ModuleType) -> None:
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+        assert "custom type" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            dict | Person,
+            Person | dict,
+            PersonDict | dict,
+            PersonDataclass | dict,
+            Person | PersonDict,
+        ],
+    )
+    def test_err_union_with_multiple_dict_like_types(self, typ: Any, proto: ModuleType) -> None:
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+        assert "more than one dict-like type" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @py315_or_later_only
+    def test_err_union_frozendict_dict_like_types(self, proto: ModuleType) -> None:
+        for typ in [
+            frozendict | Person,
+            Person | frozendict,
+            PersonDict | frozendict,
+            typing.Union[PersonDataclass, frozendict],  # noqa
+        ]:
+            with pytest.raises(TypeError) as rec:
+                proto.Decoder(typ)
+            assert "more than one dict-like type" in str(rec.value)
+            assert repr(typ) in str(rec.value)
+
+    @py315_or_later_only
+    def test_err_union_frozendict_and_dict(self, proto: ModuleType) -> None:
+        for typ in [
+            frozendict | dict,
+            dict | frozendict,
+            dict[str, int] | frozendict,
+            frozendict[str, int] | dict,
+            frozendict[str, int] | dict[str, bool],
+        ]:
+            with pytest.raises(TypeError) as rec:
+                proto.Decoder(typ)
+            assert "more than one dict type" in str(rec.value)
+            assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            PersonArray | list,
+            tuple | PersonArray,
+            PersonArray | PersonTuple,
+            PersonTuple | frozenset,
+            typing.Union[PersonArray, list],  # noqa
+        ],
+    )
+    def test_err_union_with_struct_array_like_and_array(self, typ: Any, proto: ModuleType) -> None:
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+        assert "more than one array-like type" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            FruitInt | int,
+            FruitInt | Literal[1, 2],
+            typing.Union[FruitInt, int],  # noqa
+        ],
+    )
+    def test_err_union_with_multiple_int_like_types(self, typ: Any, proto: ModuleType) -> None:
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+        assert "int-like" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            str,
+            Literal["one", "two"],
+            datetime.datetime,
+            datetime.date,
+            datetime.time,
+            uuid.UUID,
+        ],
+    )
+    def test_err_union_with_multiple_str_like_types(self, typ: Any, proto: ModuleType) -> None:
+        union: Any = FruitStr | typ
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(union)
+        assert "str-like" in str(rec.value)
+        assert repr(union) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "typ,kind",
+        [
+            (FruitInt | VeggieInt, "int enum"),
+            (FruitStr | VeggieStr, "str enum"),
+            (dict[int, float] | dict, "dict"),
+            (list[int] | list[float], "array-like"),
+            (list[int] | tuple, "array-like"),
+            (set | tuple, "array-like"),
+            (tuple[int, ...] | list, "array-like"),
+            (tuple[int, float, str] | set, "array-like"),
+            (deque | int | Custom, "custom"),
+        ],
+    )
+    def test_err_union_conflicts(self, typ: Any, kind: str, proto: ModuleType) -> None:
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+        assert f"more than one {kind}" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    def test_310_union_types(self, proto: ModuleType) -> None:
+        dec: Any = proto.Decoder(int | str | None)
+        for msg in [1, "abc", None]:
+            assert dec.decode(proto.encode(msg)) == msg
+        with pytest.raises(ValidationError):
+            assert dec.decode(proto.encode(1.5))
+
+
+class TestStructUnion:
+    def test_err_union_struct_mix_array_like(self, proto: ModuleType) -> None:
+        class Test1(Struct, tag=True, array_like=True):
+            x: int
+
+        class Test2(Struct, tag=True, array_like=False):
+            x: int
+
+        typ = Test1 | Test2
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        assert "array_like" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    @pytest.mark.parametrize("tag1", [False, True])
+    def test_err_union_struct_not_tagged(
+        self, array_like: bool, tag1: bool, proto: ModuleType
+    ) -> None:
+        class Test1(Struct, tag=tag1, array_like=array_like):
+            x: int
+
+        class Test2(Struct, array_like=array_like):
+            x: int
+
+        typ = Test1 | Test2
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        assert "must be tagged" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_err_union_conflict_with_basic_type(self, array_like: bool, proto: ModuleType) -> None:
+        class Test1(Struct, tag=True, array_like=array_like):
+            x: int
+
+        class Test2(Struct, tag=True, array_like=array_like):
+            x: int
+
+        other: type = list if array_like else dict
+
+        typ: Any = Test1 | Test2 | other
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        if array_like:
+            assert "more than one array-like type" in str(rec.value)
+        else:
+            assert "more than one dict-like type" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_err_union_struct_different_fields(self, proto: ModuleType, array_like: bool) -> None:
+        class Test1(Struct, tag_field="foo", array_like=array_like):
+            x: int
+
+        class Test2(Struct, tag_field="bar", array_like=array_like):
+            x: int
+
+        typ = Test1 | Test2
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        assert "the same `tag_field`" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_err_union_struct_mix_int_str_tags(self, proto: ModuleType, array_like: bool) -> None:
+        class Test1(Struct, tag=1, array_like=array_like):
+            x: int
+
+        class Test2(Struct, tag="two", array_like=array_like):
+            x: int
+
+        typ = Test1 | Test2
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        assert "both `int` and `str` tags" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            ("a", "b", "b"),
+            ("a", "a", "b"),
+            ("a", "b", "a"),
+            (1, 2, 2),
+            (1, 1, 2),
+            (1, 2, 1),
+        ],
+    )
+    def test_err_union_struct_non_unique_tag_values(
+        self, proto: ModuleType, array_like: bool, tags: tuple[Any, ...]
+    ) -> None:
+        class Test1(Struct, tag=tags[0], array_like=array_like):
+            x: int
+
+        class Test2(Struct, tag=tags[1], array_like=array_like):
+            x: int
+
+        class Test3(Struct, tag=tags[2], array_like=array_like):
+            x: int
+
+        typ = Test1 | Test2 | Test3
+
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(typ)
+
+        assert "not supported" in str(rec.value)
+        assert "unique `tag`" in str(rec.value)
+        assert repr(typ) in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "tag1, tag2, unknown",
+        [
+            ("Test1", "Test2", "Test3"),
+            (0, 1, 2),
+            (123, -123, 0),
+        ],
+    )
+    def test_decode_struct_union(
+        self, proto: ModuleType, tag1: Any, tag2: Any, unknown: Any
+    ) -> None:
+        class Test1(Struct, tag=tag1):
+            a: int
+            b: int
+            c: int = 0
+
+        class Test2(Struct, tag=tag2):
+            x: int
+            y: int
+
+        dec: Any = proto.Decoder(Test1 | Test2)
+        enc: Any = proto.Encoder()
+
+        # Tag can be in any position
+        assert dec.decode(enc.encode({"type": tag1, "a": 1, "b": 2})) == Test1(1, 2)
+        assert dec.decode(enc.encode({"a": 1, "type": tag1, "b": 2})) == Test1(1, 2)
+        assert dec.decode(enc.encode({"x": 1, "y": 2, "type": tag2})) == Test2(1, 2)
+
+        # Optional fields still work
+        assert dec.decode(enc.encode({"type": tag1, "a": 1, "b": 2, "c": 3})) == Test1(1, 2, 3)
+        assert dec.decode(enc.encode({"a": 1, "b": 2, "c": 3, "type": tag1})) == Test1(1, 2, 3)
+
+        # Extra fields still ignored
+        assert dec.decode(enc.encode({"a": 1, "b": 2, "d": 4, "type": tag1})) == Test1(1, 2)
+
+        # Tag missing
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode({"a": 1, "b": 2}))
+        assert "missing required field `type`" in str(rec.value)
+
+        # Tag wrong type
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode({"type": 123.456, "a": 1, "b": 2}))
+        assert f"Expected `{type(tag1).__name__}`" in str(rec.value)
+        assert "`$.type`" in str(rec.value)
+
+        # Tag unknown
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode({"type": unknown, "a": 1, "b": 2}))
+        assert f"Invalid value {unknown!r} - at `$.type`" == str(rec.value)
+
+    @pytest.mark.parametrize(
+        "tag1, tag2, tag3, unknown",
+        [
+            ("Test1", "Test2", "Test3", "Test4"),
+            (0, 1, 2, 3),
+            (123, -123, 0, -1),
+        ],
+    )
+    def test_decode_struct_array_union(
+        self, proto: ModuleType, tag1: Any, tag2: Any, tag3: Any, unknown: Any
+    ) -> None:
+        class Test1(Struct, tag=tag1, array_like=True):
+            a: int
+            b: int
+            c: int = 0
+
+        class Test2(Struct, tag=tag2, array_like=True):
+            x: int
+            y: int
+
+        class Test3(Struct, tag=tag3, array_like=True):
+            pass
+
+        dec: Any = proto.Decoder(Test1 | Test2 | Test3)
+        enc: Any = proto.Encoder()
+
+        # Decoding works
+        assert dec.decode(enc.encode([tag1, 1, 2])) == Test1(1, 2)
+        assert dec.decode(enc.encode([tag2, 3, 4])) == Test2(3, 4)
+        assert dec.decode(enc.encode([tag3])) == Test3()
+
+        # Optional & Extra fields still respected
+        assert dec.decode(enc.encode([tag1, 1, 2, 3])) == Test1(1, 2, 3)
+        assert dec.decode(enc.encode([tag1, 1, 2, 3, 4])) == Test1(1, 2, 3)
+
+        # Missing required field
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode([tag1, 1]))
+        assert "Expected `array` of at least length 3, got 2" in str(rec.value)
+
+        # Type error has correct field index
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode([tag1, 1, "bad", 2]))
+        assert "Expected `int`, got `str` - at `$[2]`" == str(rec.value)
+
+        # Tag missing
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode([]))
+        assert "Expected `array` of at least length 1, got 0" == str(rec.value)
+
+        # Tag wrong type
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode([123.456, 2, 3, 4]))
+        assert f"Expected `{type(tag1).__name__}`" in str(rec.value)
+        assert "`$[0]`" in str(rec.value)
+
+        # Tag unknown
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode([unknown, 1, 2, 3]))
+        assert f"Invalid value {unknown!r} - at `$[0]`" == str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_decode_struct_union_with_non_struct_types(
+        self, array_like: bool, proto: ModuleType
+    ) -> None:
+        class Test1(Struct, tag=True, array_like=array_like):
+            a: int
+            b: int
+
+        class Test2(Struct, tag=True, array_like=array_like):
+            x: int
+            y: int
+
+        dec: Any = proto.Decoder(Test1 | Test2 | int | str | None)
+        enc: Any = proto.Encoder()
+
+        msgs: list[Any] = [Test1(1, 2), Test2(3, 4), None, 5, 6]
+        for msg in msgs:
+            assert dec.decode(enc.encode(msg)) == msg
+
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(enc.encode(True))
+
+        typ: str = "array" if array_like else "object"
+
+        assert f"Expected `int | str | {typ} | null`, got `bool`" == str(rec.value)
+
+    @pytest.mark.parametrize("array_like", [False, True])
+    def test_struct_union_cached(self, array_like: bool, proto: ModuleType) -> None:
+        from rune.rune import _struct_lookup_cache as cache
+
+        cache.clear()
+
+        class Test1(Struct, tag=True, array_like=array_like):
+            a: int
+            b: int
+
+        class Test2(Struct, tag=True, array_like=array_like):
+            x: int
+            y: int
+
+        typ1: Any = Test2 | Test1
+        typ2: Any = Test1 | Test2
+        typ3: Any = Test1 | Test2 | int | None
+
+        for typ in [typ1, typ2, typ3]:
+            for msg in [Test1(1, 2), Test2(3, 4)]:
+                assert proto.decode(proto.encode(msg), type=typ) == msg
+
+        assert len(cache) == 1
+        assert frozenset((Test1, Test2)) in cache
+
+    def test_struct_union_cache_evicted(self, proto: ModuleType) -> None:
+        from rune.rune import _struct_lookup_cache as cache
+
+        MAX_CACHE_SIZE: int = 64  # XXX: update if hardcoded value in `_core.c` changes
+
+        cache.clear()
+
+        def call_with_new_types() -> frozenset[type]:
+            class Test1(Struct, tag=True):
+                a: int
+
+            class Test2(Struct, tag=True):
+                x: int
+
+            typ: tuple[type, type] = (Test1, Test2)
+
+            proto.decode(proto.encode(Test1(1)), type=typing.Union[typ])  # noqa: UP007
+
+            return frozenset(typ)
+
+        first: frozenset[type] = call_with_new_types()
+        assert first in cache
+
+        # Fill up the cache
+        for _ in range(MAX_CACHE_SIZE - 1):
+            call_with_new_types()
+
+        # Check that first item is still in cache and is first in order
+        assert len(cache) == MAX_CACHE_SIZE
+        assert first in cache
+        assert first == next(iter(cache.keys()))
+
+        # Add a new item, causing an item to be popped from the cache
+        new: frozenset[type] = call_with_new_types()
+
+        assert len(cache) == MAX_CACHE_SIZE
+        assert first not in cache
+        assert frozenset(new) in cache

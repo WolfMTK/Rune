@@ -7,6 +7,7 @@ mod msgpack;
 #[pyo3::pymodule]
 mod rune {
     use pyo3::prelude::*;
+    use pyo3::types::PyDict;
 
     #[pymodule]
     mod json {
@@ -29,6 +30,7 @@ mod rune {
         let modules = sys.getattr("modules")?;
         modules.set_item("rune.json", m.getattr("json")?)?;
         modules.set_item("rune.msgpack", m.getattr("msgpack")?)?;
+        m.add("_struct_lookup_cache", PyDict::new(m.py()))?;
         Ok(())
     }
 }

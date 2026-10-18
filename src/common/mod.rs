@@ -7,6 +7,7 @@ pub(crate) mod decode;
 pub(crate) mod dynamic;
 pub(crate) mod py_types;
 pub(crate) mod token;
+pub mod validate;
 pub(crate) mod writer;
 
 pub(crate) fn recursion_limit(py: Python<'_>) -> PyResult<usize> {

@@ -21,3 +21,7 @@ pub const NEEDS_ESCAPE: [bool; 256] = {
 };
 
 pub const MAX_DEPTH: usize = 512;
+
+pub const CACHE_ATTR: &str = "__rune_cache__";
+
+pub const STRUCT_LOOKUP_CACHE_SIZE: usize = 64;

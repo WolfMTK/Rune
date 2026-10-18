@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use crate::common::token::Token;
 use crate::common::writer::Writer;
 use crate::constants::{DEC_DIGITS, HEX, INITIAL_CAPACITY, NEEDS_ESCAPE};
@@ -18,71 +20,92 @@ impl JsonWriter {
 
     #[inline]
     fn begin_item(&mut self) -> bool {
-        if self.expect_value {
-            self.expect_value = false;
+        if std::mem::take(&mut self.expect_value) {
             return false;
         }
+        let Some(frame) = self.frames.last_mut() else {
+            return false;
+        };
+        if !std::mem::replace(&mut frame.first, false) {
+            self.out.push(b',');
+        }
+        frame.is_map
+    }
 
-        match self.frames.last_mut() {
-            Some(frame) => {
-                let is_key = frame.is_map;
-                if frame.first {
-                    frame.first = false;
-                } else {
-                    self.out.push(b',');
-                }
-                is_key
-            }
-            None => false,
+    #[inline]
+    fn finish_key(&mut self) {
+        self.out.push(b':');
+        self.expect_value = true;
+    }
+
+    #[inline]
+    fn write_scalar(&mut self, write: impl FnOnce(&mut Self)) {
+        let is_key = self.begin_item();
+        if is_key {
+            self.out.push(b'"');
+        }
+        write(self);
+        if is_key {
+            self.out.push(b'"');
+            self.finish_key();
         }
     }
 
     #[inline]
-    fn write_int(&mut self, value: i64) {
-        let mut num = value.unsigned_abs();
+    fn open_container(&mut self, bracket: u8, is_map: bool) {
+        self.begin_item();
+        self.out.push(bracket);
+        self.frames.push(Frame {
+            is_map,
+            first: true,
+        });
+    }
+
+    #[inline]
+    fn close_container(&mut self) {
+        let frame = self
+            .frames
+            .pop()
+            .expect("End token without an open container");
+        self.out.push(if frame.is_map { b'}' } else { b']' });
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        if value < 0 {
+            self.out.push(b'-');
+        }
+        self.write_u64(value.unsigned_abs());
+    }
+
+    #[inline]
+    fn write_u64(&mut self, mut num: u64) {
         let mut buf = [0u8; 20];
         let mut index = buf.len();
-
         while num >= 100 {
-            let pair = ((num % 100) as usize) * 2;
+            let pair = (num % 100) as usize * 2;
             num /= 100;
             index -= 2;
-            buf[index] = DEC_DIGITS[pair];
-            buf[index + 1] = DEC_DIGITS[pair + 1];
+            buf[index..index + 2].copy_from_slice(&DEC_DIGITS[pair..pair + 2]);
         }
         if num >= 10 {
-            let pair = (num as usize) * 2;
+            let pair = num as usize * 2;
             index -= 2;
-            buf[index] = DEC_DIGITS[pair];
-            buf[index + 1] = DEC_DIGITS[pair + 1];
+            buf[index..index + 2].copy_from_slice(&DEC_DIGITS[pair..pair + 2]);
         } else {
             index -= 1;
             buf[index] = b'0' + num as u8;
-        }
-        if value < 0 {
-            index -= 1;
-            buf[index] = b'-';
         }
         self.out.extend_from_slice(&buf[index..]);
     }
 
     #[inline]
-    fn close_scalar_key(&mut self, start: usize, is_key: bool) {
-        if is_key {
-            self.out.insert(start, b'"');
-            self.out.push(b'"');
-            self.out.push(b':');
-            self.expect_value = true;
-        }
-    }
-
-    #[inline]
     fn write_float(&mut self, value: f64) {
-        if value.is_finite() {
-            self.out.extend_from_slice(format!("{value:?}").as_bytes());
-        } else {
+        if !value.is_finite() {
             self.out.extend_from_slice(b"null");
+            return;
         }
+        let _ = write!(self.out, "{value:?}");
     }
 
     #[inline]
@@ -95,27 +118,36 @@ impl JsonWriter {
                 continue;
             }
             self.out.extend_from_slice(&bytes[start..i]);
-            match b {
-                b'"' => self.out.extend_from_slice(b"\\\""),
-                b'\\' => self.out.extend_from_slice(b"\\\\"),
-                b'\n' => self.out.extend_from_slice(b"\\n"),
-                b'\r' => self.out.extend_from_slice(b"\\r"),
-                b'\t' => self.out.extend_from_slice(b"\\t"),
-                0x08 => self.out.extend_from_slice(b"\\b"),
-                0x0c => self.out.extend_from_slice(b"\\f"),
-                _ => self.out.extend_from_slice(&[
+            self.write_escaped_byte(b);
+            start = i + 1;
+        }
+        self.out.extend_from_slice(&bytes[start..]);
+        self.out.push(b'"');
+    }
+
+    #[inline]
+    fn write_escaped_byte(&mut self, b: u8) {
+        let short: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            _ => {
+                self.out.extend_from_slice(&[
                     b'\\',
                     b'u',
                     b'0',
                     b'0',
                     HEX[(b >> 4) as usize],
                     HEX[(b & 0xf) as usize],
-                ]),
+                ]);
+                return;
             }
-            start = i + 1;
-        }
-        self.out.extend_from_slice(&bytes[start..]);
-        self.out.push(b'"');
+        };
+        self.out.extend_from_slice(short);
     }
 }
 
@@ -129,68 +161,24 @@ impl Writer for JsonWriter {
     #[inline]
     fn write(&mut self, token: Token<'_>) {
         match token {
-            Token::Null => {
-                let is_key = self.begin_item();
-                let start = self.out.len();
-                self.out.extend_from_slice(b"null");
-                self.close_scalar_key(start, is_key);
-            }
-            Token::Bool(value) => {
-                let is_key = self.begin_item();
-                let start = self.out.len();
-                self.out
-                    .extend_from_slice(if value { b"true" } else { b"false" });
-                self.close_scalar_key(start, is_key);
-            }
-            Token::Int(value) => {
-                let is_key = self.begin_item();
-                let start = self.out.len();
-                self.write_int(value);
-                self.close_scalar_key(start, is_key);
-            }
-            Token::UInt(value) => {
-                let is_key = self.begin_item();
-                let start = self.out.len();
-                self.out.extend_from_slice(value.to_string().as_bytes());
-                self.close_scalar_key(start, is_key);
-            }
-            Token::Float(value) => {
-                let is_key = self.begin_item();
-                let start = self.out.len();
-                self.write_float(value);
-                self.close_scalar_key(start, is_key);
-            }
+            Token::Null => self.write_scalar(|w| w.out.extend_from_slice(b"null")),
+            Token::Bool(value) => self.write_scalar(|w| {
+                w.out
+                    .extend_from_slice(if value { b"true" } else { b"false" })
+            }),
+            Token::Int(value) => self.write_scalar(|w| w.write_i64(value)),
+            Token::UInt(value) => self.write_scalar(|w| w.write_u64(value)),
+            Token::Float(value) => self.write_scalar(|w| w.write_float(value)),
             Token::Str(string) => {
                 let is_key = self.begin_item();
                 self.write_str(string);
                 if is_key {
-                    self.out.push(b':');
-                    self.expect_value = true;
+                    self.finish_key();
                 }
             }
-            Token::ArrayStart(_) => {
-                self.begin_item();
-                self.out.push(b'[');
-                self.frames.push(Frame {
-                    is_map: false,
-                    first: true,
-                });
-            }
-            Token::MapStart(_) => {
-                self.begin_item();
-                self.out.push(b'{');
-                self.frames.push(Frame {
-                    is_map: true,
-                    first: true,
-                });
-            }
-            Token::End => {
-                let frame = self
-                    .frames
-                    .pop()
-                    .expect("End token without an open container");
-                self.out.push(if frame.is_map { b'}' } else { b']' });
-            }
+            Token::ArrayStart(_) => self.open_container(b'[', false),
+            Token::MapStart(_) => self.open_container(b'{', true),
+            Token::End => self.close_container(),
         }
     }
 }

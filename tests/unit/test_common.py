@@ -1539,7 +1539,7 @@ class TestGenericStruct:
             res = proto.decode(msg, type=mod.Ex[int])
             assert res == sol
 
-            res = proto.decode(msg, type=mod.Ex[typing.Union[int, str]]) # noqa
+            res = proto.decode(msg, type=mod.Ex[typing.Union[int, str]])  # noqa
             assert res == sol
 
             res = proto.decode(msg, type=mod.Ex[int | str])
@@ -1924,7 +1924,7 @@ class TestGenericStruct:
             # union (collected via recursion) or a container (collected as its own
             # node), not just at the top level
             msg = b'{"key": 1, "val": "a"}'
-            assert rune.json.decode(msg, type=typing.Optional[typ]) == mod.Pair(1, "a") # noqa
+            assert rune.json.decode(msg, type=typing.Optional[typ]) == mod.Pair(1, "a")  # noqa
             assert rune.json.decode(b"[" + msg + b"]", type=list[typ]) == [mod.Pair(1, "a")]
 
     def test_manual_types_generic_alias_robustness(self) -> None:

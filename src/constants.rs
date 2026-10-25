@@ -1,27 +1,14 @@
-pub const INITIAL_CAPACITY: usize = 256;
+use std::ops::Range;
 
-pub const DEC_DIGITS: &[u8; 200] = b"0001020304050607080910111213141516171819\
-2021222324252627282930313233343536373839\
-4041424344454647484950515253545556575859\
-6061626364656667686970717273747576777879\
-8081828384858687888990919293949596979899";
-
-pub const HEX: &[u8; 16] = b"0123456789abcdef";
-
-pub const NEEDS_ESCAPE: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
-    while i < 0x20 {
-        table[i] = true;
-        i += 1;
-    }
-    table[b'"' as usize] = true;
-    table[b'\\' as usize] = true;
-    table
-};
-
-pub const MAX_DEPTH: usize = 512;
-
-pub const CACHE_ATTR: &str = "__rune_cache__";
-
-pub const STRUCT_LOOKUP_CACHE_SIZE: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 512;
+pub(crate) const GENERATED_NAMEDTUPLE_PREFIX: &str = "namedtuple_";
+pub(crate) const STRUCT_LOOKUP_CACHE_SIZE: usize = 64;
+pub(crate) const CACHE_ATTR: &str = "__rune_cache__";
+pub(crate) const MAX_CACHED_KEYS: usize = 512;
+pub(crate) const MAX_CACHED_KEY_LEN: usize = 32;
+pub(crate) const INITIAL_CAPACITY: usize = 256;
+pub(crate) const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+pub(crate) const SCIENTIFIC_NOTATION_START: f64 = 1e16;
+pub(crate) const EXPONENT_MINUS_FIVE: Range<f64> = 1e-5..1e-4;
+pub(crate) const EXPONENT_MINUS_FIVE_PREFIX: &[u8] = b"0.0000";
+pub(crate) const PATH_PREFIX: &str = " - at `$";

@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "rune"
 description = "Typed serialization for Python."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3",

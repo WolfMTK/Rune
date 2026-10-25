@@ -1,9 +1,13 @@
-pub(crate) mod reader;
-pub(crate) mod structures;
-pub(crate) mod writer;
+use crate::common::macros::format_bindings;
 
-crate::common::bindings::format_bindings!(
+mod helpers;
+mod reader;
+mod structures;
+mod writer;
+
+format_bindings!(
     "rune.json",
-    crate::json::structures::JsonWriter,
-    crate::json::reader
+    Json,
+    structures::JsonWriter,
+    structures::Parser
 );

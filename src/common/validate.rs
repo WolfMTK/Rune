@@ -1,46 +1,155 @@
+use crate::common::enums::UnionKind;
+use crate::common::helpers::{is_named_tuple_class, struct_class};
+use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
-    date, datetime, deque, frozendict, is_dataclass, is_enum_class, is_literal_origin,
-    is_typeddict, is_typevar, is_union_origin, time, type_args, type_origin, uuid,
+    date, datetime, deque, frozendict, is_dataclass, is_enum_class, is_literal_origin, is_type,
+    is_typeddict, is_typevar, origin_or_self, time, type_args, type_origin, uuid,
 };
-use crate::common::struct_schema::{
-    fields_for_validation, is_array_like_struct, is_struct_class, struct_tag, struct_tag_field,
-    struct_visit_key,
-};
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::{PyAnyMethods, PyTypeMethods};
+use crate::common::structures::{StructSettings, Validator};
+use crate::common::types::UnionOption;
+use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
+use pyo3::prelude::{PyAnyMethods, PySetMethods};
 use pyo3::types::{
     PyBool, PyDict, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple, PyType,
 };
-use pyo3::{Bound, PyAny, PyResult};
-use std::collections::HashSet;
+use pyo3::{Bound, PyAny, PyResult, intern};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    IntEnum,
-    StrEnum,
-    IntPlain,
-    StrPlain,
-    StrStrict,
-    Dict,
-    Array,
-    Deque,
-    Custom,
-    Other,
+pub(crate) fn validate_literal_value(value: &Bound<'_, PyAny>) -> PyResult<()> {
+    if value.is_exact_instance_of::<PyInt>() {
+        validate_i64_range(value, "Literal")
+    } else if value.is_none()
+        || value.is_exact_instance_of::<PyBool>()
+        || value.is_exact_instance_of::<PyString>()
+    {
+        Ok(())
+    } else {
+        Err(PyTypeError::new_err(format!(
+            "Literal value {} is not supported, expected an int, str, bool or None",
+            value.repr()?
+        )))
+    }
+}
+
+pub(crate) fn validate_i64_range(value: &Bound<'_, PyAny>, label: &str) -> PyResult<()> {
+    value.extract::<i64>().map(drop).map_err(|_| {
+        PyNotImplementedError::new_err(format!(
+            "Integer {label} values outside the 64-bit signed integer range are not supported"
+        ))
+    })
 }
 
 pub(crate) fn validate_type(ty: &Bound<'_, PyAny>) -> PyResult<()> {
-    validate_recursive(ty, &mut HashSet::new())
+    if is_enum_class(ty)? {
+        validate_enum(ty)?;
+    }
+    Validator::default().visit(ty)
 }
-
-pub(crate) fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
+pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind>> {
+    let is_frozendict = frozendict(ty.py()).is_some_and(|frozendict| ty.is(frozendict));
+    Ok(if is_type::<PyDict>(ty) || is_frozendict {
+        Some(UnionKind::Dict)
+    } else if is_type::<PyList>(ty)
+        || is_type::<PySet>(ty)
+        || is_type::<PyFrozenSet>(ty)
+        || is_type::<PyTuple>(ty)
+    {
+        Some(UnionKind::Array)
+    } else if ty.is(deque(ty.py())?) {
+        Some(UnionKind::Deque)
+    } else {
+        None
+    })
+}
+pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
+    use UnionKind::*;
+    let options = type_args(ty)?
+        .into_iter()
+        .filter(|arg| !is_type::<PyNone>(arg))
+        .map(|option| {
+            let settings = struct_class(&option)?
+                .map(|class| StructSettings::of_class(&class))
+                .transpose()?;
+            Ok((option, settings))
+        })
+        .collect::<PyResult<Vec<UnionOption<'_>>>>()?;
+    if options.len() < 2 {
+        return Ok(());
+    }
+    ensure_union_structs_are_valid(ty, &options)?;
+    let mut seen_tagged = false;
+    let options: Vec<_> = options
+        .into_iter()
+        .filter(|(_, settings)| {
+            let is_tagged = settings.as_ref().is_some_and(|s| s.tag.is_some());
+            let repeats_tagged_group = is_tagged && seen_tagged;
+            seen_tagged |= is_tagged;
+            !repeats_tagged_group
+        })
+        .collect();
+    let kinds = options
+        .iter()
+        .map(|(option, settings)| match settings {
+            Some(settings) if settings.array_like => Ok(Array),
+            Some(_) => Ok(Dict),
+            None => union_kind(option),
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let count = |wanted: &[UnionKind]| kinds.iter().filter(|kind| wanted.contains(kind)).count();
+    let has_many_dicts = count(&[Dict]) > 1;
+    let has_dict_like = has_many_dicts && has_dict_like_option(&options, &kinds)?;
+    let rules = [
+        (
+            count(&[IntEnum]) > 1,
+            "it may not contain more than one int enum type",
+        ),
+        (
+            count(&[StrEnum]) > 1,
+            "it may not contain more than one str enum type",
+        ),
+        (
+            count(&[IntEnum]) >= 1 && count(&[IntEnum, IntPlain]) > 1,
+            "it may not contain more than one int-like type",
+        ),
+        (
+            count(&[StrEnum, StrStrict]) >= 1 && count(&[StrEnum, StrStrict, StrPlain]) > 1,
+            "it may not contain more than one str-like type",
+        ),
+        (
+            has_dict_like,
+            "it may not contain more than one dict-like type",
+        ),
+        (has_many_dicts, "it may not contain more than one dict type"),
+        (
+            count(&[NamedTuple]) > 1,
+            "it may not contain more than one NamedTuple type",
+        ),
+        (
+            count(&[Array, NamedTuple]) > 1,
+            "it may not contain more than one array-like type",
+        ),
+        (
+            count(&[Custom, Deque]) > 1,
+            "it may not contain more than one custom type",
+        ),
+        (
+            count(&[Deque]) > 0,
+            "contains a custom type (collections.deque), which can't be used in a union",
+        ),
+    ];
+    for (violated, reason) in rules {
+        reject_union_if!(ty, violated, reason);
+    }
+    Ok(())
+}
+fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     let values = enum_values(ty)?;
     if values.is_empty() {
         return Err(PyTypeError::new_err(
             "Enum types must have at least one item",
         ));
     }
-    let all_str = values.iter().all(|v| v.is_instance_of::<PyString>());
-    let all_int = values.iter().all(|v| v.is_instance_of::<PyInt>());
+    let all_str = values.iter().all(PyAnyMethods::is_instance_of::<PyString>);
+    let all_int = values.iter().all(PyAnyMethods::is_instance_of::<PyInt>);
     if all_str || all_int {
         return Ok(());
     }
@@ -50,299 +159,130 @@ pub(crate) fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     )))
 }
 
-fn validate_recursive(
-    ty: &Bound<'_, PyAny>,
-    visited_structs: &mut HashSet<String>,
-) -> PyResult<()> {
-    if is_typevar(ty)? {
-        return validate_typevar(ty, visited_structs);
-    } else if is_struct_class(ty)? {
-        return validate_struct(ty, visited_structs);
-    } else if let Some(origin) = type_origin(ty)? {
-        return validate_generic(ty, &origin, visited_structs);
-    } else if !ty.is_instance_of::<PyType>() {
-        return Err(PyTypeError::new_err(format!(
-            "Unsupported type {}",
-            ty.repr()?
-        )));
-    }
-    Ok(())
-}
-
-fn validate_struct(ty: &Bound<'_, PyAny>, visited_structs: &mut HashSet<String>) -> PyResult<()> {
-    if !visited_structs.insert(struct_visit_key(ty)?) {
-        return Ok(());
-    }
-    for field in fields_for_validation(ty)? {
-        validate_recursive(&field.ty, visited_structs)?;
-    }
-    Ok(())
-}
-
-fn validate_typevar(ty: &Bound<'_, PyAny>, visited_structs: &mut HashSet<String>) -> PyResult<()> {
-    if ty.getattr("__constraints__")?.len()? > 0 {
-        return Err(PyTypeError::new_err(format!(
-            "Unbound TypeVar `{}` has constraints",
-            ty.repr()?
-        )));
-    }
-    let bound = ty.getattr("__bound__")?;
-    if bound.is_none() {
-        return Ok(());
-    }
-    validate_recursive(&bound, visited_structs)
-}
-
-fn validate_generic(
-    ty: &Bound<'_, PyAny>,
-    origin: &Bound<'_, PyAny>,
-    visited_structs: &mut HashSet<String>,
-) -> PyResult<()> {
-    if is_literal_origin(origin)? {
-        return Ok(());
-    }
-    let is_union = is_union_origin(origin)?;
-    if is_union {
-        ensure_union_is_unambiguous(ty)?;
-    }
-    if !is_union && classify_container(origin)?.is_none() {
-        return Ok(());
-    }
-    let ellipsis = ty.py().Ellipsis();
-    for arg in type_args(ty)? {
-        if !arg.is(&ellipsis) {
-            validate_recursive(&arg, visited_structs)?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
-    let none_type = ty.py().get_type::<PyNone>();
-    let options: Vec<Bound<'_, PyAny>> = type_args(ty)?
-        .into_iter()
-        .filter(|a| !a.is(&none_type))
-        .collect();
-    if options.len() < 2 {
-        return Ok(());
-    }
-    ensure_union_structs_are_valid(ty, &options)?;
-    let options = merge_tagged_structs(options)?;
-    let kinds = options
-        .iter()
-        .map(classify_type)
-        .collect::<PyResult<Vec<Kind>>>()?;
-    let count = |wanted: &[Kind]| kinds.iter().filter(|k| wanted.contains(k)).count();
-
-    let has_many_dicts = count(&[Kind::Dict]) > 1;
-    let has_dict_like = has_many_dicts && has_dict_like_option(&options, &kinds)?;
-
-    let violations = [
-        (
-            count(&[Kind::IntEnum]) > 1,
-            "has more than one int enum type",
-        ),
-        (
-            count(&[Kind::StrEnum]) > 1,
-            "has more than one str enum type",
-        ),
-        (
-            count(&[Kind::IntEnum]) >= 1 && count(&[Kind::IntEnum, Kind::IntPlain]) > 1,
-            "has more than one int-like type",
-        ),
-        (
-            count(&[Kind::StrEnum, Kind::StrStrict]) >= 1
-                && count(&[Kind::StrEnum, Kind::StrStrict, Kind::StrPlain]) > 1,
-            "has more than one str-like type",
-        ),
-        (has_dict_like, "has more than one dict-like type"),
-        (has_many_dicts, "has more than one dict type"),
-        (
-            count(&[Kind::Array]) > 1,
-            "has more than one array-like type",
-        ),
-        (
-            count(&[Kind::Custom, Kind::Deque]) > 1,
-            "has more than one custom type",
-        ),
-        (
-            count(&[Kind::Deque]) > 0,
-            "contains a custom type (collections.deque), which can't be used in a union",
-        ),
-    ];
-    if let Some((_, reason)) = violations.iter().find(|(violated, _)| *violated) {
-        return unsupported_union(ty, reason);
-    }
-    Ok(())
-}
-
-fn unsupported_union<T>(ty: &Bound<'_, PyAny>, reason: &str) -> PyResult<T> {
-    Err(PyTypeError::new_err(format!(
-        "Union {} is not supported, {reason}",
-        ty.repr()?
-    )))
-}
-
 fn ensure_union_structs_are_valid(
     ty: &Bound<'_, PyAny>,
-    options: &[Bound<'_, PyAny>],
+    options: &[UnionOption<'_>],
 ) -> PyResult<()> {
-    let mut structs = Vec::new();
-    for option in options {
-        if is_struct_class(option)? {
-            let settings = (is_array_like_struct(option)?, struct_tag_field(option)?);
-            structs.push((settings, struct_tag(option)?));
-        }
-    }
-    if structs.len() < 2 {
+    let structs: Vec<&StructSettings> = options
+        .iter()
+        .filter_map(|(_, settings)| settings.as_ref())
+        .collect();
+    let [first, _, ..] = structs.as_slice() else {
         return Ok(());
+    };
+    for settings in &structs {
+        reject_union_if!(
+            ty,
+            settings.array_like != first.array_like,
+            "structs in a union must all have the same `array_like` setting"
+        );
+        reject_union_if!(
+            ty,
+            settings.tag_field != first.tag_field,
+            "structs in a union must all use the same `tag_field`"
+        );
     }
-    let (array_like, tag_field) = &structs[0].0;
-    for ((option_array_like, option_tag_field), _) in &structs {
-        if option_array_like != array_like {
-            return unsupported_union(
-                ty,
-                "structs in a union must all have the same `array_like` setting",
-            );
-        } else if option_tag_field != tag_field {
-            return unsupported_union(ty, "structs in a union must all use the same `tag_field`");
-        }
-    }
-    let mut tags = Vec::with_capacity(structs.len());
-    for (_, tag) in structs {
-        let Some(tag) = tag else {
-            return unsupported_union(
-                ty,
-                "structs in a union must be tagged (set `tag`) so they can be told apart",
-            );
-        };
-        tags.push(tag);
-    }
-    let has_str = tags.iter().any(|t| t.is_instance_of::<PyString>());
-    let has_int = tags.iter().any(|t| t.is_instance_of::<PyInt>());
-    if has_str && has_int {
-        return unsupported_union(ty, "a union can't mix both `int` and `str` tags");
-    }
-    for (i, tag) in tags.iter().enumerate() {
-        for other in &tags[..i] {
-            if tag.eq(other)? {
-                return unsupported_union(
-                    ty,
-                    "struct tags must be a unique `tag` value for each struct",
-                );
-            }
-        }
+    let py = ty.py();
+    let tags: Vec<_> = structs
+        .iter()
+        .filter_map(|settings| settings.tag.as_ref().map(|tag| tag.bind(py)))
+        .collect();
+    reject_union_if!(
+        ty,
+        tags.len() < structs.len(),
+        "structs in a union must be tagged (set `tag`) so they can be told apart"
+    );
+    reject_union_if!(
+        ty,
+        tags.iter().any(|tag| tag.is_instance_of::<PyString>())
+            && tags.iter().any(|tag| tag.is_instance_of::<PyInt>()),
+        "a union can't mix both `int` and `str` tags"
+    );
+    let seen = PySet::empty(py)?;
+    for tag in tags {
+        reject_union_if!(
+            ty,
+            seen.contains(tag)?,
+            "struct tags must be a unique `tag` value for each struct"
+        );
+        seen.add(tag)?;
     }
     Ok(())
 }
 
-fn merge_tagged_structs(options: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Bound<'_, PyAny>>> {
-    let mut seen_tagged = false;
-    let mut merged = Vec::with_capacity(options.len());
-    for option in options {
-        let is_tagged = struct_tag(&option)?.is_some();
-        if !(is_tagged && seen_tagged) {
-            merged.push(option);
-        }
-        seen_tagged |= is_tagged;
-    }
-    Ok(merged)
-}
-
-fn has_dict_like_option(options: &[Bound<'_, PyAny>], kinds: &[Kind]) -> PyResult<bool> {
-    for (option, kind) in options.iter().zip(kinds) {
-        if *kind == Kind::Dict && is_dict_like(option)? {
+fn has_dict_like_option(options: &[UnionOption<'_>], kinds: &[UnionKind]) -> PyResult<bool> {
+    for ((option, settings), kind) in options.iter().zip(kinds) {
+        if *kind == UnionKind::Dict && (settings.is_some() || is_typeddict_or_dataclass(option)?) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn classify_type(ty: &Bound<'_, PyAny>) -> PyResult<Kind> {
-    let py = ty.py();
+fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
+    use UnionKind::*;
     if is_typevar(ty)? {
-        let bound = ty.getattr("__bound__")?;
-        if bound.is_none() {
-            return Ok(Kind::Other);
-        }
-        return classify_type(&bound);
-    } else if is_struct_class(ty)? {
-        if is_array_like_struct(ty)? {
-            return Ok(Kind::Array);
-        }
-        return Ok(Kind::Dict);
+        let bound = ty.getattr(intern!(ty.py(), "__bound__"))?;
+        return if bound.is_none() {
+            Ok(Other)
+        } else {
+            union_kind(&bound)
+        };
+    } else if let Some(class) = struct_class(ty)? {
+        return Ok(if StructSettings::of_class(&class)?.array_like {
+            Array
+        } else {
+            Dict
+        });
+    } else if is_named_tuple_class(&origin_or_self(ty)?)? {
+        return Ok(NamedTuple);
     } else if let Some(origin) = type_origin(ty)? {
         if is_literal_origin(&origin)? {
-            return Ok(classify_values(
-                &type_args(ty)?,
-                Kind::IntPlain,
-                Kind::StrPlain,
-            ));
+            return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));
         }
-        return Ok(classify_container(&origin)?.unwrap_or(Kind::Other));
-    } else if !ty.is_instance_of::<PyType>() || ty.is(py.get_type::<PyBool>()) {
-        return Ok(Kind::Other);
+        return Ok(container_kind(&origin)?.unwrap_or(Other));
+    }
+    Ok(if !ty.is_instance_of::<PyType>() || is_type::<PyBool>(ty) {
+        Other
     } else if is_enum_class(ty)? {
-        return Ok(classify_values(
-            &enum_values(ty)?,
-            Kind::IntEnum,
-            Kind::StrEnum,
-        ));
-    } else if ty.is(py.get_type::<PyInt>()) {
-        return Ok(Kind::IntPlain);
-    } else if ty.is(py.get_type::<PyString>()) {
-        return Ok(Kind::StrPlain);
+        value_kind(&enum_values(ty)?, IntEnum, StrEnum)
+    } else if is_type::<PyInt>(ty) {
+        IntPlain
+    } else if is_type::<PyString>(ty) {
+        StrPlain
     } else if is_strict_str_type(ty)? {
-        return Ok(Kind::StrStrict);
-    } else if let Some(kind) = classify_container(ty)? {
-        return Ok(kind);
+        StrStrict
+    } else if let Some(kind) = container_kind(ty)? {
+        kind
     } else if is_typeddict_or_dataclass(ty)? {
-        return Ok(Kind::Dict);
-    } else if is_named_tuple(ty)? {
-        return Ok(Kind::Array);
-    }
-    Ok(Kind::Custom)
-}
-
-fn classify_container(obj: &Bound<'_, PyAny>) -> PyResult<Option<Kind>> {
-    let py = obj.py();
-    if obj.is(py.get_type::<PyDict>()) || is_frozendict_type(obj) {
-        return Ok(Some(Kind::Dict));
-    } else if obj.is(py.get_type::<PyList>())
-        || obj.is(py.get_type::<PySet>())
-        || obj.is(py.get_type::<PyFrozenSet>())
-        || obj.is(py.get_type::<PyTuple>())
-    {
-        return Ok(Some(Kind::Array));
-    } else if obj.is(&deque(py)?) {
-        return Ok(Some(Kind::Deque));
-    }
-    Ok(None)
+        Dict
+    } else {
+        Custom
+    })
 }
 
 fn enum_values<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     ty.try_iter()?
-        .map(|member| member?.getattr("value"))
+        .map(|member| member?.getattr(intern!(ty.py(), "value")))
         .collect()
 }
 
-fn classify_values(values: &[Bound<'_, PyAny>], int_kind: Kind, str_kind: Kind) -> Kind {
+fn value_kind(values: &[Bound<'_, PyAny>], int_kind: UnionKind, str_kind: UnionKind) -> UnionKind {
     if values.is_empty() {
-        return Kind::Other;
-    } else if values.iter().all(|v| v.is_exact_instance_of::<PyInt>()) {
-        return int_kind;
-    } else if values.iter().all(|v| v.is_exact_instance_of::<PyString>()) {
-        return str_kind;
+        UnionKind::Other
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyInt>)
+    {
+        int_kind
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyString>)
+    {
+        str_kind
+    } else {
+        UnionKind::Other
     }
-    Kind::Other
-}
-
-fn is_frozendict_type(obj: &Bound<'_, PyAny>) -> bool {
-    frozendict(obj.py()).is_some_and(|frozendict| obj.is(&frozendict))
-}
-
-fn is_dict_like(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
-    Ok(is_struct_class(ty)? || is_typeddict_or_dataclass(ty)?)
 }
 
 fn is_typeddict_or_dataclass(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -351,14 +291,7 @@ fn is_typeddict_or_dataclass(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
         || is_dataclass(py)?.call1((ty,))?.is_truthy()?)
 }
 
-fn is_named_tuple(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let Ok(cls) = ty.cast::<PyType>() else {
-        return Ok(false);
-    };
-    Ok(cls.is_subclass_of::<PyTuple>()? && ty.hasattr("_fields")?)
-}
-
 fn is_strict_str_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = ty.py();
-    Ok(ty.is(&datetime(py)?) || ty.is(&date(py)?) || ty.is(&time(py)?) || ty.is(&uuid(py)?))
+    Ok(ty.is(datetime(py)?) || ty.is(date(py)?) || ty.is(time(py)?) || ty.is(uuid(py)?))
 }

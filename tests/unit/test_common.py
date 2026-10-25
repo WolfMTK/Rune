@@ -1952,3 +1952,255 @@ class TestGenericStruct:
         # too many
         with pytest.raises(TypeError):
             rune.json.Decoder(types.GenericAlias(GenericStruct, (int, str)))
+
+
+class TestNamedTuple:
+    def test_types_generic_alias_non_generic_errors(self):
+        # Parametrizing a non-generic NamedTuple via a manually-built
+        # 'types.GenericAlias' is meaningless and must raise, not silently ignore the
+        # args.
+        class Ex(typing.NamedTuple):
+            a: int
+
+        with pytest.raises(TypeError, match="not a generic type"):
+            rune.json.Decoder(types.GenericAlias(Ex, (int,)))
+
+    def test_type_cached(self, proto):
+        class Ex(typing.NamedTuple):
+            a: int
+            b: str
+
+        msg = (1, "two")
+
+        dec = proto.Decoder(Ex)
+        info = Ex.__rune_cache__
+        assert info is not None
+        dec2 = proto.Decoder(Ex)
+        assert Ex.__rune_cache__ is info
+
+        assert dec.decode(proto.encode(msg)) == msg
+        assert dec2.decode(proto.encode(msg)) == msg
+
+    def test_msgspec_cache_overwritten(self, proto):
+        class Ex(typing.NamedTuple):
+            x: int
+
+        Ex.__rune_cache__ = 1
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            proto.Decoder(Ex)
+
+    def test_multiple_namedtuple_errors(self, proto):
+        class Ex1(typing.NamedTuple):
+            a: int
+
+        class Ex2(typing.NamedTuple):
+            b: int
+
+        with pytest.raises(TypeError, match="may not contain more than one NamedTuple"):
+            proto.Decoder(Ex1 | Ex2)
+        with pytest.raises(TypeError, match="may not contain more than one NamedTuple"):
+            proto.Decoder(typing.Union[Ex1, Ex2])  # noqa
+
+    def test_subtype_error(self, proto):
+        class Ex(typing.NamedTuple):
+            a: int
+            b: list | tuple
+
+        with pytest.raises(TypeError, match="may not contain more than one array-like"):
+            proto.Decoder(Ex)
+        assert not hasattr(Ex, "__rune_cache__")
+
+    def test_recursive_type(self, proto):
+        source = """
+        from __future__ import annotations
+        from typing import NamedTuple, Union
+
+        class Ex(NamedTuple):
+            a: int
+            b: Ex | None
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(1, mod.Ex(2, None))
+            dec = proto.Decoder(mod.Ex)
+            assert dec.decode(proto.encode(msg)) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode(mod.Ex(1, ("bad", "two"))))
+            assert "`$[1][0]`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    @pytest.mark.parametrize("use_typing", [True, False])
+    def test_decode_namedtuple_no_defaults(self, proto, use_typing):
+        if use_typing:
+
+            class Example(typing.NamedTuple):
+                a: int
+                b: int
+                c: int
+
+        else:
+            Example = collections.namedtuple("Example", "a b c")
+
+        dec = proto.Decoder(Example)
+        msg = Example(1, 2, 3)
+        res = dec.decode(proto.encode(msg))
+        assert res == msg
+
+        suffix = ", got 1" if proto is rune.msgpack else ""
+        with pytest.raises(ValidationError, match=f"length 3{suffix}"):
+            dec.decode(proto.encode((1,)))
+
+        suffix = ", got 6" if proto is rune.msgpack else ""
+        with pytest.raises(ValidationError, match=f"length 3{suffix}"):
+            dec.decode(proto.encode((1, 2, 3, 4, 5, 6)))
+
+    @pytest.mark.parametrize("use_typing", [True, False])
+    def test_decode_namedtuple_with_defaults(self, proto, use_typing):
+        if use_typing:
+
+            class Example(typing.NamedTuple):
+                a: int
+                b: int
+                c: int = -3
+                d: int = -4
+                e: int = -5
+
+        else:
+            Example = collections.namedtuple("Example", "a b c d e", defaults=(-3, -4, -5))
+
+        dec = proto.Decoder(Example)
+        for args in [(1, 2), (1, 2, 3), (1, 2, 3, 4), (1, 2, 3, 4, 5)]:
+            msg = Example(*args)
+            res = dec.decode(proto.encode(msg))
+            assert res == msg
+
+        suffix = ", got 1" if proto is rune.msgpack else ""
+        with pytest.raises(ValidationError, match=f"length 2 to 5{suffix}"):
+            dec.decode(proto.encode((1,)))
+
+        suffix = ", got 6" if proto is rune.msgpack else ""
+        with pytest.raises(ValidationError, match=f"length 2 to 5{suffix}"):
+            dec.decode(proto.encode((1, 2, 3, 4, 5, 6)))
+
+    def test_decode_namedtuple_field_wrong_type(self, proto):
+        dec = proto.Decoder(PersonTuple)
+        msg = proto.encode((1, "bad", 2))
+        with pytest.raises(ValidationError, match=r"Expected `str`, got `int` - at `\$\[0\]`"):
+            dec.decode(msg)
+
+    def test_decode_namedtuple_not_array(self, proto):
+        dec = proto.Decoder(PersonTuple)
+        msg = proto.encode({})
+        with pytest.raises(ValidationError, match="Expected `array`, got `object`"):
+            dec.decode(msg)
+
+    def test_generic_namedtuple_info_cached(self, proto):
+        NamedTuple = pytest.importorskip("typing_extensions").NamedTuple
+
+        class Ex(NamedTuple, typing.Generic[T]):
+            x: T
+
+        typ = Ex[int]
+        assert Ex[int] is typ
+
+        dec = proto.Decoder(typ)
+        info = typ.__rune_cache__
+        assert info is not None
+        assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+        dec2 = proto.Decoder(typ)
+        assert typ.__rune_cache__ is info
+        assert sys.getrefcount(info) <= 5
+
+        del dec
+        del dec2
+        assert sys.getrefcount(info) <= 3
+
+    def test_generic_namedtuple_invalid_types_not_cached(self, proto):
+        NamedTuple = pytest.importorskip("typing_extensions").NamedTuple
+
+        class Ex(NamedTuple, typing.Generic[T]):
+            x: list[T] | tuple[float]
+
+        for typ in [Ex, Ex[int]]:
+            for _ in range(2):
+                with pytest.raises(TypeError, match="not supported"):
+                    proto.Decoder(typ)
+
+            assert not hasattr(typ, "__rune_cache__")
+
+    def test_generic_namedtuple(self, proto):
+        NamedTuple = pytest.importorskip("typing_extensions").NamedTuple
+
+        class Ex(NamedTuple, typing.Generic[T]):
+            x: T
+            y: list[T]
+
+        sol = Ex(1, [1, 2])
+        msg = proto.encode(sol)
+
+        res = proto.decode(msg, type=Ex)
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int | str])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[float])
+        assert type(res.x) is float
+
+        with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+            proto.decode(msg, type=Ex[str])
+
+    def test_recursive_generic_namedtuple(self, proto):
+        pytest.importorskip("typing_extensions")
+
+        source = """
+        from __future__ import annotations
+        from typing import Union, Generic, TypeVar
+        from typing_extensions import NamedTuple
+
+        T = TypeVar("T")
+
+        class Ex(NamedTuple, Generic[T]):
+            a: T
+            b: Ex[T] | None
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            msg2 = mod.Ex(a=1, b=mod.Ex(a="bad", b=None))
+            assert proto.decode(proto.encode(msg), type=mod.Ex) == msg
+            assert proto.decode(proto.encode(msg2), type=mod.Ex) == msg2
+            assert proto.decode(proto.encode(msg), type=mod.Ex[int]) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                proto.decode(proto.encode(msg2), type=mod.Ex[int])
+            assert "`$[1][0]`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    def test_namedtuple_hash_preserved_after_roundtrip(self, proto):
+        """Hash of deserialized NamedTuple matches hash of original.
+
+        Regression test for gh-967. In Python 3.14+, tuples cache their hash
+        in ob_hash. When msgspec allocates NamedTuples via tp_alloc (which
+        zero-initializes memory), ob_hash was left at 0 — a valid cached hash
+        — so hash() returned 0 for all deserialized NamedTuples."""
+
+        class Key(typing.NamedTuple):
+            value: int
+
+        original = Key(value=42)
+        encoded = proto.encode(original)
+        decoded = proto.decode(encoded, type=Key)
+
+        assert original == decoded
+        assert hash(original) == hash(decoded)
+
+        # Verify dict lookup works (requires matching hash)
+        d = {original: "found"}
+        assert decoded in d
+        assert d[decoded] == "found"

@@ -1,9 +1,14 @@
-pub(crate) mod reader;
-pub(crate) mod structures;
-pub(crate) mod writer;
+use crate::common::macros::format_bindings;
 
-crate::common::bindings::format_bindings!(
+mod enums;
+mod helpers;
+mod reader;
+mod structures;
+mod writer;
+
+format_bindings!(
     "rune.msgpack",
-    crate::msgpack::structures::MsgpackWriter,
-    crate::msgpack::reader
+    Msgpack,
+    structures::MsgpackWriter,
+    structures::Parser
 );

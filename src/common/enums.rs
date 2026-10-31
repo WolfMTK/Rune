@@ -105,7 +105,7 @@ impl Shape {
         match self {
             Self::Enum(plan) => plan.has_custom_missing,
             Self::Custom(_) => has_hook,
-            Self::Struct(plan) => !plan.constructor.is_direct(),
+            Self::Struct(plan) => plan.constructor.calls_user_code(),
             Self::NamedTuple(plan) => !plan.has_generated_new,
             _ => false,
         }
@@ -177,6 +177,7 @@ pub(crate) enum Constructor {
         object_new: Py<PyAny>,
         class: Py<PyAny>,
         alias: Option<Py<PyAny>>,
+        post_init: Option<Py<PyAny>>,
     },
     Init,
 }
@@ -198,11 +199,20 @@ impl Constructor {
             object_new: object_new.unbind(),
             class: class.clone().unbind(),
             alias,
+            post_init: class
+                .getattr_opt(intern!(py, "__post_init__"))?
+                .map(Bound::unbind),
         })
     }
 
-    pub(crate) fn is_direct(&self) -> bool {
-        matches!(self, Self::Direct { .. })
+    pub(crate) fn calls_user_code(&self) -> bool {
+        !matches!(
+            self,
+            Self::Direct {
+                post_init: None,
+                ..
+            }
+        )
     }
 }
 

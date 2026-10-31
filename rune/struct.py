@@ -55,7 +55,6 @@ class Struct(metaclass=StructMeta):
         cls.__struct_fields__ = _Lazy("__struct_fields__", _resolve_fields)
         if "__match_args__" not in cls.__dict__:
             cls.__match_args__ = _Lazy("__match_args__", _field_names)
-        # Not given -> inherited from the parent through normal attribute lookup.
         if array_like is not None:
             cls.__struct_array_like__ = array_like
         if tag_field is not None:
@@ -79,6 +78,9 @@ class Struct(metaclass=StructMeta):
         if kwargs:
             unknown = ", ".join(f"`{name}`" for name in kwargs)
             raise TypeError(f"Unexpected field(s): {unknown}")
+        post_init = getattr(cls, "__post_init__", None)
+        if post_init is not None:
+            post_init(self)
 
     def __eq__(self, other: object) -> bool:
         if other is self:

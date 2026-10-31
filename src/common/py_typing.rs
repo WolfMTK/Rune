@@ -5,6 +5,7 @@ use pyo3::types::PyType;
 use pyo3::{Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern};
 
 cached_objects! {
+    annotated => "typing"."Annotated",
     any => "typing"."Any",
     generic => "typing"."Generic",
     get_origin => "typing"."get_origin",
@@ -28,10 +29,13 @@ cached_objects! {
     get_recursion_limit => "sys"."getrecursionlimit",
     resolve_generic_fields => "rune.struct"."resolve_generic_fields",
     resolve_namedtuple_fields => "rune.struct"."resolve_namedtuple_fields",
+    resolve_type_alias => "rune.struct"."resolve_type_alias",
     struct_lookup_cache => "rune.rune"."_struct_lookup_cache",
     struct_base => "rune.struct"."Struct",
     struct_meta => "rune.struct"."StructMeta",
     object_type => "builtins"."object",
+    meta_type => "rune.meta"."Meta",
+    compile_regex => "re"."compile",
 }
 
 pub(crate) fn frozendict(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
@@ -44,6 +48,29 @@ pub(crate) fn frozendict(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     })
     .as_ref()
     .map(|frozendict| frozendict.bind(py))
+}
+
+pub(crate) fn type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if is_type_alias(ty) {
+        return Ok(Some(ty.clone()));
+    }
+    Ok(type_origin(ty)?.filter(is_type_alias))
+}
+
+pub(crate) fn is_type_alias(ty: &Bound<'_, PyAny>) -> bool {
+    type_alias_type(ty.py()).is_some_and(|alias_type| ty.get_type().is(alias_type))
+}
+
+fn type_alias_type(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
+    static CELL: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
+    CELL.get_or_init(py, || {
+        py.import("typing")
+            .and_then(|typing| typing.getattr("TypeAliasType"))
+            .ok()
+            .map(Bound::unbind)
+    })
+    .as_ref()
+    .map(|alias_type| alias_type.bind(py))
 }
 
 pub(crate) fn type_origin<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -93,6 +120,10 @@ pub(crate) fn is_typevar(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
 
 pub(crate) fn is_literal_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(origin.is(literal(origin.py())?))
+}
+
+pub(crate) fn is_annotated_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(origin.is(annotated(origin.py())?))
 }
 
 pub(crate) fn is_union_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {

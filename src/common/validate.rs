@@ -1,16 +1,19 @@
 use crate::common::enums::UnionKind;
-use crate::common::helpers::{is_named_tuple_class, struct_class};
+use crate::common::helpers::{
+    is_named_tuple_class, resolve_type_aliases, struct_class, union_members,
+};
 use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
-    date, datetime, deque, frozendict, is_dataclass, is_enum_class, is_literal_origin, is_type,
-    is_typeddict, is_typevar, origin_or_self, time, type_args, type_origin, uuid,
+    date, datetime, deque, frozendict, is_annotated_origin, is_dataclass, is_enum_class,
+    is_literal_origin, is_type, is_typeddict, is_typevar, origin_or_self, time, type_args,
+    type_origin, uuid,
 };
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
 use pyo3::prelude::{PyAnyMethods, PySetMethods};
 use pyo3::types::{
-    PyBool, PyDict, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple, PyType,
+    PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple, PyType,
 };
 use pyo3::{Bound, PyAny, PyResult, intern};
 
@@ -39,10 +42,12 @@ pub(crate) fn validate_i64_range(value: &Bound<'_, PyAny>, label: &str) -> PyRes
 }
 
 pub(crate) fn validate_type(ty: &Bound<'_, PyAny>) -> PyResult<()> {
-    if is_enum_class(ty)? {
-        validate_enum(ty)?;
+    Validator::default().visit(ty)?;
+    let root = resolve_type_aliases(ty)?;
+    if is_enum_class(&root)? {
+        validate_enum(&root)?;
     }
-    Validator::default().visit(ty)
+    Ok(())
 }
 pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind>> {
     let is_frozendict = frozendict(ty.py()).is_some_and(|frozendict| ty.is(frozendict));
@@ -62,7 +67,7 @@ pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind
 }
 pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     use UnionKind::*;
-    let options = type_args(ty)?
+    let options = union_members(ty)?
         .into_iter()
         .filter(|arg| !is_type::<PyNone>(arg))
         .map(|option| {
@@ -134,6 +139,10 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
         (
             count(&[Deque]) > 0,
             "contains a custom type (collections.deque), which can't be used in a union",
+        ),
+        (
+            count(&[Custom]) > 0,
+            "it may not combine a custom type with types other than None",
         ),
     ];
     for (violated, reason) in rules {
@@ -237,12 +246,16 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
     } else if is_named_tuple_class(&origin_or_self(ty)?)? {
         return Ok(NamedTuple);
     } else if let Some(origin) = type_origin(ty)? {
+        if is_annotated_origin(&origin)? {
+            return union_kind(&ty.getattr(intern!(ty.py(), "__origin__"))?);
+        }
         if is_literal_origin(&origin)? {
             return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));
         }
         return Ok(container_kind(&origin)?.unwrap_or(Other));
     }
-    Ok(if !ty.is_instance_of::<PyType>() || is_type::<PyBool>(ty) {
+    let is_bool_or_float = is_type::<PyBool>(ty) || is_type::<PyFloat>(ty);
+    Ok(if !ty.is_instance_of::<PyType>() || is_bool_or_float {
         Other
     } else if is_enum_class(ty)? {
         value_kind(&enum_values(ty)?, IntEnum, StrEnum)

@@ -1,5 +1,6 @@
 import inspect
 import sys
+import sysconfig
 import textwrap
 import types
 import uuid
@@ -16,6 +17,16 @@ py315_or_later_only = pytest.mark.skipif(
 )
 
 py312_plus = pytest.mark.skipif(not PY312, reason="3.12+ only")
+
+emscripten_stack_limited = pytest.mark.skipif(
+    sys.platform == "emscripten",
+    reason="Pyodide can overflow the JS/Wasm stack before raising RecursionError",
+)
+
+win_arm64_py312_stack_limited = pytest.mark.skipif(
+    sysconfig.get_platform() == "win-arm64" and sys.version_info[:2] == (3, 12),
+    reason="Python 3.12 on Windows ARM64 can overflow the C stack before raising RecursionError",
+)
 
 
 @contextmanager

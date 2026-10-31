@@ -114,6 +114,17 @@ def resolve_namedtuple_fields(tp: Any) -> Fields:
     return tuple((name, _substitute(hint, mapping)) for name, hint in hints.items())
 
 
+def resolve_type_alias(tp: Any) -> Any:
+    alias = get_origin(tp) or tp
+    if alias is tp:
+        return alias.__value__
+    params = alias.__type_params__
+    args = get_args(tp)
+    if len(args) != len(params):
+        raise TypeError(f"{alias.__name__} expects {len(params)} type argument(s), got {len(args)}")
+    return _substitute(alias.__value__, dict(zip(params, args, strict=True)))
+
+
 def _resolve_fields(cls: type) -> Fields:
     return tuple(_fields(cls, {}).items())
 

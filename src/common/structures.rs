@@ -1,23 +1,25 @@
 use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal_cache};
 use crate::common::enums::{
-    ArrayOutput, Constructor, Failure, Insertion, Kind, PathSegment, Primitive, Scalar, Shape,
-    Token, Value,
+    ArrayOutput, Constraint, ConstraintSubject, Constructor, Failure, Insertion, Kind, PathSegment,
+    Primitive, Scalar, Shape, Token, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
-    ExpectedName, class_tag, default_value, has_custom_missing, has_generated_new, insert_new,
-    invalid_enum_value, is_named_tuple_class, is_single_primitive, is_struct_class,
-    named_tuple_field_pairs, parametrized_identity, struct_class, struct_field_pairs,
-    type_arg_or_any, typevar_bound, union_mismatch, untyped_plan,
+    ExpectedName, class_tag, default_value, enter_type_alias, expand_type_alias,
+    has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_named_tuple_class,
+    is_single_primitive, is_struct_class, named_tuple_field_pairs, parametrized_identity,
+    struct_class, struct_field_pairs, type_arg_or_any, typevar_bound, union_members,
+    union_mismatch, untyped_plan,
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
-    any, deque, is_enum_class, is_literal_origin, is_type, is_typevar, is_union_origin,
-    resolve_generic_fields, resolve_namedtuple_fields, type_args, type_name, type_origin,
+    any, deque, is_annotated_origin, is_enum_class, is_literal_origin, is_type, is_type_alias,
+    is_typevar, is_union_origin, resolve_generic_fields, resolve_namedtuple_fields, type_args,
+    type_name, type_origin,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
-    Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, RuneSet, TagIndex,
+    ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, RuneSet, TagIndex,
 };
 use crate::common::validate::{container_kind, ensure_union_is_unambiguous, validate_type};
 use crate::common::writer::Writer;
@@ -210,6 +212,7 @@ impl DecoderCore {
 
 pub(crate) struct Plan {
     nodes: Vec<Node>,
+    constraint_sets: Vec<ConstraintSet>,
     root: NodeId,
 }
 
@@ -220,6 +223,10 @@ impl Plan {
 
     pub(crate) fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id]
+    }
+
+    fn constraint_set(&self, id: ConstraintSetId) -> &ConstraintSet {
+        &self.constraint_sets[id]
     }
 
     pub(crate) fn struct_plan(&self, id: NodeId) -> &StructPlan {
@@ -238,11 +245,13 @@ impl Plan {
             py: ty.py(),
             has_hook,
             nodes: Vec::new(),
+            constraint_sets: Vec::new(),
             compiled: RuneMap::default(),
         };
         let root = compiler.compile(ty)?;
         let mut plan = Self {
             nodes: compiler.nodes,
+            constraint_sets: compiler.constraint_sets,
             root,
         };
         plan.mark_user_code();
@@ -274,6 +283,7 @@ struct Compiler<'py> {
     py: Python<'py>,
     has_hook: bool,
     nodes: Vec<Node>,
+    constraint_sets: Vec<ConstraintSet>,
     compiled: RuneMap<usize, (Bound<'py, PyAny>, NodeId)>,
 }
 
@@ -340,8 +350,56 @@ impl<'py> Compiler<'py> {
                 node: id,
             };
             Shape::Struct(Box::new(self.structure(&member)?))
+        } else if is_type_alias(&base) {
+            self.classify_alias(ty, id)?
+        } else if is_annotated_origin(&base)? {
+            self.annotated(ty, id)?
         } else {
             Shape::Custom(base.unbind())
+        })
+    }
+
+    fn classify_alias(&mut self, ty: &Bound<'py, PyAny>, id: NodeId) -> PyResult<Shape> {
+        let value = expand_type_alias(ty)?;
+        self.classify_as(value, id)
+    }
+
+    fn classify_as(&mut self, ty: Bound<'py, PyAny>, id: NodeId) -> PyResult<Shape> {
+        let ty = typevar_bound(&ty)?.unwrap_or(ty);
+        self.nodes[id].ty = ty.clone().unbind();
+        self.classify(&ty, id)
+    }
+
+    fn annotated(&mut self, ty: &Bound<'py, PyAny>, id: NodeId) -> PyResult<Shape> {
+        let inner = ty.getattr(intern!(self.py, "__origin__"))?;
+        let constraints =
+            Constraint::from_metadata(&ty.getattr(intern!(self.py, "__metadata__"))?)?;
+        if constraints.is_empty() {
+            return self.classify_as(inner, id);
+        }
+        let inner_id = self.compile(&inner)?;
+        let inner_node = &self.nodes[inner_id];
+        let subject = ConstraintSubject::of(&inner_node.shape);
+        if let Some(constraint) = constraints
+            .iter()
+            .find(|constraint| !constraint.applies_to(subject))
+        {
+            return Err(PyTypeError::new_err(format!(
+                "Can only set `{}` on {} - type `{}` is not supported",
+                constraint.field(),
+                constraint.requirement(),
+                ty.repr()?
+            )));
+        }
+        let accepted_kinds = inner_node.accepted_kinds;
+        self.constraint_sets.push(ConstraintSet {
+            subject,
+            constraints,
+        });
+        Ok(Shape::Constrained {
+            inner: inner_id,
+            accepted_kinds,
+            constraints: self.constraint_sets.len() - 1,
         })
     }
 
@@ -428,7 +486,7 @@ impl<'py> Compiler<'py> {
     fn union(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<UnionPlan> {
         let mut accepts_none = false;
         let (mut tagged, mut plain) = (Vec::new(), Vec::new());
-        for arg in type_args(ty)? {
+        for arg in union_members(ty)? {
             if is_type::<PyNone>(&arg) {
                 accepts_none = true;
                 continue;
@@ -698,6 +756,24 @@ impl StructPlan {
     }
 }
 
+pub(crate) struct ConstraintSet {
+    subject: ConstraintSubject,
+    constraints: Vec<Constraint>,
+}
+
+impl ConstraintSet {
+    fn check(&self, value: &Bound<'_, PyAny>) -> Outcome<()> {
+        for constraint in &self.constraints {
+            if !constraint.is_satisfied(value)? {
+                return Err(Fail::invalid(
+                    constraint.violation(value.py(), self.subject),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct TuplePlan {
     pub(crate) class: Py<PyAny>,
     pub(crate) fields: Vec<NodeId>,
@@ -720,6 +796,7 @@ struct TaggedMember<'py> {
 #[derive(Default)]
 pub(crate) struct Validator {
     visited_records: RuneSet<String>,
+    expanding_aliases: Vec<usize>,
 }
 
 impl Validator {
@@ -737,12 +814,22 @@ impl Validator {
             self.visit_generic(ty, &origin)
         } else if ty.is_instance_of::<PyType>() {
             Ok(())
+        } else if is_type_alias(ty) {
+            self.visit_alias(ty, ty)
         } else {
             Err(PyTypeError::new_err(format!(
                 "Unsupported type {}",
                 ty.repr()?
             )))
         }
+    }
+
+    fn visit_alias(&mut self, ty: &Bound<'_, PyAny>, alias: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = expand_type_alias(ty)?;
+        enter_type_alias(&mut self.expanding_aliases, alias)?;
+        let visited = self.visit(&value);
+        self.expanding_aliases.pop();
+        visited
     }
 
     fn visit_record<'py>(
@@ -784,7 +871,7 @@ impl Validator {
         } else if is_union_origin(origin)? {
             ensure_union_is_unambiguous(ty)?;
         } else if container_kind(origin)?.is_none() {
-            return Ok(());
+            return self.visit_special_form(ty, origin);
         }
         let ellipsis = ty.py().Ellipsis();
         for arg in type_args(ty)? {
@@ -793,6 +880,20 @@ impl Validator {
             }
         }
         Ok(())
+    }
+
+    fn visit_special_form(
+        &mut self,
+        ty: &Bound<'_, PyAny>,
+        origin: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if is_type_alias(origin) {
+            self.visit_alias(ty, origin)
+        } else if is_annotated_origin(origin)? {
+            self.visit(&ty.getattr(intern!(ty.py(), "__origin__"))?)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1196,7 +1297,16 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Struct(_) => self.decode_struct(id),
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
             Shape::Custom(base) => self.decode_custom(node.ty.bind(self.py), base.bind(self.py)),
+            Shape::Constrained {
+                inner, constraints, ..
+            } => self.decode_constrained(*inner, *constraints),
         }
+    }
+
+    fn decode_constrained(&mut self, inner: NodeId, constraints: ConstraintSetId) -> Decoded<'py> {
+        let value = self.decode_node(inner)?;
+        self.plan.constraint_set(constraints).check(&value)?;
+        Ok(value)
     }
 
     fn fields_call_user_code(&self, id: NodeId) -> bool {
@@ -1478,7 +1588,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 continue;
             }
             match self.decode_node(member.node) {
-                Err(fail) if fail.is_validation(py) => continue,
+                Err(fail) if fail.is_validation(py) && !node.shape.is_constrained() => continue,
                 decoded => return decoded,
             }
         }

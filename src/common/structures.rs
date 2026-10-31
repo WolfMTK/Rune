@@ -718,16 +718,13 @@ impl StructPlan {
         }
     }
 
-    fn instantiate<'py>(
-        &self,
-        py: Python<'py>,
-        values: FieldValues<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn instantiate<'py>(&self, py: Python<'py>, values: FieldValues<'py>) -> Decoded<'py> {
         let target = self.target.bind(py);
         let Constructor::Direct {
             object_new,
             class,
             alias,
+            post_init,
         } = &self.constructor
         else {
             let kwargs = PyDict::new(py);
@@ -736,7 +733,7 @@ impl StructPlan {
                     kwargs.set_item(field.key.bind(py), value)?;
                 }
             }
-            return target.call((), Some(&kwargs));
+            return Ok(target.call((), Some(&kwargs))?);
         };
         let instance = object_new.bind(py).call1((class,))?;
         for (field, value) in self.fields.iter().zip(values) {
@@ -748,6 +745,12 @@ impl StructPlan {
         }
         if let Some(alias) = alias {
             let _ = instance.setattr(intern!(py, "__orig_class__"), alias);
+        }
+        if let Some(post_init) = post_init {
+            post_init
+                .bind(py)
+                .call1((&instance,))
+                .map_err(|err| Fail::from_hook(py, err))?;
         }
         Ok(instance)
     }
@@ -1047,7 +1050,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
             }
             Ok(())
         })?;
-        Ok(plan.instantiate(self.py, values)?)
+        plan.instantiate(self.py, values)
     }
 
     fn decode_map_struct(&mut self, id: NodeId) -> Decoded<'py> {
@@ -1056,14 +1059,14 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         if !self.fields_call_user_code(id) {
             let len = self.wire.enter_map()?;
             match self.fill_values(len, plan, 0) {
-                Ok(values) => return Ok(plan.instantiate(self.py, values)?),
+                Ok(values) => return plan.instantiate(self.py, values),
                 Err(fail) if fail.is_syntax() => return Err(fail),
                 Err(_) => self.wire.restore(start),
             }
         }
         let entries = self.index_map()?;
         let values = self.entry_values(&entries, plan)?;
-        Ok(plan.instantiate(self.py, values)?)
+        plan.instantiate(self.py, values)
     }
 
     fn fill_values(
@@ -1175,7 +1178,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
                 Ok(())
             },
         )?;
-        Ok(plan.instantiate(self.py, values)?)
+        plan.instantiate(self.py, values)
     }
 
     fn decode_tagged_map(&mut self, group: &TagGroup<'_, 'py>) -> Decoded<'py> {
@@ -1183,7 +1186,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         if group.tag_index.is_some() {
             match self.ordered_tagged_values(group) {
                 Ok(Some((id, values))) => {
-                    return Ok(self.plan.struct_plan(id).instantiate(self.py, values)?);
+                    return self.plan.struct_plan(id).instantiate(self.py, values);
                 }
                 Err(fail) if fail.is_syntax() => return Err(fail),
                 Ok(None) | Err(_) => self.wire.restore(start),
@@ -1198,7 +1201,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         let id = self.resolve_tag(group, || PathSegment::Key(tag_field.clone()))?;
         let plan = self.plan.struct_plan(id);
         let values = self.entry_values(&entries, plan)?;
-        Ok(plan.instantiate(self.py, values)?)
+        plan.instantiate(self.py, values)
     }
 
     fn ordered_tagged_values(

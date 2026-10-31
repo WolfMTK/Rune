@@ -78,6 +78,9 @@ class Struct(metaclass=StructMeta):
         if kwargs:
             unknown = ", ".join(f"`{name}`" for name in kwargs)
             raise TypeError(f"Unexpected field(s): {unknown}")
+        post_init = getattr(cls, "__post_init__", None)
+        if post_init is not None:
+            post_init(self)
 
     def __eq__(self, other: object) -> bool:
         if other is self:

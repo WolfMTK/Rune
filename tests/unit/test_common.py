@@ -21,7 +21,16 @@ from rune.struct import Struct
 import rune
 from rune import ValidationError
 
-from .utils import PY311, PY312, max_call_depth, py312_plus, py315_or_later_only, temp_module
+from .utils import (
+    PY311,
+    PY312,
+    emscripten_stack_limited,
+    max_call_depth,
+    py312_plus,
+    py315_or_later_only,
+    temp_module,
+    win_arm64_py312_stack_limited,
+)
 
 if sys.version_info >= (3, 15):
     from builtins import frozendict
@@ -2204,3 +2213,100 @@ class TestNamedTuple:
         d = {original: "found"}
         assert decoded in d
         assert d[decoded] == "found"
+
+
+class TestTypeAlias:
+    @py312_plus
+    def test_simple(self, proto):
+        with temp_module("type Ex = str | None") as mod:
+            dec = proto.Decoder(mod.Ex)
+            assert dec.decode(proto.encode("test")) == "test"
+            assert dec.decode(proto.encode(None)) is None
+            with pytest.raises(ValidationError):
+                dec.decode(proto.encode(1))
+
+    @py312_plus
+    def test_generic(self, proto):
+        with temp_module("type Pair[T] = tuple[T, T]") as mod:
+            dec = proto.Decoder(mod.Pair)
+            assert dec.decode(proto.encode((1, 2))) == (1, 2)
+            for bad in [1, [1, 2, 3]]:
+                with pytest.raises(ValidationError):
+                    dec.decode(proto.encode(bad))
+
+    @py312_plus
+    def test_parametrized_generic(self, proto):
+        with temp_module("type Pair[T] = tuple[T, T]") as mod:
+            dec = proto.Decoder(mod.Pair[int])
+            assert dec.decode(proto.encode((1, 2))) == (1, 2)
+            for bad in [1, [1, 2, 3], [1, "a"]]:
+                with pytest.raises(ValidationError):
+                    dec.decode(proto.encode(bad))
+
+    @py312_plus
+    def test_typealias_wrapping_typealias(self, proto):
+        src = """
+        type Pair[T] = tuple[T, T]
+        type Pairs[T] = list[Pair[T]]
+        """
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.Pairs)
+            for good in [[], [(1, 2), (3, 4)]]:
+                assert dec.decode(proto.encode(good)) == good
+            for bad in [1, [1], [(1, 2, 3)]]:
+                with pytest.raises(ValidationError):
+                    dec.decode(proto.encode(bad))
+
+            dec = proto.Decoder(mod.Pairs[int])
+            for good in [[], [(1, 2)], [(1, 2), (3, 4)]]:
+                assert dec.decode(proto.encode(good)) == good
+            for bad in [1, [1], [(1, "a")]]:
+                with pytest.raises(ValidationError):
+                    dec.decode(proto.encode(bad))
+
+    @py312_plus
+    def test_typealias_with_constraints(self, proto):
+        src = """
+        import rune
+        from typing import Annotated
+        type Key = Annotated[str, rune.Meta(max_length=4)]
+        """
+        with temp_module(src) as mod:
+            dec = proto.Decoder(mod.Key)
+            for good in ["", "abc", "abcd"]:
+                assert dec.decode(proto.encode(good)) == good
+            for bad in [1, "abcde"]:
+                with pytest.raises(ValidationError):
+                    dec.decode(proto.encode(bad))
+
+    @py312_plus
+    def test_typealias_parametrized_generic_too_many_parameters(self):
+        with temp_module("type Pair[T] = tuple[T, T]") as mod:
+            with pytest.raises(TypeError):
+                rune.json.Decoder(mod.Pair[int, int])
+
+    @py312_plus
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "type Ex = Ex | None",
+            "type Ex = tuple[Ex, int]",
+            "type Ex[T] = tuple[T, Ex[T]]",
+            "type Temp[T] = tuple[T, Temp[T]]; Ex = Temp[int]",
+            "type Temp[T] = tuple[T, Ex[T]]; type Ex[T] = tuple[Temp[T], T];",
+        ],
+    )
+    @emscripten_stack_limited
+    @win_arm64_py312_stack_limited
+    def test_recursive_typealias_errors(self, src):
+        """Eventually we should support this, but for now just test that it
+        errors cleanly"""
+        with temp_module(src) as mod:
+            with pytest.raises(RecursionError):
+                rune.json.Decoder(mod.Ex)
+
+    @py312_plus
+    def test_typealias_invalid_type(self):
+        with temp_module("type Ex = int | complex") as mod:
+            with pytest.raises(TypeError):
+                rune.json.Decoder(mod.Ex)

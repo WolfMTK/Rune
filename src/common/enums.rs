@@ -1,12 +1,13 @@
 use crate::common::helpers::{check_default_construction, check_instantiable_alias};
 use crate::common::macros::first_matching_kind;
-use crate::common::py_typing::{is_type, object_type};
+use crate::common::py_typing::{compile_regex, is_type, meta_type, object_type};
 use crate::common::reader::kind;
 use crate::common::structures::{
     ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
 };
-use crate::common::types::NodeId;
+use crate::common::types::{ConstraintSetId, NodeId};
 use crate::exceptions::ParseError;
+use pyo3::basic::CompareOp;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{
     PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple,
@@ -82,6 +83,11 @@ pub(crate) enum Shape {
     Struct(Box<StructPlan>),
     NamedTuple(TuplePlan),
     Custom(Py<PyAny>),
+    Constrained {
+        inner: NodeId,
+        accepted_kinds: u8,
+        constraints: ConstraintSetId,
+    },
 }
 
 impl Shape {
@@ -97,6 +103,7 @@ impl Shape {
             Self::Dict(values) => matches(*values),
             Self::Struct(plan) => plan.fields.iter().map(|field| field.node).any(matches),
             Self::NamedTuple(plan) => plan.fields.iter().copied().any(matches),
+            Self::Constrained { inner, .. } => matches(*inner),
             _ => false,
         }
     }
@@ -111,6 +118,10 @@ impl Shape {
         }
     }
 
+    pub(crate) fn is_constrained(&self) -> bool {
+        matches!(self, Self::Constrained { .. })
+    }
+
     pub(crate) fn accepted_kinds(&self) -> u8 {
         match self {
             Self::Any | Self::Custom(_) | Self::Union(_) => kind::ANY,
@@ -120,6 +131,7 @@ impl Shape {
             Self::Array(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
             Self::Dict(_) | Self::Struct(_) => kind::MAP,
+            Self::Constrained { accepted_kinds, .. } => *accepted_kinds,
         }
     }
 }
@@ -280,5 +292,194 @@ impl Kind {
             self,
             Self::Null | Self::Bool | Self::Int | Self::Float | Self::Str
         )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Comparison {
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+}
+
+impl Comparison {
+    const ALL: [Self; 4] = [
+        Self::Greater,
+        Self::GreaterOrEqual,
+        Self::Less,
+        Self::LessOrEqual,
+    ];
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Greater => "gt",
+            Self::GreaterOrEqual => "ge",
+            Self::Less => "lt",
+            Self::LessOrEqual => "le",
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+        }
+    }
+
+    fn operator(self) -> CompareOp {
+        match self {
+            Self::Greater => CompareOp::Gt,
+            Self::GreaterOrEqual => CompareOp::Ge,
+            Self::Less => CompareOp::Lt,
+            Self::LessOrEqual => CompareOp::Le,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstraintSubject {
+    Int,
+    Float,
+    Str,
+    Array,
+    Object,
+    Other,
+}
+
+impl ConstraintSubject {
+    pub(crate) fn of(shape: &Shape) -> Self {
+        match shape {
+            Shape::Primitive(Primitive::Int) => Self::Int,
+            Shape::Primitive(Primitive::Float) => Self::Float,
+            Shape::Primitive(Primitive::Str) => Self::Str,
+            Shape::Array(_) => Self::Array,
+            Shape::Dict(_) => Self::Object,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Str => "str",
+            Self::Array => "array",
+            Self::Object => "object",
+            Self::Other => "value",
+        }
+    }
+}
+
+pub(crate) enum Constraint {
+    Bound(Comparison, Py<PyAny>),
+    MultipleOf(Py<PyAny>),
+    Pattern { regex: Py<PyAny>, source: String },
+    MinLength(usize),
+    MaxLength(usize),
+}
+
+impl Constraint {
+    pub(crate) fn from_metadata(metadata: &Bound<'_, PyAny>) -> PyResult<Vec<Self>> {
+        let py = metadata.py();
+        let mut constraints = Vec::new();
+        for item in metadata.try_iter()? {
+            let meta = item?;
+            if !meta.is_instance(meta_type(py)?)? {
+                continue;
+            }
+            let field = |name: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+                let value = meta.getattr(name)?;
+                Ok((!value.is_none()).then_some(value))
+            };
+            for comparison in Comparison::ALL {
+                if let Some(limit) = field(comparison.field())? {
+                    constraints.push(Self::Bound(comparison, limit.unbind()));
+                }
+            }
+            if let Some(factor) = field("multiple_of")? {
+                constraints.push(Self::MultipleOf(factor.unbind()));
+            }
+            if let Some(pattern) = field("pattern")? {
+                constraints.push(Self::Pattern {
+                    source: pattern.repr()?.to_string(),
+                    regex: compile_regex(py)?.call1((pattern,))?.unbind(),
+                });
+            }
+            if let Some(min) = field("min_length")? {
+                constraints.push(Self::MinLength(min.extract()?));
+            }
+            if let Some(max) = field("max_length")? {
+                constraints.push(Self::MaxLength(max.extract()?));
+            }
+        }
+        Ok(constraints)
+    }
+
+    pub(crate) fn field(&self) -> &'static str {
+        match self {
+            Self::Bound(comparison, _) => comparison.field(),
+            Self::MultipleOf(_) => "multiple_of",
+            Self::Pattern { .. } => "pattern",
+            Self::MinLength(_) => "min_length",
+            Self::MaxLength(_) => "max_length",
+        }
+    }
+
+    pub(crate) fn requirement(&self) -> &'static str {
+        match self {
+            Self::Bound(..) | Self::MultipleOf(_) => "a numeric type",
+            Self::Pattern { .. } => "a str type",
+            Self::MinLength(_) | Self::MaxLength(_) => "a str or collection type",
+        }
+    }
+
+    pub(crate) fn applies_to(&self, subject: ConstraintSubject) -> bool {
+        use ConstraintSubject::*;
+        match self {
+            Self::Bound(..) | Self::MultipleOf(_) => matches!(subject, Int | Float),
+            Self::Pattern { .. } => subject == Str,
+            Self::MinLength(_) | Self::MaxLength(_) => matches!(subject, Str | Array | Object),
+        }
+    }
+
+    pub(crate) fn is_satisfied(&self, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = value.py();
+        Ok(match self {
+            Self::Bound(comparison, limit) => value
+                .rich_compare(limit.bind(py), comparison.operator())?
+                .is_truthy()?,
+            Self::MultipleOf(factor) => value.rem(factor.bind(py))?.eq(0)?,
+            Self::Pattern { regex, .. } => !regex
+                .bind(py)
+                .call_method1(intern!(py, "search"), (value,))?
+                .is_none(),
+            Self::MinLength(min) => value.len()? >= *min,
+            Self::MaxLength(max) => value.len()? <= *max,
+        })
+    }
+
+    pub(crate) fn violation(&self, py: Python<'_>, subject: ConstraintSubject) -> String {
+        let subject = subject.name();
+        match self {
+            Self::Bound(comparison, limit) => {
+                format!(
+                    "Expected `{subject}` {} {}",
+                    comparison.symbol(),
+                    limit.bind(py)
+                )
+            }
+            Self::MultipleOf(factor) => {
+                format!(
+                    "Expected `{subject}` that's a multiple of {}",
+                    factor.bind(py)
+                )
+            }
+            Self::Pattern { source, .. } => format!("Expected `{subject}` matching regex {source}"),
+            Self::MinLength(min) => format!("Expected `{subject}` of length >= {min}"),
+            Self::MaxLength(max) => format!("Expected `{subject}` of length <= {max}"),
+        }
     }
 }

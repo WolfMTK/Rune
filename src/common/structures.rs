@@ -1627,9 +1627,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     pub(crate) fn decode_document(mut self) -> Decoded<'py> {
         let value = self.decode_node(self.plan.root())?;
         if !self.wire.is_exhausted() {
-            return Err(self.wire.error("Trailing characters after value").into());
+            self.expect_only_trailing_whitespace()?;
         }
         Ok(value)
+    }
+
+    #[cold]
+    fn expect_only_trailing_whitespace(&mut self) -> Outcome<()> {
+        self.wire.skip_trailing_whitespace();
+        if self.wire.is_exhausted() {
+            Ok(())
+        } else {
+            Err(self.wire.error("Trailing characters after value").into())
+        }
     }
 
     fn decode_node(&mut self, id: NodeId) -> Decoded<'py> {

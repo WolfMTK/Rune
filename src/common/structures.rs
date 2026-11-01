@@ -1,4 +1,5 @@
 use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal_cache};
+use crate::common::datetime_format;
 use crate::common::enums::{
     AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat,
     Failure, Insertion, Kind, PathSegment, Primitive, Scalar, Shape, Token, Value,
@@ -13,9 +14,10 @@ use crate::common::helpers::{
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
-    any, decimal_type, deque, is_annotated_origin, is_decimal, is_enum_class, is_frozendict_type,
-    is_literal_origin, is_type, is_type_alias, is_typevar, is_union_origin, resolve_generic_fields,
-    resolve_namedtuple_fields, type_args, type_name, type_origin,
+    any, date, datetime, decimal_type, deque, is_annotated_origin, is_decimal, is_enum_class,
+    is_frozendict_type, is_literal_origin, is_temporal_type, is_type, is_type_alias, is_typevar,
+    is_union_origin, resolve_generic_fields, resolve_namedtuple_fields, time, timedelta, type_args,
+    type_name, type_origin,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
@@ -34,6 +36,9 @@ use pyo3::types::PySetMethods;
 use pyo3::types::PyTupleMethods;
 use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyList, PyNone, PySet, PyString, PyTuple};
 use pyo3::types::{PyBoolMethods, PyInt};
+use pyo3::types::{
+    PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyTime, PyTimeAccess, PyTzInfo,
+};
 use pyo3::types::{PyDictMethods, PyType};
 use pyo3::types::{PyFloat, PyStringMethods};
 use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
@@ -352,6 +357,12 @@ impl<'py> Compiler<'py> {
             Shape::Struct(Box::new(self.structure(&member)?))
         } else if base.is(decimal_type(self.py)?) {
             Shape::Decimal
+        } else if base.is(date(self.py)?) {
+            Shape::Date
+        } else if base.is(time(self.py)?) {
+            Shape::Time
+        } else if base.is(timedelta(self.py)?) {
+            Shape::TimeDelta
         } else if let Some(container) = AbstractContainer::of(&base)? {
             self.abstract_container(ty, container)?
         } else if is_type_alias(&base) {
@@ -1398,6 +1409,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
             Shape::Custom(base) => self.decode_custom(node.ty.bind(self.py), base.bind(self.py)),
             Shape::Decimal => self.decode_decimal(node.ty.bind(self.py)),
+            Shape::Date => self.decode_date(),
+            Shape::Time => self.decode_time(),
+            Shape::TimeDelta => self.decode_timedelta(),
             Shape::Constrained {
                 inner, constraints, ..
             } => self.decode_constrained(*inner, *constraints),
@@ -1431,6 +1445,57 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             scalar => scalar.to_py(py),
         };
         Ok(decimal.call1((argument,))?)
+    }
+
+    fn decode_date(&mut self) -> Decoded<'py> {
+        let parsed =
+            self.read_temporal_text("date", datetime_format::parse_date, "Invalid RFC3339 date")?;
+        Ok(PyDate::new(self.py, parsed.year, parsed.month, parsed.day)?.into_any())
+    }
+
+    fn decode_time(&mut self) -> Decoded<'py> {
+        let py = self.py;
+        let parsed =
+            self.read_temporal_text("time", datetime_format::parse_time, "Invalid RFC3339 time")?;
+        let tzinfo = match parsed.offset_minutes {
+            Some(minutes) => Some(PyTzInfo::fixed_offset(
+                py,
+                PyDelta::new(py, 0, minutes * 60, 0, true)?,
+            )?),
+            None => None,
+        };
+        let value = PyTime::new(
+            py,
+            parsed.hour,
+            parsed.minute,
+            parsed.second,
+            parsed.microsecond,
+            tzinfo.as_ref(),
+        )?;
+        Ok(value.into_any())
+    }
+
+    fn decode_timedelta(&mut self) -> Decoded<'py> {
+        self.expect_kind(kind::STR, "duration", kind::container_name)?;
+        let Scalar::Str(text) = self.wire.read_scalar()? else {
+            unreachable!("kind is checked as str above")
+        };
+        let total_micros = datetime_format::parse_duration(&text).map_err(duration_failure)?;
+        let (days, seconds, microseconds) = datetime_format::timedelta_components(total_micros);
+        Ok(PyDelta::new(self.py, days, seconds, microseconds, false)?.into_any())
+    }
+
+    fn read_temporal_text<T>(
+        &mut self,
+        expected: &str,
+        parse: fn(&str) -> Option<T>,
+        invalid_message: &str,
+    ) -> Outcome<T> {
+        self.expect_kind(kind::STR, expected, kind::container_name)?;
+        let Scalar::Str(text) = self.wire.read_scalar()? else {
+            unreachable!("kind is checked as str above")
+        };
+        parse(&text).ok_or_else(|| Fail::invalid(invalid_message.to_owned()))
     }
 
     fn decode_constrained(&mut self, inner: NodeId, constraints: ConstraintSetId) -> Decoded<'py> {
@@ -1794,6 +1859,73 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     }
 }
 
+fn duration_failure(error: datetime_format::DurationError) -> Fail {
+    Fail::invalid(match error {
+        datetime_format::DurationError::Malformed => "Invalid ISO8601 duration".to_owned(),
+        datetime_format::DurationError::UnsupportedUnit => {
+            "Only units 'D', 'H', 'M', and 'S' are supported in durations".to_owned()
+        }
+        datetime_format::DurationError::OutOfRange => "Duration is out of range".to_owned(),
+    })
+}
+
+fn temporal_text(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    let py = obj.py();
+    let ty = obj.get_type();
+    if ty.is(datetime(py)?) {
+        let value = obj.cast::<PyDateTime>()?;
+        let date_text =
+            datetime_format::format_date(value.get_year(), value.get_month(), value.get_day());
+        let time_text = datetime_format::format_time(
+            value.get_hour(),
+            value.get_minute(),
+            value.get_second(),
+            value.get_microsecond(),
+            utcoffset_minutes(obj)?,
+        );
+        Ok(format!("{date_text}T{time_text}"))
+    } else if ty.is(date(py)?) {
+        let value = obj.cast::<PyDate>()?;
+        Ok(datetime_format::format_date(
+            value.get_year(),
+            value.get_month(),
+            value.get_day(),
+        ))
+    } else if ty.is(time(py)?) {
+        let value = obj.cast::<PyTime>()?;
+        Ok(datetime_format::format_time(
+            value.get_hour(),
+            value.get_minute(),
+            value.get_second(),
+            value.get_microsecond(),
+            utcoffset_minutes(obj)?,
+        ))
+    } else {
+        let value = obj.cast::<PyDelta>()?;
+        Ok(datetime_format::format_duration(
+            datetime_format::total_micros(
+                value.get_days(),
+                value.get_seconds(),
+                value.get_microseconds(),
+            ),
+        ))
+    }
+}
+
+fn utcoffset_minutes(obj: &Bound<'_, PyAny>) -> PyResult<Option<i32>> {
+    let offset = obj.call_method0(intern!(obj.py(), "utcoffset"))?;
+    if offset.is_none() {
+        return Ok(None);
+    }
+    let delta = offset.cast::<PyDelta>()?;
+    let micros = datetime_format::total_micros(
+        delta.get_days(),
+        delta.get_seconds(),
+        delta.get_microseconds(),
+    );
+    Ok(Some(datetime_format::utc_offset_minutes(micros)))
+}
+
 struct Entries<'a> {
     items: Vec<(Cow<'a, str>, usize)>,
     end: Checkpoint,
@@ -1866,7 +1998,10 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Enum
         } else if is_struct_class(&ty)? {
             Kind::Struct(Rc::new(StructLayout::load(&ty, &ty)?))
-        } else if ty.is(decimal_type(ty.py())?) || is_frozendict_type(&ty)? {
+        } else if ty.is(decimal_type(ty.py())?)
+            || is_temporal_type(&ty)?
+            || is_frozendict_type(&ty)?
+        {
             Kind::Uncommon
         } else {
             Kind::Unknown
@@ -1926,9 +2061,17 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     fn encode_uncommon(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
         if is_decimal(obj)? {
             self.encode_decimal::<false>(obj)
+        } else if is_temporal_type(&obj.get_type())? {
+            self.encode_temporal(obj)
         } else {
             self.encode_frozendict(obj)
         }
+    }
+
+    fn encode_temporal(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        let text = temporal_text(obj)?;
+        self.writer.write(Token::Str(&text));
+        Ok(())
     }
 
     #[inline(never)]

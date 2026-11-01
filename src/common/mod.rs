@@ -7,6 +7,7 @@ use pyo3::prelude::PyAnyMethods;
 use pyo3::{PyResult, Python};
 
 pub(crate) mod cache;
+pub(crate) mod datetime_format;
 pub(crate) mod enums;
 pub(crate) mod failure;
 pub(crate) mod helpers;

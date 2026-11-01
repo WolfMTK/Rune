@@ -90,6 +90,9 @@ pub(crate) enum Shape {
     NamedTuple(TuplePlan),
     Custom(Py<PyAny>),
     Decimal,
+    Date,
+    Time,
+    TimeDelta,
     Constrained {
         inner: NodeId,
         accepted_kinds: u8,
@@ -136,6 +139,7 @@ impl Shape {
             Self::Primitive(primitive) => primitive.accepted_kinds(),
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
+            Self::Date | Self::Time | Self::TimeDelta => kind::STR,
             Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
             Self::Dict(_) | Self::AbstractDict(_) | Self::Struct(_) => kind::MAP,

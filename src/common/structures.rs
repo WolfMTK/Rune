@@ -1,7 +1,7 @@
 use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal_cache};
 use crate::common::enums::{
-    ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat, Failure, Insertion,
-    Kind, PathSegment, Primitive, Scalar, Shape, Token, Value,
+    AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat,
+    Failure, Insertion, Kind, PathSegment, Primitive, Scalar, Shape, Token, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
@@ -13,9 +13,9 @@ use crate::common::helpers::{
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
-    any, decimal_type, deque, is_annotated_origin, is_enum_class, is_literal_origin, is_type,
-    is_type_alias, is_typevar, is_union_origin, resolve_generic_fields, resolve_namedtuple_fields,
-    type_args, type_name, type_origin,
+    any, decimal_type, deque, is_annotated_origin, is_decimal, is_enum_class, is_frozendict_type,
+    is_literal_origin, is_type, is_type_alias, is_typevar, is_union_origin, resolve_generic_fields,
+    resolve_namedtuple_fields, type_args, type_name, type_origin,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
@@ -352,12 +352,37 @@ impl<'py> Compiler<'py> {
             Shape::Struct(Box::new(self.structure(&member)?))
         } else if base.is(decimal_type(self.py)?) {
             Shape::Decimal
+        } else if let Some(container) = AbstractContainer::of(&base)? {
+            self.abstract_container(ty, container)?
         } else if is_type_alias(&base) {
             self.classify_alias(ty, id)?
         } else if is_annotated_origin(&base)? {
             self.annotated(ty, id)?
         } else {
             Shape::Custom(base.unbind())
+        })
+    }
+
+    fn abstract_container(
+        &mut self,
+        ty: &Bound<'py, PyAny>,
+        container: AbstractContainer,
+    ) -> PyResult<Shape> {
+        let concrete = match container {
+            AbstractContainer::Sequence => self.py.get_type::<PyList>(),
+            AbstractContainer::Set => self.py.get_type::<PySet>(),
+            AbstractContainer::Mapping => self.py.get_type::<PyDict>(),
+        };
+        let args = type_args(ty)?;
+        let concrete = if args.is_empty() {
+            concrete.into_any()
+        } else {
+            concrete.get_item(PyTuple::new(self.py, args)?)?
+        };
+        let inner = self.compile(&concrete)?;
+        Ok(match container {
+            AbstractContainer::Mapping => Shape::AbstractDict(inner),
+            AbstractContainer::Sequence | AbstractContainer::Set => Shape::AbstractArray(inner),
         })
     }
 
@@ -1295,7 +1320,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Enum(members) => self.decode_enum(node.ty.bind(self.py), members),
             Shape::Union(union) => self.decode_union(union),
             Shape::Array(array) => self.decode_array(array, user_code_inside),
+            Shape::AbstractArray(inner) => self.decode_abstract(*inner, kind::ARRAY, "array"),
             Shape::Dict(values) => self.decode_dict(*values),
+            Shape::AbstractDict(inner) => self.decode_abstract(*inner, kind::MAP, "object"),
             Shape::Struct(_) => self.decode_struct(id),
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
             Shape::Custom(base) => self.decode_custom(node.ty.bind(self.py), base.bind(self.py)),
@@ -1304,6 +1331,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 inner, constraints, ..
             } => self.decode_constrained(*inner, *constraints),
         }
+    }
+
+    #[inline(never)]
+    fn decode_abstract(&mut self, inner: NodeId, accepted: u8, expected: &str) -> Decoded<'py> {
+        self.expect_kind(accepted, expected, kind::container_name)?;
+        self.decode_node(inner)
     }
 
     fn decode_decimal(&mut self, ty: &Bound<'py, PyAny>) -> Decoded<'py> {
@@ -1755,8 +1788,8 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Enum
         } else if is_struct_class(&ty)? {
             Kind::Struct(Rc::new(StructLayout::load(&ty, &ty)?))
-        } else if ty.is(decimal_type(ty.py())?) {
-            Kind::Decimal
+        } else if ty.is(decimal_type(ty.py())?) || is_frozendict_type(&ty)? {
+            Kind::Uncommon
         } else {
             Kind::Unknown
         };
@@ -1792,7 +1825,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Set => return self.encode_items(obj.cast::<PySet>()?.iter()),
             Kind::FrozenSet => return self.encode_items(obj.cast::<PyFrozenSet>()?.iter()),
             Kind::Struct(layout) => return self.encode_struct(obj, &layout),
-            Kind::Decimal => return self.encode_decimal::<false>(obj),
+            Kind::Uncommon => return self.encode_uncommon(obj),
             Kind::Unknown => return self.encode_with_hook(obj),
         };
         if AS_KEY {
@@ -1806,8 +1839,17 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     #[inline(never)]
     fn encode_other_key(&mut self, key: &Bound<'py, PyAny>, kind: Kind) -> PyResult<()> {
         match kind {
-            Kind::Decimal => self.encode_decimal::<true>(key),
+            Kind::Uncommon if is_decimal(key)? => self.encode_decimal::<true>(key),
             _ => Err(unsupported_key_error(key)),
+        }
+    }
+
+    #[inline(never)]
+    fn encode_uncommon(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        if is_decimal(obj)? {
+            self.encode_decimal::<false>(obj)
+        } else {
+            self.encode_frozendict(obj)
         }
     }
 
@@ -1911,6 +1953,20 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     fn encode_dict(&mut self, dict: &Bound<'py, PyDict>) -> PyResult<()> {
         self.encode_container(Token::MapStart(dict.len()), |encoder| {
             for (key, value) in dict.iter() {
+                let kind = encoder.kind_of(&key)?;
+                encoder.encode_as::<true>(&key, kind)?;
+                encoder.encode(&value)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[inline(never)]
+    fn encode_frozendict(&mut self, frozendict: &Bound<'py, PyAny>) -> PyResult<()> {
+        let items = frozendict.call_method0(intern!(frozendict.py(), "items"))?;
+        self.encode_container(Token::MapStart(frozendict.len()?), |encoder| {
+            for item in items.try_iter()? {
+                let (key, value) = item?.extract::<(Bound<'py, PyAny>, Bound<'py, PyAny>)>()?;
                 let kind = encoder.kind_of(&key)?;
                 encoder.encode_as::<true>(&key, kind)?;
                 encoder.encode(&value)?;

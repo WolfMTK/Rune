@@ -1,6 +1,9 @@
 use crate::common::helpers::{check_default_construction, check_instantiable_alias};
 use crate::common::macros::first_matching_kind;
-use crate::common::py_typing::{compile_regex, is_type, meta_type, object_type};
+use crate::common::py_typing::{
+    abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence, abc_mutable_set,
+    abc_sequence, abc_set, compile_regex, is_type, meta_type, object_type,
+};
 use crate::common::reader::kind;
 use crate::common::structures::{
     ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
@@ -80,7 +83,9 @@ pub(crate) enum Shape {
     Enum(EnumPlan),
     Union(UnionPlan),
     Array(ArrayPlan),
+    AbstractArray(NodeId),
     Dict(NodeId),
+    AbstractDict(NodeId),
     Struct(Box<StructPlan>),
     NamedTuple(TuplePlan),
     Custom(Py<PyAny>),
@@ -103,6 +108,7 @@ impl Shape {
                 .any(matches),
             Self::Array(array) => array.items.iter().copied().any(matches),
             Self::Dict(values) => matches(*values),
+            Self::AbstractArray(inner) | Self::AbstractDict(inner) => matches(*inner),
             Self::Struct(plan) => plan.fields.iter().map(|field| field.node).any(matches),
             Self::NamedTuple(plan) => plan.fields.iter().copied().any(matches),
             Self::Constrained { inner, .. } => matches(*inner),
@@ -130,9 +136,9 @@ impl Shape {
             Self::Primitive(primitive) => primitive.accepted_kinds(),
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
-            Self::Array(_) | Self::NamedTuple(_) => kind::ARRAY,
+            Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
-            Self::Dict(_) | Self::Struct(_) => kind::MAP,
+            Self::Dict(_) | Self::AbstractDict(_) | Self::Struct(_) => kind::MAP,
             Self::Constrained { accepted_kinds, .. } => *accepted_kinds,
         }
     }
@@ -268,6 +274,33 @@ impl DecimalFormat {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbstractContainer {
+    Sequence,
+    Set,
+    Mapping,
+}
+
+impl AbstractContainer {
+    pub(crate) fn of(ty: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        let py = ty.py();
+        Ok(
+            if ty.is(abc_sequence(py)?)
+                || ty.is(abc_mutable_sequence(py)?)
+                || ty.is(abc_collection(py)?)
+            {
+                Some(Self::Sequence)
+            } else if ty.is(abc_set(py)?) || ty.is(abc_mutable_set(py)?) {
+                Some(Self::Set)
+            } else if ty.is(abc_mapping(py)?) || ty.is(abc_mutable_mapping(py)?) {
+                Some(Self::Mapping)
+            } else {
+                None
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArrayOutput {
     List,
     Tuple,
@@ -309,7 +342,7 @@ pub(crate) enum Kind {
     Set,
     FrozenSet,
     Enum,
-    Decimal,
+    Uncommon,
     Struct(Rc<StructLayout>),
     Unknown,
 }
@@ -405,8 +438,8 @@ impl ConstraintSubject {
             Shape::Primitive(Primitive::Int) => Self::Int,
             Shape::Primitive(Primitive::Float) => Self::Float,
             Shape::Primitive(Primitive::Str) => Self::Str,
-            Shape::Array(_) => Self::Array,
-            Shape::Dict(_) => Self::Object,
+            Shape::Array(_) | Shape::AbstractArray(_) => Self::Array,
+            Shape::Dict(_) | Shape::AbstractDict(_) => Self::Object,
             _ => Self::Other,
         }
     }

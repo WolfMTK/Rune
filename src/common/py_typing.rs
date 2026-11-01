@@ -1,7 +1,7 @@
 use crate::common::macros::cached_objects;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyType;
+use pyo3::types::{PyType, PyTypeMethods};
 use pyo3::{Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern};
 
 cached_objects! {
@@ -27,6 +27,13 @@ cached_objects! {
     time => "datetime"."time",
     uuid => "uuid"."UUID",
     decimal_type => "decimal"."Decimal",
+    abc_collection => "collections.abc"."Collection",
+    abc_sequence => "collections.abc"."Sequence",
+    abc_mutable_sequence => "collections.abc"."MutableSequence",
+    abc_set => "collections.abc"."Set",
+    abc_mutable_set => "collections.abc"."MutableSet",
+    abc_mapping => "collections.abc"."Mapping",
+    abc_mutable_mapping => "collections.abc"."MutableMapping",
     get_recursion_limit => "sys"."getrecursionlimit",
     resolve_generic_fields => "rune.struct"."resolve_generic_fields",
     resolve_namedtuple_fields => "rune.struct"."resolve_namedtuple_fields",
@@ -49,6 +56,14 @@ pub(crate) fn frozendict(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     })
     .as_ref()
     .map(|frozendict| frozendict.bind(py))
+}
+
+pub(crate) fn is_decimal(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(obj.get_type().is(decimal_type(obj.py())?))
+}
+
+pub(crate) fn is_frozendict_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {
+    frozendict(ty.py()).map_or(Ok(false), |frozendict| ty.is_subclass(frozendict))
 }
 
 pub(crate) fn type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {

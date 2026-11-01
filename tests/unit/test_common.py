@@ -12,7 +12,7 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, make_dataclass
 from types import ModuleType
 from typing import Any, Literal
 
@@ -20,7 +20,7 @@ import pytest
 from rune.struct import Struct
 
 import rune
-from rune import ValidationError
+from rune import UNSET, UnsetType, ValidationError
 
 from .utils import (
     PY311,
@@ -3339,3 +3339,285 @@ class TestTimeDelta:
             encoded = proto.encode(msg)
             with pytest.raises(ValidationError, match="Only units 'D'"):
                 proto.decode(encoded, type=datetime.timedelta)
+
+
+class TestNewType:
+    def test_decode_newtype(self, proto):
+        UserId = typing.NewType("UserId", int)
+        assert proto.decode(proto.encode(1), type=UserId) == 1
+
+        with pytest.raises(ValidationError):
+            proto.decode(proto.encode("bad"), type=UserId)
+
+        # Nested NewId works
+        UserId2 = typing.NewType("UserId2", UserId)
+        assert proto.decode(proto.encode(1), type=UserId2) == 1
+
+        with pytest.raises(ValidationError):
+            proto.decode(proto.encode("bad"), type=UserId2)
+
+    def test_decode_annotated_newtype(self, proto):
+        UserId = typing.NewType("UserId", int)
+        dec = proto.Decoder(typing.Annotated[UserId, rune.Meta(ge=0)])
+        assert dec.decode(proto.encode(1)) == 1
+
+        with pytest.raises(ValidationError):
+            dec.decode(proto.encode(-1))
+
+    def test_decode_newtype_annotated(self, proto):
+        UserId = typing.NewType("UserId", typing.Annotated[int, rune.Meta(ge=0)])
+        dec = proto.Decoder(UserId)
+        assert dec.decode(proto.encode(1)) == 1
+
+        with pytest.raises(ValidationError):
+            dec.decode(proto.encode(-1))
+
+    def test_decode_annotated_newtype_annotated(self, proto):
+        UserId = typing.Annotated[
+            typing.NewType("UserId", typing.Annotated[int, rune.Meta(ge=0)]), rune.Meta(le=10)
+        ]
+        dec = proto.Decoder(UserId)
+        assert dec.decode(proto.encode(1)) == 1
+
+        for bad in [-1, 11]:
+            with pytest.raises(ValidationError):
+                dec.decode(proto.encode(bad))
+
+
+class TestFinal:
+    def test_decode_final(self, proto):
+        dec = proto.Decoder(typing.Final[int])
+
+        assert dec.decode(proto.encode(1)) == 1
+        with pytest.raises(ValidationError):
+            dec.decode(proto.encode("bad"))
+
+    def test_decode_final_annotated(self, proto):
+        dec = proto.Decoder(typing.Final[typing.Annotated[int, rune.Meta(ge=0)]])
+
+        assert dec.decode(proto.encode(1)) == 1
+        with pytest.raises(ValidationError):
+            dec.decode(proto.encode(-1))
+
+    def test_decode_final_newtype(self, proto):
+        UserId = typing.NewType("UserId", int)
+        dec = proto.Decoder(typing.Final[UserId])
+
+        assert dec.decode(proto.encode(1)) == 1
+        with pytest.raises(ValidationError):
+            dec.decode(proto.encode("bad"))
+
+
+class TestSet:
+    def test_encode_set_doesnt_leak_item_refs(self, proto):
+        class Ex:
+            pass
+
+        items = {Ex(), Ex(), Ex()}
+        refs = [weakref.ref(item) for item in items]
+
+        proto.Encoder(enc_hook=lambda x: None).encode(items)
+
+        del items
+        gc.collect()
+
+        assert all(ref() is None for ref in refs)
+
+
+class TestOrder:
+    def test_encoder_order_attribute(self, proto):
+        enc = proto.Encoder()
+        assert enc.order is None
+
+        enc = proto.Encoder(order=None)
+        assert enc.order is None
+
+        enc = proto.Encoder(order="deterministic")
+        assert enc.order == "deterministic"
+
+        enc = proto.Encoder(order="sorted")
+        assert enc.order == "sorted"
+
+    def test_order_invalid(self, proto):
+        with pytest.raises(ValueError, match="`order` must be one of"):
+            proto.Encoder(order="bad")
+
+        with pytest.raises(ValueError, match="`order` must be one of"):
+            proto.encode(1, order="bad")
+
+    @pytest.mark.parametrize("msg", [{}, {"y": 1, "x": 2, "z": 3}])
+    @pytest.mark.parametrize("order", [None, "deterministic", "sorted"])
+    @pytest.mark.parametrize("use_encoder", [False, True])
+    def test_order_dict(self, msg, order, use_encoder, proto):
+        if use_encoder:
+            res = proto.Encoder(order=order).encode(msg)
+        else:
+            res = proto.encode(msg, order=order)
+
+        if order is not None:
+            sol = proto.encode(dict(sorted(msg.items())))
+        else:
+            sol = proto.encode(msg)
+
+        assert res == sol
+
+    def test_order_dict_non_str_errors(self, proto):
+        with pytest.raises(TypeError, match="Only dicts with str keys"):
+            proto.encode({"b": 2, 1: "a"}, order="deterministic")
+
+    def test_order_dict_unsortable(self, proto):
+        with pytest.raises(TypeError):
+            proto.encode({"x": 1, 1: 2}, order="deterministic")
+
+    @py315_or_later_only
+    @pytest.mark.parametrize("msg", [{}, {"y": 1, "x": 2, "z": 3}])
+    @pytest.mark.parametrize("order", [None, "deterministic", "sorted"])
+    @pytest.mark.parametrize("use_encoder", [False, True])
+    def test_order_frozendict(self, msg, order, use_encoder, proto):
+        if use_encoder:
+            res = proto.Encoder(order=order).encode(frozendict(msg))
+        else:
+            res = proto.encode(frozendict(msg), order=order)
+
+        # `frozendict` must be equal to the regular `dict`:
+        assert isinstance(msg, dict)
+        if order is not None:
+            sol = proto.encode(dict(sorted(msg.items())))
+        else:
+            sol = proto.encode(msg)
+
+        assert isinstance(res, bytes)
+        assert res == sol
+
+    @py315_or_later_only
+    def test_order_frozendict_non_str_errors(self, proto):
+        with pytest.raises(TypeError, match="Only dicts with str keys"):
+            proto.encode(frozendict({"b": 2, 1: "a"}), order="deterministic")
+
+    @py315_or_later_only
+    def test_order_frozendict_unsortable(self, proto):
+        with pytest.raises(TypeError):
+            proto.encode(frozendict({"x": 1, 1: 2}), order="deterministic")
+
+    @pytest.mark.parametrize("typ", [set, frozenset])
+    @pytest.mark.parametrize("order", ["deterministic", "sorted"])
+    def test_order_set(self, typ, proto, rand, order):
+        assert proto.encode(typ(), order=order) == proto.encode([])
+
+        msg = typ(rand.str(10) for _ in range(20))
+
+        res = proto.encode(msg, order=order)
+        sol = proto.encode(list(sorted(msg)))
+        assert res == sol
+
+        res = proto.encode(msg)
+        sol = proto.encode(list(msg))
+        assert res == sol
+
+    def test_order_set_unsortable(self, proto):
+        with pytest.raises(TypeError):
+            proto.encode({"x", 1}, order="deterministic")
+
+    @pytest.mark.parametrize("n", [0, 1, 2])
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "struct",
+            "dataclass",
+            "attrs",
+            "attrs-dict",
+        ],
+    )
+    def test_order_object(self, kind, n, proto):
+        fields = [f"x{i}" for i in range(n)]
+        fields.reverse()
+        if kind == "struct":
+            cls = rune.defstruct("Test", fields)
+        elif kind == "dataclass":
+            cls = make_dataclass("Test", fields)
+        else:
+            attrs = pytest.importorskip("attrs")
+            cls = attrs.make_class("Test", fields, slots=(kind == "attrs"))
+        msg = cls(*range(n))
+
+        if kind in ("struct", "dataclass"):
+            # we currently don't guarantee field order with attrs types
+            sol = proto.encode(dict(zip(fields, range(n), strict=False)))
+            res = proto.encode(msg)
+            assert res == sol
+
+            res = proto.encode(msg, order="deterministic")
+            assert res == sol
+
+        res = proto.encode(msg, order="sorted")
+        sol = proto.encode(dict(sorted(zip(fields, range(n), strict=False))))
+        assert res == sol
+
+    @pytest.mark.parametrize("kind", ["struct", "dataclass", "attrs", "attrs-dict"])
+    def test_order_unset(self, kind, proto):
+        if kind == "struct":
+
+            class Ex(Struct):
+                z: int | UnsetType = UNSET
+                x: int | UnsetType = UNSET
+        elif kind == "dataclass":
+
+            @dataclass
+            class Ex:
+                z: int | UnsetType = UNSET
+                x: int | UnsetType = UNSET
+        else:
+            attrs = pytest.importorskip("attrs")
+
+            @attrs.define(slots=(kind == "attrs"))
+            class Ex:
+                z: int | UnsetType = UNSET
+                x: int | UnsetType = UNSET
+
+        res = proto.encode(Ex(), order="sorted")
+        sol = proto.encode({})
+        assert res == sol
+
+        res = proto.encode(Ex(z=10), order="sorted")
+        sol = proto.encode({"z": 10})
+        assert res == sol
+
+        res = proto.encode(Ex(z=10, x=-1), order="sorted")
+        sol = proto.encode({"x": -1, "z": 10})
+        assert res == sol
+
+    def test_order_struct_omit_defaults(self, proto):
+        class Ex(Struct, omit_defaults=True):
+            z: int = 0
+            x: int = 1
+            y: int = 2
+
+        res = proto.encode(Ex(), order="sorted")
+        sol = proto.encode({})
+        assert res == sol
+
+        res = proto.encode(Ex(z=10), order="sorted")
+        sol = proto.encode({"z": 10})
+        assert res == sol
+
+        res = proto.encode(Ex(z=10, x=-1), order="sorted")
+        sol = proto.encode({"x": -1, "z": 10})
+        assert res == sol
+
+    def test_order_struct_tag(self, proto):
+        class Ex(Struct, tag_field="y", tag=2):
+            z: int
+            x: int
+
+        res = proto.encode(Ex(0, 1), order="sorted")
+        sol = proto.encode({"x": 1, "y": 2, "z": 0})
+        assert res == sol
+
+    @pytest.mark.parametrize("n", [0, 2, 3, 7, 15, 16, 17, 32, 100, 500, 1000, 10000])
+    def test_order_sort_implementation(self, rand, n):
+        keys = [f"x_{i}" for i in range(n)]
+        rand.shuffle(keys)
+        msg = dict(zip(keys, range(n), strict=False))
+        res = rune.json.encode(msg, order="deterministic")
+        sol = rune.json.encode(dict(sorted(msg.items())))
+        assert res == sol

@@ -7,6 +7,8 @@ use pyo3::{Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern};
 cached_objects! {
     annotated => "typing"."Annotated",
     any => "typing"."Any",
+    final_form => "typing"."Final",
+    new_type => "typing"."NewType",
     generic => "typing"."Generic",
     get_origin => "typing"."get_origin",
     get_args => "typing"."get_args",
@@ -45,6 +47,9 @@ cached_objects! {
     object_type => "builtins"."object",
     meta_type => "rune.meta"."Meta",
     default_factory_type => "rune.struct"."_DefaultFactory",
+    plain_class_fields => "rune.helpers"."plain_class_fields",
+    unset => "rune.unset"."UNSET",
+    unset_type => "rune.unset"."UnsetType",
     compile_regex => "re"."compile",
 }
 
@@ -147,6 +152,28 @@ pub(crate) fn is_literal_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {
 
 pub(crate) fn is_annotated_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(origin.is(annotated(origin.py())?))
+}
+
+pub(crate) fn is_final_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(origin.is(final_form(origin.py())?))
+}
+
+pub(crate) fn is_new_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(ty.get_type().is(new_type(ty.py())?))
+}
+
+pub(crate) fn new_type_supertype<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    ty.getattr(intern!(ty.py(), "__supertype__"))
+}
+
+pub(crate) fn is_unset_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(ty.is(unset_type(ty.py())?))
+}
+
+pub(crate) fn is_plain_class(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = ty.py();
+    Ok(is_dataclass(py)?.call1((ty,))?.is_truthy()?
+        || ty.hasattr(intern!(py, "__attrs_attrs__"))?)
 }
 
 pub(crate) fn is_union_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {

@@ -277,6 +277,49 @@ impl DecimalFormat {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Order {
+    #[default]
+    Unsorted,
+    Deterministic,
+    Sorted,
+}
+
+impl Order {
+    pub(crate) fn from_argument(value: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let Some(value) = value.filter(|value| !value.is_none()) else {
+            return Ok(Self::Unsorted);
+        };
+        if let Ok(name) = value.cast::<PyString>() {
+            match name.to_str()? {
+                "deterministic" => return Ok(Self::Deterministic),
+                "sorted" => return Ok(Self::Sorted),
+                _ => {}
+            }
+        }
+        Err(PyValueError::new_err(format!(
+            "`order` must be one of None, 'deterministic' or 'sorted', got {}",
+            value.repr()?
+        )))
+    }
+
+    pub(crate) fn get(self) -> Option<&'static str> {
+        match self {
+            Self::Unsorted => None,
+            Self::Deterministic => Some("deterministic"),
+            Self::Sorted => Some("sorted"),
+        }
+    }
+
+    pub(crate) fn sorts_containers(self) -> bool {
+        self != Self::Unsorted
+    }
+
+    pub(crate) fn sorts_fields(self) -> bool {
+        self == Self::Sorted
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbstractContainer {
     Sequence,

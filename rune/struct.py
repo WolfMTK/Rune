@@ -1,6 +1,6 @@
 import inspect
 import reprlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -179,6 +179,13 @@ def resolve_namedtuple_fields(tp: Any) -> Fields:
         return tuple(hints.items())
     mapping = _type_mapping(tp, origin)
     return tuple((name, _substitute(hint, mapping)) for name, hint in hints.items())
+
+
+def defstruct(name: str, fields: Iterable[str]) -> type[Struct]:
+    names = tuple(fields)
+    if len(set(names)) != len(names):
+        raise TypeError("defstruct() field names must be unique")
+    return StructMeta(name, (Struct,), {"__annotations__": dict.fromkeys(names, Any)})
 
 
 def _resolve_fields(cls: type) -> Fields:

@@ -75,7 +75,7 @@ macro_rules! format_bindings {
         use pyo3::prelude::PyAnyMethods;
         use pyo3::types::{PyByteArray, PyBytes, PySlice, PyType};
         use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pyfunction, pymethods};
-        use $crate::common::enums::DecimalFormat;
+        use $crate::common::enums::{DecimalFormat, Order};
         use $crate::common::structures::{DecoderCore, Hook};
         use $crate::common::helpers::encode_object;
         use $crate::common::Format;
@@ -93,30 +93,41 @@ macro_rules! format_bindings {
         }
 
         #[pyfunction]
+        #[pyo3(signature = (obj, *, order = None))]
         pub(crate) fn encode<'py>(
             py: Python<'py>,
             obj: &Bound<'py, PyAny>,
+            order: Option<Bound<'py, PyAny>>,
         ) -> PyResult<Bound<'py, PyBytes>> {
-            encode_object::<$writer>(py, obj, &Hook::default(), &DecimalFormat::default())
+            encode_object::<$writer>(
+                py,
+                obj,
+                &Hook::default(),
+                &DecimalFormat::default(),
+                Order::from_argument(order)?,
+            )
         }
 
         #[pyclass(name = "Encoder", module = $module, frozen)]
         pub(crate) struct Encoder {
             hook: Hook,
             decimal_format: DecimalFormat,
+            order: Order,
         }
 
         #[pymethods]
         impl Encoder {
             #[new]
-            #[pyo3(signature = (*, enc_hook = None, decimal_format = None))]
+            #[pyo3(signature = (*, enc_hook = None, decimal_format = None, order = None))]
             fn new(
                 enc_hook: Option<Bound<'_, PyAny>>,
                 decimal_format: Option<Bound<'_, PyAny>>,
+                order: Option<Bound<'_, PyAny>>,
             ) -> PyResult<Self> {
                 Ok(Self {
                     hook: Hook::from_argument(enc_hook, "enc_hook")?,
                     decimal_format: DecimalFormat::from_argument(decimal_format)?,
+                    order: Order::from_argument(order)?,
                 })
             }
 
@@ -130,12 +141,17 @@ macro_rules! format_bindings {
                 self.decimal_format.get(py)
             }
 
+            #[getter]
+            fn order(&self) -> Option<&'static str> {
+                self.order.get()
+            }
+
             fn encode<'py>(
                 &self,
                 py: Python<'py>,
                 obj: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyBytes>> {
-                encode_object::<$writer>(py, obj, &self.hook, &self.decimal_format)
+                encode_object::<$writer>(py, obj, &self.hook, &self.decimal_format, self.order)
             }
 
             #[pyo3(signature = (obj, buffer, offset = 0))]
@@ -151,7 +167,13 @@ macro_rules! format_bindings {
                     0.. => offset,
                     _ => return Err(PyValueError::new_err("offset must be >= -1")),
                 };
-                let encoded = encode_object::<$writer>(py, obj, &self.hook, &self.decimal_format)?;
+                let encoded = encode_object::<$writer>(
+                    py,
+                    obj,
+                    &self.hook,
+                    &self.decimal_format,
+                    self.order,
+                )?;
                 buffer.set_item(PySlice::new(py, start, isize::MAX, 1), encoded)
             }
         }

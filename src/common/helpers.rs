@@ -242,6 +242,7 @@ pub(crate) fn encode_object<'py, W: Writer>(
         encoding_decimal_replacement: false,
         kinds: RuneMap::default(),
         enum_values: RuneMap::default(),
+        pending_fields: Vec::new(),
     };
     encoder.encode(obj)?;
     Ok(PyBytes::new(py, &encoder.writer.finish()))
@@ -308,6 +309,13 @@ pub(crate) fn is_default_factory(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 #[inline(never)]
 fn call_default_factory<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     value.getattr(intern!(value.py(), "factory"))?.call0()
+}
+
+pub(crate) fn plain_default<'py>(default: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if is_default_factory(default)? {
+        return call_default_factory(default);
+    }
+    Ok(default.clone())
 }
 
 pub(crate) fn is_single_primitive(py: Python<'_>, union: &UnionPlan) -> bool {

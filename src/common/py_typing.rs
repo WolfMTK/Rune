@@ -19,8 +19,6 @@ cached_objects! {
     typing_generic_alias => "typing"."_GenericAlias",
     literal_generic_alias => "typing"."_LiteralGenericAlias",
     builtin_generic_alias => "types"."GenericAlias",
-    is_typeddict => "typing"."is_typeddict",
-    is_dataclass => "dataclasses"."is_dataclass",
     enum_type => "enum"."Enum",
     enum_meta => "enum"."EnumMeta",
     deque => "collections"."deque",
@@ -48,6 +46,7 @@ cached_objects! {
     meta_type => "rune.meta"."Meta",
     default_factory_type => "rune.struct"."_DefaultFactory",
     plain_class_fields => "rune.helpers"."plain_class_fields",
+    typeddict_check => "rune.helpers"."is_typeddict",
     unset => "rune.unset"."UNSET",
     unset_type => "rune.unset"."UnsetType",
     compile_regex => "re"."compile",
@@ -170,10 +169,24 @@ pub(crate) fn is_unset_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(ty.is(unset_type(ty.py())?))
 }
 
+pub(crate) fn is_dataclass_class(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let class = if ty.is_instance_of::<PyType>() {
+        ty.clone()
+    } else {
+        ty.get_type().into_any()
+    };
+    class.hasattr(intern!(ty.py(), "__dataclass_fields__"))
+}
+
+pub(crate) fn is_typeddict_class(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !ty.hasattr(intern!(ty.py(), "__required_keys__"))? {
+        return Ok(false);
+    }
+    typeddict_check(ty.py())?.call1((ty,))?.is_truthy()
+}
+
 pub(crate) fn is_plain_class(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let py = ty.py();
-    Ok(is_dataclass(py)?.call1((ty,))?.is_truthy()?
-        || ty.hasattr(intern!(py, "__attrs_attrs__"))?)
+    Ok(is_dataclass_class(ty)? || ty.hasattr(intern!(ty.py(), "__attrs_attrs__"))?)
 }
 
 pub(crate) fn is_union_origin(origin: &Bound<'_, PyAny>) -> PyResult<bool> {

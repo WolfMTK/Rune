@@ -1,4 +1,6 @@
-use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal_cache};
+use crate::common::cache::{
+    cached_fields, cached_tag_lookup, enum_cache, literal_cache, plain_field_cache, plain_fields,
+};
 use crate::common::datetime_format;
 use crate::common::enums::{
     AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat,
@@ -9,16 +11,16 @@ use crate::common::helpers::{
     ExpectedName, class_default, class_tag, default_value, enter_type_alias, expand_type_alias,
     has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_default_factory,
     is_named_tuple_class, is_single_primitive, is_struct_class, named_tuple_field_pairs,
-    parametrized_identity, struct_class, struct_field_pairs, type_arg_or_any, typevar_bound,
-    union_members, union_mismatch, untyped_plan,
+    parametrized_identity, plain_default, struct_class, struct_field_pairs, type_arg_or_any,
+    typevar_bound, union_members, union_mismatch, untyped_plan,
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
     any, date, datetime, decimal_type, deque, is_annotated_origin, is_decimal, is_enum_class,
     is_final_origin, is_frozendict_type, is_literal_origin, is_new_type, is_plain_class,
-    is_temporal_type, is_type, is_type_alias, is_typevar, is_union_origin, is_unset_type,
-    new_type_supertype, plain_class_fields, resolve_generic_fields, resolve_namedtuple_fields,
-    time, timedelta, type_args, type_name, type_origin, unset,
+    is_temporal_type, is_type, is_type_alias, is_typeddict_class, is_typevar, is_union_origin,
+    is_unset_type, new_type_supertype, object_type, resolve_generic_fields,
+    resolve_namedtuple_fields, time, timedelta, type_args, type_name, type_origin, unset,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
@@ -29,7 +31,9 @@ use crate::common::writer::Writer;
 use crate::common::{Format, recursion_limit};
 use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS};
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
-use pyo3::exceptions::{PyArithmeticError, PyRecursionError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyArithmeticError, PyKeyError, PyRecursionError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyFrozenSetMethods;
 use pyo3::types::PyListMethods;
@@ -370,6 +374,8 @@ impl<'py> Compiler<'py> {
             Shape::Time
         } else if base.is(timedelta(self.py)?) {
             Shape::TimeDelta
+        } else if is_typeddict_class(&base)? || is_plain_class(&base)? {
+            Shape::Struct(Box::new(self.plain_structure(ty, &base)?))
         } else if let Some(container) = AbstractContainer::of(&base)? {
             self.abstract_container(ty, container)?
         } else if is_type_alias(&base) {
@@ -507,6 +513,7 @@ impl<'py> Compiler<'py> {
                 node: self.compile(field.ty.bind(self.py))?,
                 is_required: class_value.is_none(),
                 has_default_factory,
+                default: None,
                 name: field.name,
                 key: field.key,
             });
@@ -547,6 +554,57 @@ impl<'py> Compiler<'py> {
             forbid_unknown_fields: settings.forbid_unknown_fields,
             constructor: Constructor::detect(ty, &member.class)?,
             tag_index,
+            describes_as_object: false,
+        })
+    }
+
+    fn plain_structure(
+        &mut self,
+        ty: &Bound<'py, PyAny>,
+        class: &Bound<'py, PyAny>,
+    ) -> PyResult<StructPlan> {
+        let cached = plain_field_cache(ty)?;
+        let mut fields = Vec::with_capacity(cached.len());
+        for (key, entry) in cached.iter() {
+            let (field_ty, is_required, default): (Bound<'py, PyAny>, bool, Bound<'py, PyAny>) =
+                entry.extract()?;
+            let key = key.cast_into::<PyString>()?;
+            fields.push(FieldPlan {
+                node: self.compile(&field_ty)?,
+                name: key.to_str()?.into(),
+                key: key.unbind(),
+                is_required,
+                has_default_factory: false,
+                default: (!is_required).then(|| default.unbind()),
+            });
+        }
+        let slot_by_name: RuneMap<Box<str>, usize> = fields
+            .iter()
+            .enumerate()
+            .map(|(slot, field)| (field.name.clone(), slot))
+            .collect();
+        let constructor = if is_typeddict_class(class)? {
+            Constructor::Dict
+        } else {
+            Constructor::Keywords {
+                pre_init: class
+                    .getattr_opt(intern!(ty.py(), "__attrs_pre_init__"))?
+                    .map(Bound::unbind),
+            }
+        };
+        Ok(StructPlan {
+            target: ty.clone().unbind(),
+            slot_by_name,
+            min_array_length: 0,
+            fields,
+            has_str_tag: false,
+            tag: None,
+            tag_field: String::new(),
+            array_like: false,
+            forbid_unknown_fields: false,
+            constructor,
+            tag_index: None,
+            describes_as_object: true,
         })
     }
 
@@ -763,6 +821,7 @@ pub(crate) struct FieldPlan {
     pub(crate) node: NodeId,
     pub(crate) is_required: bool,
     pub(crate) has_default_factory: bool,
+    pub(crate) default: Option<Py<PyAny>>,
 }
 
 pub(crate) struct StructPlan {
@@ -777,6 +836,7 @@ pub(crate) struct StructPlan {
     pub(crate) forbid_unknown_fields: bool,
     pub(crate) constructor: Constructor,
     pub(crate) tag_index: Option<TagIndex>,
+    pub(crate) describes_as_object: bool,
 }
 
 impl StructPlan {
@@ -816,13 +876,7 @@ impl StructPlan {
             post_init,
         } = &self.constructor
         else {
-            let kwargs = PyDict::new(py);
-            for (field, value) in self.fields.iter().zip(values) {
-                if let Some(value) = value {
-                    kwargs.set_item(field.key.bind(py), value)?;
-                }
-            }
-            return Ok(target.call((), Some(&kwargs))?);
+            return self.instantiate_by_call(py, values);
         };
         let instance = object_new.bind(py).call1((class,))?;
         for (field, value) in self.fields.iter().zip(values) {
@@ -842,6 +896,45 @@ impl StructPlan {
                 .map_err(|err| Fail::from_hook(py, err))?;
         }
         Ok(instance)
+    }
+
+    #[inline(never)]
+    fn instantiate_by_call<'py>(&self, py: Python<'py>, values: FieldValues<'py>) -> Decoded<'py> {
+        let target = self.target.bind(py);
+        match &self.constructor {
+            Constructor::Keywords { pre_init } => {
+                let kwargs = PyDict::new(py);
+                for (field, value) in self.fields.iter().zip(values) {
+                    let value = match (value, &field.default) {
+                        (Some(value), _) => value,
+                        (None, Some(default)) => plain_default(default.bind(py))?,
+                        (None, None) => continue,
+                    };
+                    kwargs.set_item(field.key.bind(py), value)?;
+                }
+                target
+                    .call((), Some(&kwargs))
+                    .map_err(|err| construction_error(py, err, pre_init.as_ref()))
+            }
+            Constructor::Dict => {
+                let dict = PyDict::new(py);
+                for (field, value) in self.fields.iter().zip(values) {
+                    if let Some(value) = value {
+                        dict.set_item(field.key.bind(py), value)?;
+                    }
+                }
+                Ok(dict.into_any())
+            }
+            Constructor::Init | Constructor::Direct { .. } => {
+                let kwargs = PyDict::new(py);
+                for (field, value) in self.fields.iter().zip(values) {
+                    if let Some(value) = value {
+                        kwargs.set_item(field.key.bind(py), value)?;
+                    }
+                }
+                Ok(target.call((), Some(&kwargs))?)
+            }
+        }
     }
 }
 
@@ -882,6 +975,16 @@ struct TaggedMember<'py> {
     node: NodeId,
 }
 
+fn plain_field_pairs<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = ty.py();
+    let mut pairs = Vec::new();
+    for (name, entry) in plain_fields(ty, true)?.iter() {
+        let (field_ty, _, _): (Bound<'py, PyAny>, bool, Bound<'py, PyAny>) = entry.extract()?;
+        pairs.push(PyTuple::new(py, [name, field_ty])?);
+    }
+    Ok(PyList::new(py, pairs)?.into_any())
+}
+
 #[derive(Default)]
 pub(crate) struct Validator {
     visited_records: RuneSet<String>,
@@ -900,6 +1003,8 @@ impl Validator {
         let base = origin.clone().unwrap_or_else(|| ty.clone());
         if is_struct_class(&base)? {
             self.visit_record(&base, ty, || struct_field_pairs(ty, &base))
+        } else if is_typeddict_class(&base)? || is_plain_class(&base)? {
+            self.visit_record(&base, ty, || plain_field_pairs(ty))
         } else if is_named_tuple_class(&base)? {
             self.visit_record(&base, ty, || named_tuple_field_pairs(ty))
         } else if let Some(origin) = origin {
@@ -1077,6 +1182,7 @@ pub(crate) struct StructLayout {
     pub(crate) fields: Vec<Field>,
     pub(crate) settings: StructSettings,
     pub(crate) has_unset_fields: bool,
+    pub(crate) may_miss_attributes: bool,
 }
 
 impl StructLayout {
@@ -1086,6 +1192,7 @@ impl StructLayout {
             fields,
             settings,
             has_unset_fields,
+            may_miss_attributes: false,
         }
     }
 
@@ -1115,15 +1222,18 @@ impl StructLayout {
     }
 
     pub(crate) fn load_plain(class: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let fields = plain_class_fields(class.py())?
-            .call1((class,))?
-            .try_iter()?
-            .map(|pair| {
-                let (key, field_ty) = pair?.extract()?;
-                Field::new(key, field_ty)
+        let fields = plain_fields(class, false)?
+            .iter()
+            .map(|(key, entry)| {
+                let (field_ty, _, _): (Bound<'_, PyAny>, bool, Bound<'_, PyAny>) =
+                    entry.extract()?;
+                Field::new(key.cast_into()?, field_ty)
             })
             .collect::<PyResult<_>>()?;
-        Ok(Self::new(fields, StructSettings::default()))
+        Ok(Self {
+            may_miss_attributes: true,
+            ..Self::new(fields, StructSettings::default())
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1203,8 +1313,12 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         } else if !plan.array_like && found == kind::MAP {
             return self.decode_map_struct(id);
         }
-        let expected = type_name(plan.target.bind(self.py))?;
-        Err(Fail::mismatch(&expected, kind::name(found)))
+        let expected = if plan.describes_as_object {
+            "object".to_owned()
+        } else {
+            type_name(plan.target.bind(self.py))?
+        };
+        Err(Fail::mismatch(&expected, kind::container_name(found)))
     }
 
     fn decode_array_struct(&mut self, id: NodeId) -> Decoded<'py> {
@@ -2039,6 +2153,7 @@ pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) encoding_decimal_replacement: bool,
     pub(crate) kinds: RuneMap<usize, (Bound<'py, PyType>, Kind)>,
     pub(crate) enum_values: RuneMap<usize, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+    pub(crate) pending_fields: Vec<(usize, Bound<'py, PyAny>)>,
 }
 
 impl<'py, W: Writer> Encoder<'_, 'py, W> {
@@ -2322,9 +2437,44 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     }
 
     #[inline(never)]
+    fn encode_plain(&mut self, obj: &Bound<'py, PyAny>, layout: &StructLayout) -> PyResult<()> {
+        let settings = &layout.settings;
+        if settings.omit_defaults
+            || layout.has_unset_fields
+            || self.order.sorts_fields()
+            || layout.fields.is_empty()
+        {
+            return self.encode_struct_filtered(obj, layout);
+        }
+        let py = obj.py();
+        let start = self.pending_fields.len();
+        for (slot, field) in layout.fields.iter().enumerate() {
+            if let Some(value) = read_attribute(obj, field.key.bind(py))? {
+                self.pending_fields.push((slot, value));
+            }
+        }
+        let end = self.pending_fields.len();
+        let result = self.encode_container(Token::MapStart(end - start), |encoder| {
+            for index in start..end {
+                let (slot, value) = encoder.pending_fields[index].clone();
+                encoder
+                    .writer
+                    .write_key(Token::Str(&layout.fields[slot].name));
+                encoder.encode(&value)?;
+            }
+            Ok(())
+        });
+        self.pending_fields.truncate(start);
+        result
+    }
+
+    #[inline(never)]
     fn encode_struct(&mut self, obj: &Bound<'py, PyAny>, layout: &StructLayout) -> PyResult<()> {
         let py = obj.py();
         let settings = &layout.settings;
+        if layout.may_miss_attributes {
+            return self.encode_plain(obj, layout);
+        }
         if !settings.array_like
             && (settings.omit_defaults || layout.has_unset_fields || self.order.sorts_fields())
         {
@@ -2361,12 +2511,17 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         let py = obj.py();
         let class = obj.get_type().into_any();
         let settings = &layout.settings;
-        let mut entries: Vec<(&str, Bound<'py, PyAny>)> = Vec::with_capacity(layout.len());
+        let own_fields = instance_fields(obj, layout)?;
+        let fields = own_fields.as_deref().unwrap_or(layout.fields.as_slice());
+        let mut entries: Vec<(&str, Bound<'py, PyAny>)> =
+            Vec::with_capacity(fields.len() + usize::from(settings.tag.is_some()));
         if let Some(tag) = &settings.tag {
             entries.push((settings.tag_field.as_str(), tag.bind(py).clone()));
         }
-        for field in &layout.fields {
-            let value = obj.getattr(field.key.bind(py))?;
+        for field in fields {
+            let Some(value) = read_attribute(obj, field.key.bind(py))? else {
+                continue;
+            };
             if !is_omitted_field(&class, field, &value, settings.omit_defaults)? {
                 entries.push((&*field.name, value));
             }
@@ -2381,6 +2536,64 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             }
             Ok(())
         })
+    }
+}
+
+fn construction_error(py: Python<'_>, err: PyErr, pre_init: Option<&Py<PyAny>>) -> Fail {
+    match pre_init {
+        Some(pre_init) if raised_in(py, &err, pre_init.bind(py)).unwrap_or(false) => err.into(),
+        _ => Fail::from_hook(py, err),
+    }
+}
+
+fn raised_in(py: Python<'_>, err: &PyErr, function: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let code = function.getattr(intern!(py, "__code__"))?;
+    let mut traceback = err.traceback(py).map(|tb| tb.into_any());
+    while let Some(current) = traceback {
+        let frame_code = current
+            .getattr(intern!(py, "tb_frame"))?
+            .getattr(intern!(py, "f_code"))?;
+        if frame_code.is(&code) {
+            return Ok(true);
+        }
+        let next = current.getattr(intern!(py, "tb_next"))?;
+        traceback = (!next.is_none()).then_some(next);
+    }
+    Ok(false)
+}
+
+fn instance_fields(obj: &Bound<'_, PyAny>, layout: &StructLayout) -> PyResult<Option<Vec<Field>>> {
+    if !layout.fields.is_empty() {
+        return Ok(None);
+    }
+    let py = obj.py();
+    let key = intern!(py, "__dataclass_fields__");
+    let Some(table) = obj.getattr_opt(key)? else {
+        return Ok(None);
+    };
+    let class_table = obj.get_type().getattr_opt(key)?;
+    if class_table.is_some_and(|class_table| class_table.is(&table)) {
+        return Ok(None);
+    }
+    let object = object_type(py)?;
+    table
+        .cast::<PyDict>()?
+        .keys()
+        .iter()
+        .map(|name| Field::new(name.cast_into()?, object.clone()))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
+}
+
+#[inline(always)]
+fn read_attribute<'py>(
+    obj: &Bound<'py, PyAny>,
+    key: &Bound<'py, PyString>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match obj.getattr_opt(key) {
+        Ok(value) => Ok(value),
+        Err(err) if err.is_instance_of::<PyKeyError>(obj.py()) => Ok(None),
+        Err(err) => Err(err),
     }
 }
 

@@ -7,6 +7,7 @@ def encode(
     obj: Any,
     /,
     *,
+    enc_hook: Callable[[Any], Any] | None = None,
     order: Literal["deterministic", "sorted"] | None = None,
 ) -> bytes: ...
 def decode(

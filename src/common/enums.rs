@@ -8,7 +8,8 @@ use crate::common::structures::{
 use crate::common::types::{ConstraintSetId, NodeId};
 use crate::exceptions::ParseError;
 use pyo3::basic::CompareOp;
-use pyo3::prelude::PyAnyMethods;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::{PyAnyMethods, PyStringMethods};
 use pyo3::types::{
     PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple,
 };
@@ -83,6 +84,7 @@ pub(crate) enum Shape {
     Struct(Box<StructPlan>),
     NamedTuple(TuplePlan),
     Custom(Py<PyAny>),
+    Decimal,
     Constrained {
         inner: NodeId,
         accepted_kinds: u8,
@@ -127,7 +129,7 @@ impl Shape {
             Self::Any | Self::Custom(_) | Self::Union(_) => kind::ANY,
             Self::Primitive(primitive) => primitive.accepted_kinds(),
             Self::Literal(plan) => plan.accepted_kinds(),
-            Self::Enum(_) => kind::NUMBER_OR_STR,
+            Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
             Self::Array(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
             Self::Dict(_) | Self::Struct(_) => kind::MAP,
@@ -228,6 +230,43 @@ impl Constructor {
     }
 }
 
+#[derive(Default)]
+pub(crate) enum DecimalFormat {
+    #[default]
+    String,
+    Number,
+    Callable(Py<PyAny>),
+}
+
+impl DecimalFormat {
+    pub(crate) fn from_argument(value: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let Some(value) = value else {
+            return Ok(Self::String);
+        };
+        if let Ok(name) = value.cast::<PyString>() {
+            match name.to_str()? {
+                "string" => return Ok(Self::String),
+                "number" => return Ok(Self::Number),
+                _ => {}
+            }
+        } else if value.is_callable() {
+            return Ok(Self::Callable(value.unbind()));
+        }
+        Err(PyValueError::new_err(format!(
+            "`decimal_format` must be 'string', 'number', or a callable, got {}",
+            value.repr()?
+        )))
+    }
+
+    pub(crate) fn get(&self, py: Python<'_>) -> Py<PyAny> {
+        match self {
+            Self::String => intern!(py, "string").clone().into_any().unbind(),
+            Self::Number => intern!(py, "number").clone().into_any().unbind(),
+            Self::Callable(format) => format.clone_ref(py),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArrayOutput {
     List,
@@ -270,6 +309,7 @@ pub(crate) enum Kind {
     Set,
     FrozenSet,
     Enum,
+    Decimal,
     Struct(Rc<StructLayout>),
     Unknown,
 }

@@ -37,7 +37,7 @@ def plain_class_fields(tp: Any, decoding: bool = True) -> dict[str, tuple[Any, b
 
 def _is_plain(obj: Any) -> bool:
     return isinstance(obj, type) and (
-        is_typeddict(obj) or dataclasses.is_dataclass(obj) or hasattr(obj, "__attrs_attrs__")
+            is_typeddict(obj) or dataclasses.is_dataclass(obj) or hasattr(obj, "__attrs_attrs__")
     )
 
 
@@ -48,7 +48,7 @@ def _fields(cls: type, mapping: dict[Any, Any], decoding: bool) -> dict[str, Any
         if not _is_plain(base_origin):
             continue
         for name, field_ty in _fields(
-            base_origin, _base_mapping(base, base_origin, mapping), decoding
+                base_origin, _base_mapping(base, base_origin, mapping), decoding
         ).items():
             if name in fields and fields[name] != field_ty:
                 raise TypeError(
@@ -84,8 +84,9 @@ def _own_fields(cls: type, inherited: dict[str, Any], decoding: bool) -> dict[st
 
 
 def _resolved_hints(cls: type) -> dict[str, Any]:
+    type_params = {param.__name__: param for param in getattr(cls, "__type_params__", ())}
     try:
-        return get_type_hints(cls, include_extras=True)
+        return get_type_hints(cls, localns=type_params, include_extras=True)
     except NameError:
         return inspect.get_annotations(cls)
 
@@ -153,8 +154,8 @@ def _dataclass_info(origin: type) -> dict[str, tuple[bool, bool, Any]]:
         else:
             default = field.default
         has_default = (
-            field.default is not dataclasses.MISSING
-            or field.default_factory is not dataclasses.MISSING
+                field.default is not dataclasses.MISSING
+                or field.default_factory is not dataclasses.MISSING
         )
         info[field.name] = (not has_default, field.init, default)
     return info

@@ -309,8 +309,8 @@ impl Plan {
                 let node = &self.nodes[id];
                 if !node.children_call_user_code
                     && node
-                    .shape
-                    .any_child(|child| self.nodes[child].calls_user_code)
+                        .shape
+                        .any_child(|child| self.nodes[child].calls_user_code)
                 {
                     let node = &mut self.nodes[id];
                     node.children_call_user_code = true;
@@ -2893,7 +2893,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: None,
         }
-            .into()
+        .into()
     }
 
     pub(crate) fn mismatch(expected: &str, got: &str) -> Self {
@@ -2915,7 +2915,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: Some(err),
         }
-            .into()
+        .into()
     }
 
     pub(crate) fn at(mut self, segment: PathSegment) -> Self {

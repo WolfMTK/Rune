@@ -1728,7 +1728,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         if self.plan.lax
             && let Some(seconds) = lax::numeric(py, &scalar)?
         {
-            return self.timedelta_from_seconds(&seconds);
+            return self
+                .timedelta_from_seconds(&seconds)
+                .map_err(|err| overflow_failure(py, err, "Duration is out of range"));
         }
         let Scalar::Str(text) = scalar else {
             unreachable!("kind is checked as str above")
@@ -1738,13 +1740,11 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         Ok(PyDelta::new(py, days, seconds, microseconds, false)?.into_any())
     }
 
-    fn timedelta_from_seconds(&self, seconds: &Bound<'py, PyAny>) -> Decoded<'py> {
+    fn timedelta_from_seconds(&self, seconds: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let py = self.py;
         let kwargs = PyDict::new(py);
         kwargs.set_item(intern!(py, "seconds"), seconds)?;
-        timedelta(py)?
-            .call((), Some(&kwargs))
-            .map_err(|err| overflow_failure(py, err, "Duration is out of range"))
+        timedelta(py)?.call((), Some(&kwargs))
     }
 
     fn decode_datetime(&mut self, accepted: u8) -> Decoded<'py> {
@@ -1792,8 +1792,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             return Err(Fail::invalid("Invalid epoch timestamp".to_owned()));
         }
         let utc = PyTzInfo::utc(py)?;
-        datetime(py)?
-            .call_method1(intern!(py, "fromtimestamp"), (seconds, utc))
+        let epoch = PyDateTime::new(py, 1970, 1, 1, 0, 0, 0, 0, Some(&utc))?;
+        self.timedelta_from_seconds(seconds)
+            .and_then(|offset| epoch.add(offset))
             .map_err(|err| overflow_failure(py, err, "Epoch timestamp is out of range"))
     }
 

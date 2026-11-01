@@ -14,7 +14,7 @@ use pyo3::basic::CompareOp;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::{PyAnyMethods, PyStringMethods};
 use pyo3::types::{
-    PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple,
+    PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple,
 };
 use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
 use std::borrow::Cow;
@@ -27,6 +27,7 @@ pub(crate) enum Token<'a> {
     UInt(u64),
     Float(f64),
     Str(&'a str),
+    Bytes(&'a [u8]),
     ArrayStart(usize),
     MapStart(usize),
     ArrayEnd,
@@ -40,9 +41,11 @@ pub(crate) enum Scalar<'a> {
     UInt(u64),
     Float(f64),
     Str(Cow<'a, str>),
+    Bytes(Cow<'a, [u8]>),
 }
 
 impl Scalar<'_> {
+    #[inline]
     pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
         match self {
             Scalar::Null => py.None().into_bound(py),
@@ -51,6 +54,7 @@ impl Scalar<'_> {
             Scalar::UInt(value) => PyInt::new(py, *value).into_any(),
             Scalar::Float(value) => PyFloat::new(py, *value).into_any(),
             Scalar::Str(value) => PyString::new(py, value).into_any(),
+            Scalar::Bytes(value) => PyBytes::new(py, value).into_any(),
         }
     }
 }
@@ -86,13 +90,19 @@ pub(crate) enum Shape {
     AbstractArray(NodeId),
     Dict(NodeId),
     AbstractDict(NodeId),
+    Frozendict {
+        class: Py<PyAny>,
+        values: NodeId,
+    },
     Struct(Box<StructPlan>),
     NamedTuple(TuplePlan),
     Custom(Py<PyAny>),
     Decimal,
     Date,
     Time,
+    DateTime,
     TimeDelta,
+    Uuid,
     Constrained {
         inner: NodeId,
         accepted_kinds: u8,
@@ -110,7 +120,7 @@ impl Shape {
                 .chain(union.tagged.iter().copied())
                 .any(matches),
             Self::Array(array) => array.items.iter().copied().any(matches),
-            Self::Dict(values) => matches(*values),
+            Self::Dict(values) | Self::Frozendict { values, .. } => matches(*values),
             Self::AbstractArray(inner) | Self::AbstractDict(inner) => matches(*inner),
             Self::Struct(plan) => plan.fields.iter().map(|field| field.node).any(matches),
             Self::NamedTuple(plan) => plan.fields.iter().copied().any(matches),
@@ -129,20 +139,21 @@ impl Shape {
         }
     }
 
-    pub(crate) fn is_constrained(&self) -> bool {
-        matches!(self, Self::Constrained { .. })
-    }
-
-    pub(crate) fn accepted_kinds(&self) -> u8 {
+    pub(crate) fn accepted_kinds(&self, lax: bool) -> u8 {
         match self {
             Self::Any | Self::Custom(_) | Self::Union(_) => kind::ANY,
-            Self::Primitive(primitive) => primitive.accepted_kinds(),
+            Self::Primitive(primitive) => primitive.accepted_kinds(lax),
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
-            Self::Date | Self::Time | Self::TimeDelta => kind::STR,
+            Self::Date | Self::Time => kind::STR,
+            Self::Uuid => kind::STR | kind::BYTES,
+            Self::DateTime | Self::TimeDelta if lax => kind::NUMBER_OR_STR,
+            Self::DateTime | Self::TimeDelta => kind::STR,
             Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
-            Self::Dict(_) | Self::AbstractDict(_) | Self::Struct(_) => kind::MAP,
+            Self::Dict(_) | Self::AbstractDict(_) | Self::Frozendict { .. } | Self::Struct(_) => {
+                kind::MAP
+            }
             Self::Constrained { accepted_kinds, .. } => *accepted_kinds,
         }
     }
@@ -177,7 +188,7 @@ impl Primitive {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::None => "None",
+            Self::None => "null",
             Self::Bool => "bool",
             Self::Int => "int",
             Self::Float => "float",
@@ -185,7 +196,7 @@ impl Primitive {
         }
     }
 
-    fn accepted_kinds(self) -> u8 {
+    pub(crate) fn exact_kinds(self) -> u8 {
         match self {
             Self::None => kind::NULL,
             Self::Bool => kind::BOOL,
@@ -193,6 +204,17 @@ impl Primitive {
             Self::Float => kind::FLOAT | kind::INT,
             Self::Str => kind::STR,
         }
+    }
+
+    fn accepted_kinds(self, lax: bool) -> u8 {
+        let lax_kinds = match self {
+            Self::None if lax => kind::STR,
+            Self::Bool if lax => kind::INT | kind::STR,
+            Self::Int if lax => kind::FLOAT | kind::STR,
+            Self::Float if lax => kind::STR,
+            _ => 0,
+        };
+        self.exact_kinds() | lax_kinds
     }
 }
 
@@ -322,6 +344,47 @@ impl Order {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum UuidFormat {
+    #[default]
+    Canonical,
+    Hex,
+    Bytes,
+}
+
+impl UuidFormat {
+    pub(crate) fn from_argument(value: Option<Bound<'_, PyAny>>, binary: bool) -> PyResult<Self> {
+        let Some(value) = value.filter(|value| !value.is_none()) else {
+            return Ok(Self::Canonical);
+        };
+        if let Ok(name) = value.cast::<PyString>() {
+            match name.to_str()? {
+                "canonical" => return Ok(Self::Canonical),
+                "hex" => return Ok(Self::Hex),
+                "bytes" if binary => return Ok(Self::Bytes),
+                _ => {}
+            }
+        }
+        let allowed = if binary {
+            "'canonical', 'hex', or 'bytes'"
+        } else {
+            "'canonical' or 'hex'"
+        };
+        Err(PyValueError::new_err(format!(
+            "`uuid_format` must be {allowed}, got {}",
+            value.repr()?
+        )))
+    }
+
+    pub(crate) fn get(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Hex => "hex",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbstractContainer {
     Sequence,
@@ -385,6 +448,8 @@ pub(crate) enum Kind {
     Int,
     Float,
     Str,
+    Bytes,
+    Uuid,
     Dict,
     List,
     Tuple,
@@ -478,6 +543,7 @@ pub(crate) enum ConstraintSubject {
     Str,
     Array,
     Object,
+    DateTime,
     Other,
 }
 
@@ -488,7 +554,8 @@ impl ConstraintSubject {
             Shape::Primitive(Primitive::Float) => Self::Float,
             Shape::Primitive(Primitive::Str) => Self::Str,
             Shape::Array(_) | Shape::AbstractArray(_) => Self::Array,
-            Shape::Dict(_) | Shape::AbstractDict(_) => Self::Object,
+            Shape::Dict(_) | Shape::AbstractDict(_) | Shape::Frozendict { .. } => Self::Object,
+            Shape::DateTime => Self::DateTime,
             _ => Self::Other,
         }
     }
@@ -500,9 +567,21 @@ impl ConstraintSubject {
             Self::Str => "str",
             Self::Array => "array",
             Self::Object => "object",
+            Self::DateTime => "datetime",
             Self::Other => "value",
         }
     }
+}
+
+fn bound_text(limit: &Bound<'_, PyAny>, subject: ConstraintSubject) -> String {
+    let shown = match subject {
+        ConstraintSubject::Float => match limit.extract::<f64>() {
+            Ok(value) => PyFloat::new(limit.py(), value).into_any(),
+            Err(_) => limit.clone(),
+        },
+        _ => limit.clone(),
+    };
+    shown.to_string()
 }
 
 pub(crate) enum Constraint {
@@ -511,6 +590,7 @@ pub(crate) enum Constraint {
     Pattern { regex: Py<PyAny>, source: String },
     MinLength(usize),
     MaxLength(usize),
+    Timezone { aware: bool },
 }
 
 impl Constraint {
@@ -546,6 +626,11 @@ impl Constraint {
             if let Some(max) = field("max_length")? {
                 constraints.push(Self::MaxLength(max.extract()?));
             }
+            if let Some(aware) = field("tz")? {
+                constraints.push(Self::Timezone {
+                    aware: aware.is_truthy()?,
+                });
+            }
         }
         Ok(constraints)
     }
@@ -557,6 +642,7 @@ impl Constraint {
             Self::Pattern { .. } => "pattern",
             Self::MinLength(_) => "min_length",
             Self::MaxLength(_) => "max_length",
+            Self::Timezone { .. } => "tz",
         }
     }
 
@@ -565,6 +651,7 @@ impl Constraint {
             Self::Bound(..) | Self::MultipleOf(_) => "a numeric type",
             Self::Pattern { .. } => "a str type",
             Self::MinLength(_) | Self::MaxLength(_) => "a str or collection type",
+            Self::Timezone { .. } => "a datetime type",
         }
     }
 
@@ -574,6 +661,7 @@ impl Constraint {
             Self::Bound(..) | Self::MultipleOf(_) => matches!(subject, Int | Float),
             Self::Pattern { .. } => subject == Str,
             Self::MinLength(_) | Self::MaxLength(_) => matches!(subject, Str | Array | Object),
+            Self::Timezone { .. } => subject == DateTime,
         }
     }
 
@@ -590,28 +678,37 @@ impl Constraint {
                 .is_none(),
             Self::MinLength(min) => value.len()? >= *min,
             Self::MaxLength(max) => value.len()? <= *max,
+            Self::Timezone { aware } => value.getattr(intern!(py, "tzinfo"))?.is_none() != *aware,
         })
     }
 
     pub(crate) fn violation(&self, py: Python<'_>, subject: ConstraintSubject) -> String {
-        let subject = subject.name();
+        let subject_name = subject.name();
         match self {
             Self::Bound(comparison, limit) => {
                 format!(
-                    "Expected `{subject}` {} {}",
+                    "Expected `{subject_name}` {} {}",
                     comparison.symbol(),
-                    limit.bind(py)
+                    bound_text(limit.bind(py), subject)
                 )
             }
             Self::MultipleOf(factor) => {
                 format!(
-                    "Expected `{subject}` that's a multiple of {}",
+                    "Expected `{subject_name}` that's a multiple of {}",
                     factor.bind(py)
                 )
             }
-            Self::Pattern { source, .. } => format!("Expected `{subject}` matching regex {source}"),
-            Self::MinLength(min) => format!("Expected `{subject}` of length >= {min}"),
-            Self::MaxLength(max) => format!("Expected `{subject}` of length <= {max}"),
+            Self::Pattern { source, .. } => {
+                format!("Expected `{subject_name}` matching regex {source}")
+            }
+            Self::MinLength(min) => format!("Expected `{subject_name}` of length >= {min}"),
+            Self::MaxLength(max) => format!("Expected `{subject_name}` of length <= {max}"),
+            Self::Timezone { aware: true } => {
+                "Expected `datetime` with a timezone component".to_owned()
+            }
+            Self::Timezone { aware: false } => {
+                "Expected `datetime` with no timezone component".to_owned()
+            }
         }
     }
 }

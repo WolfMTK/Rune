@@ -61,6 +61,7 @@ impl<'a> Parser<'a> {
             0xc0 => Ok(Scalar::Null),
             0xc2 => Ok(Scalar::Bool(false)),
             0xc3 => Ok(Scalar::Bool(true)),
+            0xc4..=0xc6 => Ok(Scalar::Bytes(Cow::Borrowed(self.read_binary(tag)?))),
             0xca => Ok(Scalar::Float(self.read_f32()?.into())),
             0xcb => Ok(Scalar::Float(self.read_f64()?)),
             0xcc => Ok(Scalar::Int(self.read_u8()?.into())),
@@ -93,6 +94,15 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.error("Invalid UTF-8 in string"))
     }
 
+    fn read_binary(&mut self, tag: u8) -> Result<&'a [u8], ParseError> {
+        let len = match tag {
+            0xc4 => usize::from(self.read_u8()?),
+            0xc5 => usize::from(self.read_u16()?),
+            _ => self.read_u32()? as usize,
+        };
+        self.read_bytes(len)
+    }
+
     fn read_container(&mut self, tag: u8) -> Result<Option<Container>, ParseError> {
         Ok(Some(match tag {
             0x80..=0x8f => Container::Map(usize::from(tag & 0x0f)),
@@ -109,11 +119,11 @@ impl<'a> Parser<'a> {
 impl<'a> Reader<'a> for Parser<'a> {
     fn peek_kind(&mut self) -> Result<u8, ParseError> {
         Ok(match self.peek_bytes(0, 1)?[0] {
-            0xcf if self.peek_bytes(1, 8)?[0] >= 0x80 => kind::UINT,
             0x00..=0x7f | 0xcc..=0xd3 | 0xe0..=0xff => kind::INT,
-            0xca | 0xcb => kind::FLOAT,
             0xc0 => kind::NULL,
             0xc2 | 0xc3 => kind::BOOL,
+            0xc4..=0xc6 => kind::BYTES,
+            0xca | 0xcb => kind::FLOAT,
             0xa0..=0xbf | 0xd9..=0xdb => kind::STR,
             0x90..=0x9f | 0xdc | 0xdd => kind::ARRAY,
             0x80..=0x8f | 0xde | 0xdf => kind::MAP,
@@ -231,6 +241,18 @@ impl MsgpackWriter {
     pub(crate) fn write_string(&mut self, value: &str) {
         self.write_length(value.len(), &STRING);
         self.out.extend_from_slice(value.as_bytes());
+    }
+
+    pub(crate) fn write_binary(&mut self, value: &[u8]) {
+        let len = value.len();
+        if let Ok(v) = u8::try_from(len) {
+            self.write_tagged(0xc4, &[v]);
+        } else if let Ok(v) = u16::try_from(len) {
+            self.write_tagged(0xc5, &v.to_be_bytes());
+        } else {
+            self.write_tagged(0xc6, &(len as u32).to_be_bytes());
+        }
+        self.out.extend_from_slice(value);
     }
 
     pub(crate) fn write_length(&mut self, len: usize, markers: &LengthMarkers) {

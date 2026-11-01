@@ -6,7 +6,7 @@ Number = int | float
 
 _NUMERIC_FIELDS = ("gt", "ge", "lt", "le", "multiple_of")
 _LENGTH_FIELDS = ("min_length", "max_length")
-_FIELDS = (*_NUMERIC_FIELDS, "pattern", *_LENGTH_FIELDS)
+_FIELDS = (*_NUMERIC_FIELDS, "pattern", *_LENGTH_FIELDS, "tz")
 
 
 class Meta:
@@ -20,6 +20,7 @@ class Meta:
     pattern: str | None
     min_length: int | None
     max_length: int | None
+    tz: bool | None
 
     def __init__(
         self,
@@ -32,8 +33,9 @@ class Meta:
         pattern: str | None = None,
         min_length: int | None = None,
         max_length: int | None = None,
+        tz: bool | None = None,
     ) -> None:
-        values = (gt, ge, lt, le, multiple_of, pattern, min_length, max_length)
+        values = (gt, ge, lt, le, multiple_of, pattern, min_length, max_length, tz)
         for name, value in zip(_FIELDS, values, strict=True):
             object.__setattr__(self, name, value)
         self._validate()
@@ -61,6 +63,8 @@ class Meta:
                 raise TypeError(f"`{name}` must be an int, got {type(value).__name__}")
             if value < 0:
                 raise ValueError(f"`{name}` must be >= 0")
+        if self.tz is not None and not isinstance(self.tz, bool):
+            raise TypeError(f"`tz` must be a bool, got {type(self.tz).__name__}")
 
     def _specified_fields(self) -> dict[str, Any]:
         values = ((name, getattr(self, name)) for name in _FIELDS)

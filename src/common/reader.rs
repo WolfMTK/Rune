@@ -7,13 +7,13 @@ pub(crate) mod kind {
     pub(crate) const NULL: u8 = 1 << 0;
     pub(crate) const BOOL: u8 = 1 << 1;
     pub(crate) const INT: u8 = 1 << 2;
-    pub(crate) const UINT: u8 = 1 << 3;
+    pub(crate) const BYTES: u8 = 1 << 3;
     pub(crate) const FLOAT: u8 = 1 << 4;
     pub(crate) const STR: u8 = 1 << 5;
     pub(crate) const ARRAY: u8 = 1 << 6;
     pub(crate) const MAP: u8 = 1 << 7;
     pub(crate) const ANY: u8 = u8::MAX;
-    pub(crate) const INTEGER: u8 = INT | UINT;
+    pub(crate) const INTEGER: u8 = INT;
     pub(crate) const NUMBER_OR_STR: u8 = INTEGER | FLOAT | STR;
     pub(crate) const LITERAL: u8 = NULL | BOOL | INT | STR;
 
@@ -21,7 +21,8 @@ pub(crate) mod kind {
         match kind {
             NULL => "NoneType",
             BOOL => "bool",
-            INT | UINT => "int",
+            INT => "int",
+            BYTES => "bytes",
             FLOAT => "float",
             STR => "str",
             ARRAY => "list",

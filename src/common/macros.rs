@@ -75,10 +75,10 @@ macro_rules! format_bindings {
         use pyo3::prelude::PyAnyMethods;
         use pyo3::types::{PyByteArray, PyBytes, PySlice, PyType};
         use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pyfunction, pymethods};
-        use $crate::common::enums::{DecimalFormat, Order};
-        use $crate::common::structures::{DecoderCore, Hook};
+        use $crate::common::enums::{DecimalFormat, Order, UuidFormat};
+        use $crate::common::structures::{DecoderCore, Hook, TypeArgument};
         use $crate::common::helpers::encode_object;
-        use $crate::common::Format;
+        use $crate::common::{Format, writer::Writer};
         use $crate::exceptions::ParseError;
 
         pub(crate) struct $format;
@@ -106,6 +106,7 @@ macro_rules! format_bindings {
                 &Hook::from_argument(enc_hook, "enc_hook")?,
                 &DecimalFormat::default(),
                 Order::from_argument(order)?,
+                UuidFormat::default(),
             )
         }
 
@@ -114,21 +115,24 @@ macro_rules! format_bindings {
             hook: Hook,
             decimal_format: DecimalFormat,
             order: Order,
+            uuid_format: UuidFormat,
         }
 
         #[pymethods]
         impl Encoder {
             #[new]
-            #[pyo3(signature = (*, enc_hook = None, decimal_format = None, order = None))]
+            #[pyo3(signature = (*, enc_hook = None, decimal_format = None, order = None, uuid_format = None))]
             fn new(
                 enc_hook: Option<Bound<'_, PyAny>>,
                 decimal_format: Option<Bound<'_, PyAny>>,
                 order: Option<Bound<'_, PyAny>>,
+                uuid_format: Option<Bound<'_, PyAny>>,
             ) -> PyResult<Self> {
                 Ok(Self {
                     hook: Hook::from_argument(enc_hook, "enc_hook")?,
                     decimal_format: DecimalFormat::from_argument(decimal_format)?,
                     order: Order::from_argument(order)?,
+                    uuid_format: UuidFormat::from_argument(uuid_format, <$writer as Writer>::BINARY)?,
                 })
             }
 
@@ -147,12 +151,24 @@ macro_rules! format_bindings {
                 self.order.get()
             }
 
+            #[getter]
+            fn uuid_format(&self) -> &'static str {
+                self.uuid_format.get()
+            }
+
             fn encode<'py>(
                 &self,
                 py: Python<'py>,
                 obj: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyBytes>> {
-                encode_object::<$writer>(py, obj, &self.hook, &self.decimal_format, self.order)
+                encode_object::<$writer>(
+                    py,
+                    obj,
+                    &self.hook,
+                    &self.decimal_format,
+                    self.order,
+                    self.uuid_format,
+                )
             }
 
             #[pyo3(signature = (obj, buffer, offset = 0))]
@@ -174,20 +190,22 @@ macro_rules! format_bindings {
                     &self.hook,
                     &self.decimal_format,
                     self.order,
+                    self.uuid_format,
                 )?;
                 buffer.set_item(PySlice::new(py, start, isize::MAX, 1), encoded)
             }
         }
 
         #[pyfunction]
-        #[pyo3(signature = (buf, *, r#type = None, dec_hook = None))]
+        #[pyo3(signature = (buf, *, r#type = TypeArgument::Untyped, dec_hook = None, strict = true))]
         pub(crate) fn decode<'py>(
             py: Python<'py>,
             buf: &[u8],
-            r#type: Option<Bound<'py, PyAny>>,
+            r#type: TypeArgument<'py>,
             dec_hook: Option<Bound<'py, PyAny>>,
+            strict: bool,
         ) -> PyResult<Bound<'py, PyAny>> {
-            DecoderCore::new(r#type, dec_hook)?.decode::<$format>(py, buf)
+            DecoderCore::new(r#type, dec_hook, strict)?.decode::<$format>(py, buf)
         }
 
         #[pyclass(name = "Decoder", module = $module, frozen)]
@@ -198,19 +216,25 @@ macro_rules! format_bindings {
         #[pymethods]
         impl Decoder {
             #[new]
-            #[pyo3(signature = (r#type = None, *, dec_hook = None))]
+            #[pyo3(signature = (r#type = TypeArgument::Untyped, *, dec_hook = None, strict = true))]
             fn new(
-                r#type: Option<Bound<'_, PyAny>>,
+                r#type: TypeArgument<'_>,
                 dec_hook: Option<Bound<'_, PyAny>>,
+                strict: bool,
             ) -> PyResult<Self> {
                 Ok(Self {
-                    core: DecoderCore::new(r#type, dec_hook)?,
+                    core: DecoderCore::new(r#type, dec_hook, strict)?,
                 })
             }
 
             #[getter]
             fn dec_hook(&self, py: Python<'_>) -> Option<Py<PyAny>> {
                 self.core.hook().get(py)
+            }
+
+            #[getter]
+            fn strict(&self) -> bool {
+                self.core.strict()
             }
 
             #[classmethod]

@@ -41,6 +41,21 @@ pub(crate) fn parse_date(text: &str) -> Option<Date> {
     is_valid.then_some(Date { year, month, day })
 }
 
+pub(crate) struct DateTime {
+    pub(crate) date: Date,
+    pub(crate) time: Time,
+}
+
+pub(crate) fn parse_datetime(text: &str) -> Option<DateTime> {
+    if !matches!(text.as_bytes().get(10), Some(b'T' | b't')) {
+        return None;
+    }
+    Some(DateTime {
+        date: parse_date(text.get(..10)?)?,
+        time: parse_time(text.get(11..)?)?,
+    })
+}
+
 pub(crate) fn parse_time(text: &str) -> Option<Time> {
     let bytes = text.as_bytes();
     if bytes.len() < 8 || bytes[2] != b':' || bytes[5] != b':' {

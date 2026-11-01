@@ -204,6 +204,10 @@ pub(crate) enum Constructor {
         post_init: Option<Py<PyAny>>,
     },
     Init,
+    Keywords {
+        pre_init: Option<Py<PyAny>>,
+    },
+    Dict,
 }
 impl Constructor {
     pub(crate) fn detect(ty: &Bound<'_, PyAny>, class: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -230,13 +234,11 @@ impl Constructor {
     }
 
     pub(crate) fn calls_user_code(&self) -> bool {
-        !matches!(
-            self,
-            Self::Direct {
-                post_init: None,
-                ..
-            }
-        )
+        match self {
+            Self::Direct { post_init, .. } => post_init.is_some(),
+            Self::Init | Self::Keywords { .. } => true,
+            Self::Dict => false,
+        }
     }
 }
 

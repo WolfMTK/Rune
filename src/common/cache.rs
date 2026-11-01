@@ -1,6 +1,6 @@
 use crate::common::helpers::class_tag;
 use crate::common::py_typing::{
-    builtin_generic_alias, struct_lookup_cache, type_args, typing_generic_alias,
+    builtin_generic_alias, plain_class_fields, struct_lookup_cache, type_args, typing_generic_alias,
 };
 use crate::common::structures::Field;
 use crate::common::validate::{validate_i64_range, validate_literal_value};
@@ -87,6 +87,26 @@ pub(crate) fn cached_fields(
         .iter()
         .map(|(key, field_ty)| Field::new(key.cast_into()?, field_ty))
         .collect()
+}
+
+pub(crate) fn plain_field_cache<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
+    let resolver = plain_class_fields(ty.py())?;
+    let target = cache_target(ty, resolver)?;
+    if let Some(cache) = read_cache(&target, "Class")? {
+        return Ok(cache);
+    }
+    let cache = resolver.call1((ty,))?.cast_into::<PyDict>()?;
+    target.setattr(intern!(ty.py(), CACHE_ATTR), &cache)?;
+    Ok(cache)
+}
+
+pub(crate) fn plain_fields<'py>(
+    ty: &Bound<'py, PyAny>,
+    decoding: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    Ok(plain_class_fields(ty.py())?
+        .call1((ty, decoding))?
+        .cast_into::<PyDict>()?)
 }
 
 pub(crate) fn cached_tag_lookup<'py>(

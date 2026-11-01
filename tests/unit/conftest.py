@@ -2,8 +2,13 @@ import math
 import random
 import string
 import struct
+from dataclasses import dataclass
 from typing import Any
 
+try:
+    import attrs
+except ImportError:
+    attrs = None
 import pytest
 
 import rune
@@ -58,3 +63,13 @@ class Rand:
 @pytest.fixture
 def rand():
     yield Rand()
+
+
+@pytest.fixture(params=["dataclass", "attrs"])
+def decorator(request):
+    if request.param == "dataclass":
+        return dataclass
+    elif request.param == "attrs":
+        if attrs is None:
+            pytest.skip(reason="attrs not installed")
+        return attrs.define

@@ -12,10 +12,14 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, make_dataclass
+from dataclasses import dataclass, field, make_dataclass
 from types import ModuleType
 from typing import Any, Literal
 
+try:
+    import attrs
+except ImportError:
+    attrs = None
 import pytest
 from rune.struct import Struct
 
@@ -27,6 +31,7 @@ from .utils import (
     PY312,
     emscripten_stack_limited,
     max_call_depth,
+    py311_plus,
     py312_plus,
     py315_or_later_only,
     temp_module,
@@ -3621,3 +3626,1461 @@ class TestOrder:
         res = rune.json.encode(msg, order="deterministic")
         sol = rune.json.encode(dict(sorted(msg.items())))
         assert res == sol
+
+
+class TestGenericDataclassOrAttrs:
+    def test_generic_info_cached(self, decorator, proto):
+        @decorator
+        class Ex(typing.Generic[T]):
+            x: T
+
+        typ = Ex[int]
+        assert Ex[int] is typ
+
+        dec = proto.Decoder(typ)
+        info = typ.__rune_cache__
+        assert info is not None
+        assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+        dec2 = proto.Decoder(typ)
+        assert typ.__rune_cache__ is info
+        assert sys.getrefcount(info) <= 5
+
+        del dec
+        del dec2
+        assert sys.getrefcount(info) <= 3
+
+    def test_generic_invalid_types_not_cached(self, decorator, proto):
+        @decorator
+        class Ex(typing.Generic[T]):
+            x: list[T] | tuple[float]
+
+        for typ in [Ex, Ex[int]]:
+            for _ in range(2):
+                with pytest.raises(TypeError, match="not supported"):
+                    proto.Decoder(typ)
+
+            assert not hasattr(typ, "__rune_cache__")
+
+    def test_msgspec_cache_overwritten(self, decorator, proto):
+        @decorator
+        class Ex(typing.Generic[T]):
+            x: T
+
+        typ = Ex[int]
+        typ.__rune_cache__ = 1
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            proto.Decoder(typ)
+
+    def test_generic_dataclass(self, decorator, proto):
+        @decorator
+        class Ex(typing.Generic[T]):
+            x: T
+            y: list[T]
+
+        sol = Ex(1, [1, 2])
+        msg = proto.encode(sol)
+
+        res = proto.decode(msg, type=Ex)
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int | str])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[float])
+        assert type(res.x) is float
+
+        with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+            proto.decode(msg, type=Ex[str])
+
+    @pytest.mark.parametrize("module", ["dataclasses", "attrs"])
+    def test_recursive_generic(self, module, proto):
+        pytest.importorskip(module)
+        if module == "dataclasses":
+            import_ = "from dataclasses import dataclass as decorator"
+        else:
+            import_ = "from attrs import define as decorator"
+
+        source = f"""
+        from __future__ import annotations
+        from typing import Union, Generic, TypeVar
+        from rune import Struct
+        {import_}
+
+        T = TypeVar("T")
+
+        @decorator
+        class Ex(Generic[T]):
+            a: T
+            b: Ex[T] | None
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            msg2 = mod.Ex(a=1, b=mod.Ex(a="bad", b=None))
+            assert proto.decode(proto.encode(msg), type=mod.Ex) == msg
+            assert proto.decode(proto.encode(msg2), type=mod.Ex) == msg2
+            assert proto.decode(proto.encode(msg), type=mod.Ex[int]) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                proto.decode(proto.encode(msg2), type=mod.Ex[int])
+            assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    @pytest.mark.parametrize("module", ["dataclasses", "attrs"])
+    @py312_plus
+    def test_typevar_syntax(self, module, proto):
+        pytest.importorskip(module)
+        if module == "dataclasses":
+            import_ = "from dataclasses import dataclass as decorator"
+        else:
+            import_ = "from attrs import define as decorator"
+
+        source = f"""
+        from __future__ import annotations
+        from typing import Union
+        from rune import Struct
+        {import_}
+
+        @decorator
+        class Ex[T]:
+            a: T
+            b: Union[Ex[T], None]
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            msg2 = mod.Ex(a=1, b=mod.Ex(a="bad", b=None))
+            assert proto.decode(proto.encode(msg), type=mod.Ex) == msg
+            assert proto.decode(proto.encode(msg2), type=mod.Ex) == msg2
+            assert proto.decode(proto.encode(msg), type=mod.Ex[int]) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                proto.decode(proto.encode(msg2), type=mod.Ex[int])
+            assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    def test_unbound_typevars_use_bound_if_set(self, proto):
+        T = typing.TypeVar("T", bound=int | str)
+
+        dec = proto.Decoder(list[T])
+        sol = [1, "two", 3, "four"]
+        msg = proto.encode(sol)
+        assert dec.decode(msg) == sol
+
+        bad = proto.encode([1, {}])
+        with pytest.raises(
+            ValidationError,
+            match=r"Expected `int \| str`, got `object` - at `\$\[1\]`",
+        ):
+            dec.decode(bad)
+
+    def test_unbound_typevars_with_constraints_unsupported(self, proto):
+        T = typing.TypeVar("T", int, str)
+        with pytest.raises(TypeError) as rec:
+            proto.Decoder(list[T])
+
+        assert "Unbound TypeVar `~T` has constraints" in str(rec.value)
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(False, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic(self, mapping_type: str, future: bool):
+        source = f"""
+        import typing
+        import dataclasses
+        import collections
+
+        T = typing.TypeVar("T")
+
+        @dataclasses.dataclass
+        class Foo(typing.Generic[T], {mapping_type}[str, T]):
+            data: dict[str, T]
+
+            def __getitem__(self, x):
+                return self.data[x]
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                return iter(self.data)
+        """
+
+        if future:
+            source = "from __future__ import annotations\n" + source
+
+        with temp_module(source) as mod, pytest.raises(ValidationError):
+            rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": "foo"})), type=mod.Foo[int])
+
+        rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": 1})), type=mod.Foo[int])
+
+    @pytest.mark.parametrize("leaf", ["Child1", "Child2", "Child3"])
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(True, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic_multilevel(self, mapping_type: str, future: bool, leaf: str):
+        # the builtin generic must be listed *before* 'typing.Generic[T]'. With
+        # 'Generic' first its '__class_getitem__' wins, so 'Base[U]' resolves to a
+        # 'typing._GenericAlias' instead of a 'types.GenericAlias'
+        source = f"""
+        import typing
+        import dataclasses
+        import collections
+
+        T = typing.TypeVar("T")
+        U = typing.TypeVar("U")
+        V = typing.TypeVar("V")
+        W = typing.TypeVar("W")
+
+        @dataclasses.dataclass
+        class Base({mapping_type}[str, T], typing.Generic[T]):
+            data: dict[str, T]
+
+            def __getitem__(self, x):
+                return self.data[x]
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                return iter(self.data)
+
+        @dataclasses.dataclass
+        class Child1(Base[U], typing.Generic[U]):
+            pass
+
+        @dataclasses.dataclass
+        class Child2(Child1[V], typing.Generic[V]):
+            pass
+
+        @dataclasses.dataclass
+        class Child3(Child2[W], typing.Generic[W]):
+            pass
+        """
+
+        if future:
+            source = "from __future__ import annotations\n" + textwrap.dedent(source)
+
+        with temp_module(source) as mod:
+            typ = getattr(mod, leaf)[int]
+            rune.json.decode(b'{"data": {"x": 1}}', type=typ)
+            with pytest.raises(ValidationError):
+                rune.json.decode(b'{"data": {"x": "not_an_int"}}', type=typ)
+
+    @pytest.mark.parametrize("leaf", ["Child1", "Child2", "Child3"])
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_multilevel_typevar_syntax(
+        self, mapping_type: str, leaf: str
+    ):
+        source = f"""
+        import typing
+        import dataclasses
+        import collections
+
+        @dataclasses.dataclass
+        class Base[T]({mapping_type}[str, T]):
+            data: dict[str, T]
+
+            def __getitem__(self, x):
+                return self.data[x]
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                return iter(self.data)
+
+        @dataclasses.dataclass
+        class Child1[U](Base[U]):
+            pass
+
+        @dataclasses.dataclass
+        class Child2[V](Child1[V]):
+            pass
+
+        @dataclasses.dataclass
+        class Child3[W](Child2[W]):
+            pass
+        """
+
+        with temp_module(source) as mod:
+            typ = getattr(mod, leaf)[int]
+            rune.json.decode(b'{"data": {"x": 1}}', type=typ)
+            with pytest.raises(ValidationError):
+                rune.json.decode(b'{"data": {"x": "not_an_int"}}', type=typ)
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(False, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_typevar_syntax(self, mapping_type: str, future: bool):
+        source = f"""
+        import dataclasses
+        import collections
+        import typing
+
+        @dataclasses.dataclass
+        class Foo[T]({mapping_type}[str, T]):
+            data: dict[str, T]
+
+            def __getitem__(self, x):
+                return self.data[x]
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                return iter(self.data)
+        """
+
+        if future:
+            source = "from __future__ import annotations\n" + source
+
+        with temp_module(source) as mod, pytest.raises(ValidationError):
+            rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": "foo"})), type=mod.Foo[int])
+
+        rune.msgpack.decode(rune.msgpack.encode(mod.Foo({"x": 1})), type=mod.Foo[int])
+
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    @py312_plus
+    def test_inherited_builtin_generic_typevar_syntax_info_cached(self, mapping_type: str):
+        source = f"""
+        import dataclasses
+        import collections
+        import typing
+
+        @dataclasses.dataclass
+        class Foo[T]({mapping_type}[str, T]):
+            data: dict[str, T]
+
+            def __getitem__(self, x):
+                return self.data[x]
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                return iter(self.data)
+        """
+
+        with temp_module(source) as mod:
+            typ = mod.Foo[int]
+            dec = rune.json.Decoder(typ)
+            info = make_new_alias(typ).__rune_cache__
+            assert info is not None
+            assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+            dec2 = rune.json.Decoder(typ)
+            assert make_new_alias(typ).__rune_cache__ is info
+            assert sys.getrefcount(info) <= 5
+
+            del dec
+            del dec2
+            assert sys.getrefcount(info) <= 3
+
+    @pytest.mark.parametrize(
+        "future",
+        [pytest.param(False, id="no future"), pytest.param(True, id="future")],
+    )
+    @pytest.mark.parametrize("mapping_type", ["collections.abc.Mapping", "typing.Mapping"])
+    def test_inherited_builtin_generic_multiple_typevars(self, mapping_type: str, future: bool):
+        # builtin generic is listed *before* 'typing.Generic' so that
+        # 'Pair[int, str]' is a 'types.GenericAlias' (see
+        # test_inherited_builtin_generic_multilevel). it carries two args, so the
+        # conversion must subscript the rebuilt alias with the args *tuple* rather
+        # than spreading them, else generics with more than one type var raise.
+        source = f"""
+        import typing
+        import dataclasses
+        import collections
+
+        K = typing.TypeVar("K")
+        V = typing.TypeVar("V")
+
+        @dataclasses.dataclass
+        class Pair({mapping_type}[K, V], typing.Generic[K, V]):
+            key: K
+            val: V
+
+            def __getitem__(self, x):
+                return getattr(self, x)
+
+            def __len__(self):
+                return 2
+
+            def __iter__(self):
+                return iter(("key", "val"))
+        """
+
+        if future:
+            source = "from __future__ import annotations\n" + textwrap.dedent(source)
+
+        with temp_module(source) as mod:
+            typ = mod.Pair[int, str]
+            assert type(typ) is types.GenericAlias
+            assert rune.json.decode(b'{"key": 1, "val": "a"}', type=typ) == mod.Pair(1, "a")
+            with pytest.raises(ValidationError, match="Expected `int`"):
+                rune.json.decode(b'{"key": "x", "val": "a"}', type=typ)
+            with pytest.raises(ValidationError, match="Expected `str`"):
+                rune.json.decode(b'{"key": 1, "val": 2}', type=typ)
+
+
+class TestTypedDict:
+    def test_postponed_annotations(self, proto):
+        # Regression test for Python 3.12.0-3.12.3, where the fourth argument
+        # to typing._eval_type is recursive_guard rather than type_params.
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict
+
+        class Ex(TypedDict):
+            x: int
+        """
+
+        with temp_module(source) as mod:
+            msg = proto.encode({"x": 1})
+            assert proto.decode(msg, type=mod.Ex) == {"x": 1}
+
+    # typing.TypedDict can't be generic before 3.11.
+    @py311_plus
+    def test_generic_subclass_keeps_type_argument(self, proto):
+        # TypedDict drops a parametrized base from the MRO and copies its
+        # annotations unchanged, so Sub(Base[int]) used to accept any value
+        # for the inherited field.
+        source = """
+        from typing import Generic, TypedDict, TypeVar
+
+        L = TypeVar("L")
+
+        class Base(TypedDict, Generic[L]):
+            b: L
+
+        class Sub(Base[int]):
+            n: str
+        """
+        with temp_module(source) as mod:
+            msg = proto.encode({"b": 1, "n": "a"})
+            assert proto.decode(msg, type=mod.Sub) == {"b": 1, "n": "a"}
+            bad = proto.encode({"b": "not an int", "n": "a"})
+            with pytest.raises(ValidationError):
+                proto.decode(bad, type=mod.Sub)
+
+            base_msg = proto.encode({"b": 1})
+            assert proto.decode(base_msg, type=mod.Base[int]) == {"b": 1}
+            with pytest.raises(ValidationError):
+                proto.decode(proto.encode({"b": "x"}), type=mod.Base[int])
+
+    def test_types_generic_alias_non_generic_errors(self):
+        # mostly a smoke test to weed out some bogus stuff that may get passed to us.
+        # parametrising a non-generic TypedDict via a manually-built
+        # 'types.GenericAlias' is meaningless and shoulf raise
+        class Ex(typing.TypedDict):
+            a: int
+
+        with pytest.raises(TypeError, match="not a generic type"):
+            rune.json.Decoder(types.GenericAlias(Ex, (int,)))
+
+    def test_type_cached(self, proto):
+        class Ex(typing.TypedDict):
+            a: int
+            b: str
+
+        msg = {"a": 1, "b": "two"}
+
+        dec = proto.Decoder(Ex)
+        info = Ex.__rune_cache__
+        assert info is not None
+        dec2 = proto.Decoder(Ex)
+        assert Ex.__rune_cache__ is info
+
+        assert dec.decode(proto.encode(msg)) == msg
+        assert dec2.decode(proto.encode(msg)) == msg
+
+    def test_msgspec_cache_overwritten(self, proto):
+        class Ex(typing.TypedDict):
+            x: int
+
+        Ex.__rune_cache__ = 1
+
+        with pytest.raises(RuntimeError, match="__rune_cache__"):
+            proto.Decoder(Ex)
+
+    def test_multiple_typeddict_errors(self, proto):
+        class Ex1(typing.TypedDict):
+            a: int
+
+        class Ex2(typing.TypedDict):
+            b: int
+
+        with pytest.raises(TypeError, match="may not contain more than one TypedDict"):
+            proto.Decoder(Ex1 | Ex2)
+        with pytest.raises(TypeError, match="may not contain more than one TypedDict"):
+            proto.Decoder(typing.Union[Ex1, Ex2])  # noqa
+
+    def test_subtype_error(self, proto):
+        class Ex(typing.TypedDict):
+            a: int
+            b: list | tuple
+
+        with pytest.raises(TypeError, match="may not contain more than one array-like"):
+            proto.Decoder(Ex)
+        assert not hasattr(Ex, "__rune_cache__")
+
+    def test_recursive_type(self, proto):
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict, Union
+
+        class Ex(TypedDict):
+            a: int
+            b: Ex | None
+        """
+
+        with temp_module(source) as mod:
+            msg = {"a": 1, "b": {"a": 2, "b": None}}
+            dec = proto.Decoder(mod.Ex)
+            assert dec.decode(proto.encode(msg)) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode({"a": 1, "b": {"a": "bad"}}))
+            assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    def test_total_true(self, proto):
+        class Ex(typing.TypedDict):
+            a: int
+            b: str
+
+        dec = proto.Decoder(Ex)
+
+        x = {"a": 1, "b": "two"}
+        assert dec.decode(proto.encode(x)) == x
+
+        x2 = {"a": 1, "b": "two", "c": "extra"}
+        assert dec.decode(proto.encode(x2)) == x
+
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(proto.encode({"b": "two"}))
+        assert "Object missing required field `a`" == str(rec.value)
+
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(proto.encode({"a": 1, "b": 2}))
+        assert "Expected `str`, got `int` - at `$.b`" == str(rec.value)
+
+    def test_duplicate_keys(self, proto):
+        """Validating if all required keys are present is done with a count. We
+        need to ensure that duplicate required keys don't increment the count,
+        masking a missing field."""
+
+        class Ex(typing.TypedDict):
+            a: int
+            b: str
+
+        dec = proto.Decoder(Ex)
+
+        temp = proto.encode({"a": 1, "b": "two", "x": 2})
+
+        msg = temp.replace(b"x", b"a")
+        assert dec.decode(msg) == {"a": 2, "b": "two"}
+
+        msg = temp.replace(b"x", b"a").replace(b"b", b"c")
+        with pytest.raises(ValidationError) as rec:
+            dec.decode(msg)
+        assert "Object missing required field `b`" == str(rec.value)
+
+    def test_total_false(self, proto):
+        class Ex(typing.TypedDict, total=False):
+            a: int
+            b: str
+
+        dec = proto.Decoder(Ex)
+
+        x = {"a": 1, "b": "two"}
+        assert dec.decode(proto.encode(x)) == x
+
+        x2 = {"a": 1, "b": "two", "c": "extra"}
+        assert dec.decode(proto.encode(x2)) == x
+
+        x3 = {"b": "two"}
+        assert dec.decode(proto.encode(x3)) == x3
+
+        x4 = {}
+        assert dec.decode(proto.encode(x4)) == x4
+
+    @pytest.mark.parametrize("use_typing_extensions", [False, True])
+    def test_total_partially_optional(self, proto, use_typing_extensions):
+        if use_typing_extensions:
+            tex = pytest.importorskip("typing_extensions")
+            cls = tex.TypedDict
+        else:
+            cls = typing.TypedDict
+
+        class Base(cls):
+            a: int
+            b: str
+
+        class Ex(Base, total=False):
+            c: str
+
+        dec = proto.Decoder(Ex)
+
+        x = {"a": 1, "b": "two", "c": "extra"}
+        assert dec.decode(proto.encode(x)) == x
+
+        x2 = {"a": 1, "b": "two"}
+        assert dec.decode(proto.encode(x2)) == x2
+
+        for msg in [{"b": "two"}, {"b": "two", "c": "extra"}]:
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode(msg))
+            assert "Object missing required field `a`" == str(rec.value)
+
+    @pytest.mark.parametrize("use_typing_extensions", [False, True])
+    def test_broken_typeddict(self, proto, use_typing_extensions):
+        # Check that we don't crash if a TypedDict has incorrect
+        # introspection data.
+        if use_typing_extensions:
+            tex = pytest.importorskip("typing_extensions")
+            cls = tex.TypedDict
+        else:
+            cls = typing.TypedDict
+
+        class Ex(cls, total=False):
+            c: str
+
+        Ex.__annotations__ = {"c": "str"}
+        Ex.__required_keys__ = {"a", "b"}
+
+        with pytest.raises(RuntimeError):
+            proto.Decoder(Ex)
+
+    @pytest.mark.parametrize("use_typing_extensions", [False, True])
+    def test_required_and_notrequired(self, proto, use_typing_extensions):
+        if use_typing_extensions:
+            module = "typing_extensions"
+        else:
+            module = "typing"
+
+        ns = pytest.importorskip(module)
+
+        if not hasattr(ns, "Required"):
+            pytest.skip(f"{module}.Required is not available")
+
+        source = f"""
+        from __future__ import annotations
+        from {module} import TypedDict, Required, NotRequired
+
+        class Base(TypedDict):
+            a: int
+            b: NotRequired[str]
+
+        class Ex(Base, total=False):
+            c: str
+            d: Required[bool]
+        """
+
+        with temp_module(source) as mod:
+            dec = proto.Decoder(mod.Ex)
+
+            x = {"a": 1, "b": "two", "c": "extra", "d": False}
+            assert dec.decode(proto.encode(x)) == x
+
+            x2 = {"a": 1, "d": False}
+            assert dec.decode(proto.encode(x2)) == x2
+
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode({"d": False}))
+            assert "Object missing required field `a`" == str(rec.value)
+
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode({"a": 2}))
+            assert "Object missing required field `d`" == str(rec.value)
+
+    def test_keys_are_their_interned_values(self, proto):
+        """Ensure that we're not allocating new keys here, but reusing the
+        existing keys on the TypedDict schema"""
+
+        class Ex(typing.TypedDict):
+            key_name_1: int
+            key_name_2: int
+
+        dec = proto.Decoder(Ex)
+        msg = dec.decode(proto.encode({"key_name_1": 1, "key_name_2": 2}))
+        for k1, k2 in zip(sorted(Ex.__annotations__), sorted(msg), strict=False):
+            assert k1 is k2
+
+    def test_generic_typeddict_info_cached(self, proto):
+        TypedDict = pytest.importorskip("typing_extensions").TypedDict
+
+        class Ex(TypedDict, typing.Generic[T]):
+            x: T
+
+        typ = Ex[int]
+        assert Ex[int] is typ
+
+        dec = proto.Decoder(typ)
+        info = typ.__rune_cache__
+        assert info is not None
+        assert sys.getrefcount(info) <= 4  # info + attr + decoder + func call
+        dec2 = proto.Decoder(typ)
+        assert typ.__rune_cache__ is info
+        assert sys.getrefcount(info) <= 5
+
+        del dec
+        del dec2
+        assert sys.getrefcount(info) <= 3
+
+    def test_generic_typeddict_invalid_types_not_cached(self, proto):
+        TypedDict = pytest.importorskip("typing_extensions").TypedDict
+
+        class Ex(TypedDict, typing.Generic[T]):
+            x: list[T] | tuple[float]
+
+        for typ in [Ex, Ex[int]]:
+            for _ in range(2):
+                with pytest.raises(TypeError, match="not supported"):
+                    proto.Decoder(typ)
+
+            assert not hasattr(typ, "__rune_cache__")
+
+    def test_generic_typeddict(self, proto):
+        TypedDict = pytest.importorskip("typing_extensions").TypedDict
+
+        class Ex(TypedDict, typing.Generic[T]):
+            x: T
+            y: list[T]
+
+        sol = Ex(x=1, y=[1, 2])
+        msg = proto.encode(sol)
+
+        res = proto.decode(msg, type=Ex)
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[int | str])
+        assert res == sol
+
+        res = proto.decode(msg, type=Ex[float])
+        assert type(res["x"]) is float
+
+        with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+            proto.decode(msg, type=Ex[str])
+
+    @py312_plus
+    def test_generic_with_typevar_syntax(self, proto):
+        # `from __future__ import annotations` is load-bearing: it triggers the
+        # module-bound ForwardRefs that previously failed to resolve `T`.
+        source = """
+        from __future__ import annotations
+        from typing import TypedDict
+        class Ex[T](TypedDict):
+            x: T
+            y: list[T]
+        """
+
+        with temp_module(source) as mod:
+            sol = mod.Ex(x=1, y=[1, 2])
+            msg = proto.encode(sol)
+
+            res = proto.decode(msg, type=mod.Ex)
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[int])
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[typing.Union[int, str]])  # noqa
+            assert res == sol
+
+            res = proto.decode(msg, type=mod.Ex[float])
+            assert type(res["x"]) is float
+
+            with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+                proto.decode(msg, type=mod.Ex[str])
+
+    def test_recursive_generic_typeddict(self, proto):
+        pytest.importorskip("typing_extensions")
+
+        source = """
+        from __future__ import annotations
+        from typing import Union, Generic, TypeVar
+        from typing_extensions import TypedDict
+
+        T = TypeVar("T")
+
+        class Ex(TypedDict, Generic[T]):
+            a: T
+            b: Ex[T] | None
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            msg2 = mod.Ex(a=1, b=mod.Ex(a="bad", b=None))
+            assert proto.decode(proto.encode(msg), type=mod.Ex) == msg
+            assert proto.decode(proto.encode(msg2), type=mod.Ex) == msg2
+            assert proto.decode(proto.encode(msg), type=mod.Ex[int]) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                proto.decode(proto.encode(msg2), type=mod.Ex[int])
+            assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+
+class TestDataclass:
+    def test_encode_dataclass_err_invalid_dataclass_fields(self, proto):
+        @dataclass
+        class Ex:
+            x: int
+
+        Ex.__dataclass_fields__ = ()
+
+        with pytest.raises(RuntimeError, match="is not a dict"):
+            proto.encode(Ex(1))
+
+    def test_encode_dataclass_class_errors(self, proto):
+        @dataclass
+        class Ex:
+            x: int
+
+        with pytest.raises(TypeError, match="Encoding objects of type type"):
+            proto.encode(Ex)
+
+    def test_encode_dataclass_no_slots(self, proto):
+        @dataclass
+        class Test:
+            x: int
+            y: int
+
+        x = Test(1, 2)
+        res = proto.encode(x)
+        sol = proto.encode({"x": 1, "y": 2})
+        assert res == sol
+
+    def test_encode_dataclass_slots(self, proto):
+        @dataclass(slots=True)
+        class Test:
+            x: int
+            y: int
+
+        x = Test(1, 2)
+        res = proto.encode(x)
+        sol = proto.encode({"x": 1, "y": 2})
+        assert res == sol
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_dataclass_missing_fields(self, proto, slots):
+        @dataclass(slots=slots)
+        class Test:
+            x: int
+            y: int
+            z: int
+
+        x = Test(1, 2, 3)
+        sol = {"x": 1, "y": 2, "z": 3}
+        for key in "xyz":
+            delattr(x, key)
+            del sol[key]
+            res = proto.decode(proto.encode(x))
+            assert res == sol
+
+    @pytest.mark.parametrize("slots_base", [True, False])
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_dataclass_subclasses(self, proto, slots_base, slots):
+        @dataclass(slots=slots_base)
+        class Base:
+            x: int
+            y: int
+
+        @dataclass(slots=slots)
+        class Test(Base):
+            y: int
+            z: int
+
+        x = Test(1, 2, 3)
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "y": 2, "z": 3}
+
+        # Missing attribute ignored
+        del x.y
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "z": 3}
+
+    @py311_plus
+    def test_encode_dataclass_weakref_slot(self, proto):
+        @dataclass(slots=True, weakref_slot=True)
+        class Test:
+            x: int
+            y: int
+
+        x = Test(1, 2)
+        ref = weakref.ref(x)  # noqa
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "y": 2}
+
+    def test_encode_dataclass_classvars_ignored(self, proto):
+        @dataclass
+        class Ex:
+            a: int
+            b: typing.ClassVar[int] = 2
+
+        msg = proto.encode(Ex(a=1))
+        assert msg == proto.encode({"a": 1})
+
+    def test_encode_dataclass_extra_fields_ignored(self, proto):
+        @dataclass
+        class Ex:
+            a: int
+            b: int
+
+        x = Ex(1, 2)
+        x.c = 3
+
+        msg = proto.encode(Ex(1, 2))
+        assert msg == proto.encode({"a": 1, "b": 2})
+
+    @pytest.mark.parametrize("order", ["acb", "bca", "cba"])
+    def test_encode_dataclass_dict_reordered(self, proto, order):
+        @dataclass
+        class Ex:
+            a: int
+            b: int
+            c: int
+
+        x = Ex(1, 2, 3)
+        x.__dict__.clear()
+        x.__dict__.update(dict(zip(order, range(3), strict=False)))
+        res = proto.encode(x)
+        sol = proto.encode(dict(sorted(zip(order, range(3), strict=False))))
+        assert res == sol
+
+    @pytest.mark.parametrize("present", ["ab", "a", "b", ""])
+    def test_encode_dataclass_ducktyped(self, proto, present):
+        """gel.Object looks like a dataclass, but the implementation doesn't
+        match the one from dataclasses. This ducktyped implementation tries to
+        mirror the one in gel for testing purposes. Ref:
+        https://docs.geldata.com/reference/using/python/api/types#gel.Object"""
+
+        @dataclass
+        class Ex:
+            a: int
+            b: int
+
+        msg = {k: v for k, v in zip("ab", range(2), strict=False) if k in present}
+
+        class Ex2:
+            def __getattr__(self, key):
+                return msg[key]
+
+            __dataclass_fields__ = {}  # noqa
+
+        x = Ex2()
+        x.__dataclass_fields__ = Ex.__dataclass_fields__
+        res = proto.encode(x)
+        sol = proto.encode(msg)
+        assert res == sol
+
+    def test_encode_non_dataclass_skips_instance_getattr(self, proto):
+        calls = []
+
+        class Ex:
+            def __getattr__(self, key):
+                calls.append(key)
+                raise AttributeError(key)
+
+        res = proto.encode([Ex()], enc_hook=lambda x: "hook")
+        assert res == proto.encode(["hook"])
+        assert calls == []
+
+    @pytest.mark.parametrize("field", "xyz")
+    def test_encode_dataclass_invalid_field_errors(self, proto, field):
+        @dataclass
+        class Test:
+            x: int
+            y: int
+            z: int
+
+        x = Test(1, 2, 3)
+        setattr(x, field, object())
+        with pytest.raises(TypeError, match="unsupported"):
+            proto.encode(x)
+
+    def test_type_cached(self, proto):
+        @dataclass
+        class Ex:
+            a: int
+            b: str
+
+        msg = Ex(a=1, b="two")
+
+        dec = proto.Decoder(Ex)
+        info = Ex.__rune_cache__
+        assert info is not None
+        dec2 = proto.Decoder(Ex)
+        assert Ex.__rune_cache__ is info
+
+        assert dec.decode(proto.encode(msg)) == msg
+        assert dec2.decode(proto.encode(msg)) == msg
+
+    def test_decode_dataclass_subclasses(self, proto):
+        @dataclass
+        class Base:
+            x: int
+
+        @dataclass
+        class Sub(Base):
+            y: int
+
+        msg = proto.encode({"x": 1, "y": 2})
+
+        assert proto.decode(msg, type=Base) == Base(1)
+        assert proto.decode(msg, type=Sub) == Sub(1, 2)
+
+    def test_multiple_dataclasses_errors(self, proto):
+        @dataclass
+        class Ex1:
+            a: int
+
+        @dataclass
+        class Ex2:
+            b: int
+
+        with pytest.raises(TypeError, match="may not contain more than one dataclass"):
+            proto.Decoder(typing.Union[Ex1, Ex2])  # noqa
+
+    def test_subtype_error(self, proto):
+        @dataclass
+        class Ex:
+            a: int
+            b: list | tuple
+
+        with pytest.raises(TypeError, match="may not contain more than one array-like"):
+            proto.Decoder(Ex)
+        assert not hasattr(Ex, "__rune_cache__")
+
+    def test_recursive_type(self, proto):
+        source = """
+        from __future__ import annotations
+        from typing import Union
+        from dataclasses import dataclass
+
+        @dataclass
+        class Ex:
+            a: int
+            b: Ex | None
+        """
+
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1, b=mod.Ex(a=2, b=None))
+            dec = proto.Decoder(mod.Ex)
+            assert dec.decode(proto.encode(msg)) == msg
+
+            with pytest.raises(ValidationError) as rec:
+                dec.decode(proto.encode({"a": 1, "b": {"a": "bad"}}))
+            assert "`$.b.a`" in str(rec.value)
+            assert "Expected `int`, got `str`" in str(rec.value)
+
+    def test_classvars_ignored(self, proto):
+        source = """
+        from __future__ import annotations
+
+        from typing import ClassVar
+        from dataclasses import dataclass
+
+        @dataclass
+        class Ex:
+            a: int
+            other: ClassVar[int]
+        """
+        with temp_module(source) as mod:
+            msg = mod.Ex(a=1)
+            dec = proto.Decoder(mod.Ex)
+            res = dec.decode(proto.encode({"a": 1, "other": 2}))
+            assert res == msg
+            assert not hasattr(res, "other")
+
+    def test_initvars_forbidden(self, proto):
+        source = """
+        from dataclasses import dataclass, InitVar
+
+        @dataclass
+        class Ex:
+            a: int
+            other: InitVar[int]
+        """
+        with temp_module(source) as mod:
+            with pytest.raises(TypeError, match="`InitVar` fields are not supported"):
+                proto.Decoder(mod.Ex)
+
+    @pytest.mark.parametrize("slots", [False, True])
+    def test_decode_dataclass(self, proto, slots):
+        if slots:
+            kws = {"slots": True}
+        else:
+            kws = {}
+
+        @dataclass(**kws)
+        class Example:
+            a: int
+            b: int
+            c: int
+
+        dec = proto.Decoder(Example)
+        msg = Example(1, 2, 3)
+        res = dec.decode(proto.encode(msg))
+        assert res == msg
+
+        # Extra fields ignored
+        res = dec.decode(proto.encode({"x": -1, "a": 1, "y": -2, "b": 2, "z": -3, "c": 3, "": -4}))
+        assert res == msg
+
+        # Missing fields error
+        with pytest.raises(ValidationError, match="missing required field `b`"):
+            dec.decode(proto.encode({"a": 1}))
+
+        # Incorrect field types error
+        with pytest.raises(ValidationError, match=r"Expected `int`, got `str` - at `\$.a`"):
+            dec.decode(proto.encode({"a": "bad"}))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("slots", [False, True])
+    def test_decode_dataclass_defaults(self, proto, frozen, slots):
+        if slots:
+            kws = {"slots": True}
+        else:
+            kws = {}
+
+        @dataclass(frozen=frozen, **kws)
+        class Example:
+            a: int
+            b: int
+            c: int = -3
+            d: int = -4
+            e: int = field(default_factory=lambda: -1000)
+
+        dec = proto.Decoder(Example)
+        for args in [(1, 2), (1, 2, 3), (1, 2, 3, 4), (1, 2, 3, 4, 5)]:
+            sol = Example(*args)
+            msg = dict(zip("abcde", args, strict=False))
+            res = dec.decode(proto.encode(msg))
+            assert res == sol
+
+        # Missing fields error
+        with pytest.raises(ValidationError, match="missing required field `a`"):
+            dec.decode(proto.encode({"c": 1, "d": 2, "e": 3}))
+
+    def test_decode_dataclass_default_factory_errors(self, proto):
+        def bad():
+            raise ValueError("Oh no!")
+
+        @dataclass
+        class Example:
+            a: int = field(default_factory=bad)
+
+        with pytest.raises(ValueError, match="Oh no!"):
+            proto.decode(proto.encode({}), type=Example)
+
+    def test_decode_dataclass_frozen(self, proto):
+        @dataclass(frozen=True)
+        class Point:
+            x: int
+            y: int
+
+        msg = proto.encode(Point(1, 2))
+        res = proto.decode(msg, type=Point)
+        assert res == Point(1, 2)
+
+    def test_decode_dataclass_post_init(self, proto):
+        called = False
+
+        @dataclass
+        class Example:
+            a: int
+
+            def __post_init__(self):
+                nonlocal called
+                called = True
+
+        res = proto.decode(proto.encode({"a": 1}), type=Example)
+        assert res.a == 1
+        assert called
+
+    @pytest.mark.parametrize("exc_class", [ValueError, TypeError, OSError])
+    def test_decode_dataclass_post_init_errors(self, proto, exc_class):
+        @dataclass
+        class Example:
+            a: int
+
+            def __post_init__(self):
+                raise exc_class("Oh no!")
+
+        expected = ValidationError if exc_class in (ValueError, TypeError) else exc_class
+
+        with pytest.raises(expected, match="Oh no!") as rec:
+            proto.decode(proto.encode([{"a": 1}]), type=list[Example])
+
+        if expected is ValidationError:
+            assert "- at `$[0]`" in str(rec.value)
+
+    def test_decode_dataclass_not_object(self, proto):
+        @dataclass
+        class Example:
+            a: int
+            b: int
+
+        dec = proto.Decoder(Example)
+        msg = proto.encode([])
+        with pytest.raises(ValidationError, match="Expected `object`, got `array`"):
+            dec.decode(msg)
+
+
+@pytest.mark.skipif(attrs is None, reason="attrs not installed")
+class TestAttrs:
+    def test_factory_takes_self_not_implemented(self, proto):
+        """This feature is doable, but not yet implemented"""
+
+        @attrs.define
+        class Test:
+            x: int = attrs.Factory(lambda self: 0, takes_self=True)
+
+        with pytest.raises(NotImplementedError):
+            proto.Decoder(Test)
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_attrs(self, proto, slots):
+        @attrs.define(slots=slots)
+        class Test:
+            x: int
+            y: int
+
+        x = Test(1, 2)
+        res = proto.encode(x)
+        sol = proto.encode({"x": 1, "y": 2})
+        assert res == sol
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_attrs_missing_fields(self, proto, slots):
+        @attrs.define(slots=slots)
+        class Test:
+            x: int
+            y: int
+            z: int
+
+        x = Test(1, 2, 3)
+        sol = {"x": 1, "y": 2, "z": 3}
+        for key in "xyz":
+            delattr(x, key)
+            del sol[key]
+            res = proto.decode(proto.encode(x))
+            assert res == sol
+
+    @pytest.mark.parametrize("slots_base", [True, False])
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_attrs_subclasses(self, proto, slots_base, slots):
+        @attrs.define(slots=slots_base)
+        class Base:
+            x: int
+            y: int
+
+        @attrs.define(slots=slots)
+        class Test(Base):
+            y: int
+            z: int
+
+        x = Test(1, 2, 3)
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "y": 2, "z": 3}
+
+        # Missing attribute ignored
+        del x.y
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "z": 3}
+
+    def test_encode_attrs_weakref_slot(self, proto):
+        @attrs.define(slots=True, weakref_slot=True)
+        class Test:
+            x: int
+            y: int
+
+        x = Test(1, 2)
+        ref = weakref.ref(x)  # noqa
+        res = proto.decode(proto.encode(x))
+        assert res == {"x": 1, "y": 2}
+
+    @pytest.mark.parametrize("slots", [True, False])
+    def test_encode_attrs_skip_leading_underscore(self, proto, slots):
+        @attrs.define(slots=slots)
+        class Test:
+            x: int
+            y: int
+            _z: int
+
+        x = Test(1, 2, 3)
+        res = proto.encode(x)
+        sol = proto.encode({"x": 1, "y": 2})
+        assert res == sol
+
+    @pytest.mark.parametrize("slots", [False, True])
+    def test_decode_attrs(self, proto, slots):
+        @attrs.define(slots=slots)
+        class Example:
+            a: int
+            b: int
+            c: int
+
+        dec = proto.Decoder(Example)
+        msg = Example(1, 2, 3)
+        res = dec.decode(proto.encode(msg))
+        assert res == msg
+
+        # Extra fields ignored
+        res = dec.decode(proto.encode({"x": -1, "a": 1, "y": -2, "b": 2, "z": -3, "c": 3, "": -4}))
+        assert res == msg
+
+        # Missing fields error
+        with pytest.raises(ValidationError, match="missing required field `b`"):
+            dec.decode(proto.encode({"a": 1}))
+
+        # Incorrect field types error
+        with pytest.raises(ValidationError, match=r"Expected `int`, got `str` - at `\$.a`"):
+            dec.decode(proto.encode({"a": "bad"}))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("slots", [False, True])
+    def test_decode_attrs_defaults(self, proto, frozen, slots):
+        @attrs.define(frozen=frozen, slots=slots)
+        class Example:
+            a: int
+            b: int
+            c: int = -3
+            d: int = -4
+            e: int = attrs.field(factory=lambda: -1000)
+
+        dec = proto.Decoder(Example)
+        for args in [(1, 2), (1, 2, 3), (1, 2, 3, 4), (1, 2, 3, 4, 5)]:
+            sol = Example(*args)
+            msg = dict(zip("abcde", args, strict=False))
+            res = dec.decode(proto.encode(msg))
+            assert res == sol
+
+        # Missing fields error
+        with pytest.raises(ValidationError, match="missing required field `a`"):
+            dec.decode(proto.encode({"c": 1, "d": 2, "e": 3}))
+
+    def test_decode_attrs_default_factory_errors(self, proto):
+        def bad():
+            raise ValueError("Oh no!")
+
+        @attrs.define
+        class Example:
+            a: int = attrs.field(factory=bad)
+
+        with pytest.raises(ValueError, match="Oh no!"):
+            proto.decode(proto.encode({}), type=Example)
+
+    def test_decode_attrs_frozen(self, proto):
+        @attrs.define(frozen=True)
+        class Example:
+            x: int
+            y: int
+
+        msg = Example(1, 2)
+        res = proto.decode(proto.encode(msg), type=Example)
+        assert res == Example(1, 2)
+
+    def test_decode_attrs_post_init(self, proto):
+        called = False
+
+        @attrs.define
+        class Example:
+            a: int
+
+            def __attrs_post_init__(self):
+                nonlocal called
+                called = True
+
+        res = proto.decode(proto.encode({"a": 1}), type=Example)
+        assert res.a == 1
+        assert called
+
+    @pytest.mark.parametrize("exc_class", [ValueError, TypeError, OSError])
+    def test_decode_attrs_post_init_errors(self, proto, exc_class):
+        @attrs.define
+        class Example:
+            a: int
+
+            def __attrs_post_init__(self):
+                raise exc_class("Oh no!")
+
+        expected = ValidationError if exc_class in (ValueError, TypeError) else exc_class
+
+        with pytest.raises(expected, match="Oh no!") as rec:
+            proto.decode(proto.encode([{"a": 1}]), type=list[Example])
+
+        if expected is ValidationError:
+            assert "- at `$[0]`" in str(rec.value)
+
+    def test_decode_attrs_pre_init(self, proto):
+        called = False
+
+        @attrs.define
+        class Example:
+            a: int
+
+            def __attrs_pre_init__(self):
+                nonlocal called
+                called = True
+
+        res = proto.decode(proto.encode({"a": 1}), type=Example)
+        assert res.a == 1
+        assert called
+
+    def test_decode_attrs_pre_init_errors(self, proto):
+        @attrs.define
+        class Example:
+            a: int
+
+            def __attrs_pre_init__(self):
+                raise ValueError("Oh no!")
+
+        with pytest.raises(ValueError, match="Oh no!"):
+            proto.decode(proto.encode({"a": 1}), type=Example)
+
+    def test_decode_attrs_validators(self, proto):
+        def not2(self, attr, value):
+            if value == 2:
+                raise ValueError("Oh no!")
+
+        @attrs.define
+        class Example:
+            a: int = attrs.field(validator=[attrs.validators.gt(0), not2])
+
+        res = proto.decode(proto.encode({"a": 1}), type=Example)
+        assert res.a == 1
+
+        with pytest.raises(ValidationError):
+            res = proto.decode(proto.encode({"a": -1}), type=Example)
+
+        with pytest.raises(ValidationError, match="Oh no!"):
+            res = proto.decode(proto.encode({"a": 2}), type=Example)
+
+    def test_decode_attrs_not_object(self, proto):
+        @attrs.define
+        class Example:
+            a: int
+            b: int
+
+        dec = proto.Decoder(Example)
+        msg = proto.encode([])
+        with pytest.raises(ValidationError, match="Expected `object`, got `array`"):
+            dec.decode(msg)

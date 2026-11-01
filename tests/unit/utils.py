@@ -17,6 +17,7 @@ py315_or_later_only = pytest.mark.skipif(
 )
 
 py312_plus = pytest.mark.skipif(not PY312, reason="3.12+ only")
+py311_plus = pytest.mark.skipif(not PY311, reason="3.11+ only")
 
 emscripten_stack_limited = pytest.mark.skipif(
     sys.platform == "emscripten",

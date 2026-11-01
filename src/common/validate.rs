@@ -4,8 +4,8 @@ use crate::common::helpers::{
 };
 use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
-    date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_dataclass,
-    is_enum_class, is_final_origin, is_literal_origin, is_new_type, is_type, is_typeddict,
+    date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_enum_class,
+    is_final_origin, is_literal_origin, is_new_type, is_plain_class, is_type, is_typeddict_class,
     is_typevar, new_type_supertype, origin_or_self, time, timedelta, type_args, type_origin, uuid,
 };
 use crate::common::structures::{StructSettings, Validator};
@@ -105,6 +105,8 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
     let count = |wanted: &[UnionKind]| kinds.iter().filter(|kind| wanted.contains(kind)).count();
     let has_many_dicts = count(&[Dict]) > 1;
     let has_dict_like = has_many_dicts && has_dict_like_option(&options, &kinds)?;
+    let typed_dicts = count_options(&options, is_typeddict_class)?;
+    let dataclasses = count_options(&options, is_plain_class)?;
     let rules = [
         (
             count(&[IntEnum]) > 1,
@@ -121,6 +123,14 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
         (
             count(&[StrEnum, StrStrict]) >= 1 && count(&[StrEnum, StrStrict, StrPlain]) > 1,
             "it may not contain more than one str-like type",
+        ),
+        (
+            typed_dicts > 1,
+            "it may not contain more than one TypedDict type",
+        ),
+        (
+            dataclasses > 1,
+            "it may not contain more than one dataclass or attrs type",
         ),
         (
             has_dict_like,
@@ -222,9 +232,24 @@ fn ensure_union_structs_are_valid(
     Ok(())
 }
 
+fn count_options(
+    options: &[UnionOption<'_>],
+    is_wanted: fn(&Bound<'_, PyAny>) -> PyResult<bool>,
+) -> PyResult<usize> {
+    let mut count = 0;
+    for (option, _) in options {
+        if is_wanted(&origin_or_self(option)?)? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn has_dict_like_option(options: &[UnionOption<'_>], kinds: &[UnionKind]) -> PyResult<bool> {
     for ((option, settings), kind) in options.iter().zip(kinds) {
-        if *kind == UnionKind::Dict && (settings.is_some() || is_typeddict_or_dataclass(option)?) {
+        if *kind == UnionKind::Dict
+            && (settings.is_some() || is_plain_or_typeddict(&origin_or_self(option)?)?)
+        {
             return Ok(true);
         }
     }
@@ -260,6 +285,9 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
         if is_literal_origin(&origin)? {
             return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));
         }
+        if is_plain_or_typeddict(&origin)? {
+            return Ok(Dict);
+        }
         return Ok(container_kind(&origin)?.unwrap_or(Other));
     }
     let is_bool_or_float = is_type::<PyBool>(ty) || is_type::<PyFloat>(ty);
@@ -275,7 +303,7 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
         StrStrict
     } else if let Some(kind) = container_kind(ty)? {
         kind
-    } else if is_typeddict_or_dataclass(ty)? {
+    } else if is_plain_or_typeddict(ty)? {
         Dict
     } else {
         Custom
@@ -306,10 +334,8 @@ fn value_kind(values: &[Bound<'_, PyAny>], int_kind: UnionKind, str_kind: UnionK
     }
 }
 
-fn is_typeddict_or_dataclass(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let py = ty.py();
-    Ok(is_typeddict(py)?.call1((ty,))?.is_truthy()?
-        || is_dataclass(py)?.call1((ty,))?.is_truthy()?)
+fn is_plain_or_typeddict(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(is_typeddict_class(ty)? || is_plain_class(ty)?)
 }
 
 fn is_strict_str_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {

@@ -93,16 +93,17 @@ macro_rules! format_bindings {
         }
 
         #[pyfunction]
-        #[pyo3(signature = (obj, *, order = None))]
+        #[pyo3(signature = (obj, *, enc_hook = None, order = None))]
         pub(crate) fn encode<'py>(
             py: Python<'py>,
             obj: &Bound<'py, PyAny>,
+            enc_hook: Option<Bound<'py, PyAny>>,
             order: Option<Bound<'py, PyAny>>,
         ) -> PyResult<Bound<'py, PyBytes>> {
             encode_object::<$writer>(
                 py,
                 obj,
-                &Hook::default(),
+                &Hook::from_argument(enc_hook, "enc_hook")?,
                 &DecimalFormat::default(),
                 Order::from_argument(order)?,
             )

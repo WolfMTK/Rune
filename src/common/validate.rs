@@ -1,12 +1,12 @@
 use crate::common::enums::{AbstractContainer, UnionKind};
 use crate::common::helpers::{
-    is_named_tuple_class, resolve_type_aliases, struct_class, union_members,
+    is_named_tuple_class, resolve_type_aliases, struct_class, type_arg_or_any, union_members,
 };
 use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
     date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_dataclass,
-    is_enum_class, is_literal_origin, is_type, is_typeddict, is_typevar, origin_or_self, time,
-    timedelta, type_args, type_origin, uuid,
+    is_enum_class, is_final_origin, is_literal_origin, is_new_type, is_type, is_typeddict,
+    is_typevar, new_type_supertype, origin_or_self, time, timedelta, type_args, type_origin, uuid,
 };
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
@@ -240,6 +240,8 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
         } else {
             union_kind(&bound)
         };
+    } else if is_new_type(ty)? {
+        return union_kind(&new_type_supertype(ty)?);
     } else if let Some(class) = struct_class(ty)? {
         return Ok(if StructSettings::of_class(&class)?.array_like {
             Array
@@ -251,6 +253,9 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
     } else if let Some(origin) = type_origin(ty)? {
         if is_annotated_origin(&origin)? {
             return union_kind(&ty.getattr(intern!(ty.py(), "__origin__"))?);
+        }
+        if is_final_origin(&origin)? {
+            return union_kind(&type_arg_or_any(ty, 0)?);
         }
         if is_literal_origin(&origin)? {
             return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));

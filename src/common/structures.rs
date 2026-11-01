@@ -2,7 +2,7 @@ use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal
 use crate::common::datetime_format;
 use crate::common::enums::{
     AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat,
-    Failure, Insertion, Kind, PathSegment, Primitive, Scalar, Shape, Token, Value,
+    Failure, Insertion, Kind, Order, PathSegment, Primitive, Scalar, Shape, Token, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
@@ -15,9 +15,10 @@ use crate::common::helpers::{
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
     any, date, datetime, decimal_type, deque, is_annotated_origin, is_decimal, is_enum_class,
-    is_frozendict_type, is_literal_origin, is_temporal_type, is_type, is_type_alias, is_typevar,
-    is_union_origin, resolve_generic_fields, resolve_namedtuple_fields, time, timedelta, type_args,
-    type_name, type_origin,
+    is_final_origin, is_frozendict_type, is_literal_origin, is_new_type, is_plain_class,
+    is_temporal_type, is_type, is_type_alias, is_typevar, is_union_origin, is_unset_type,
+    new_type_supertype, plain_class_fields, resolve_generic_fields, resolve_namedtuple_fields,
+    time, timedelta, type_args, type_name, type_origin, unset,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
@@ -324,6 +325,9 @@ impl<'py> Compiler<'py> {
         if ty.is(any(self.py)?) || is_typevar(ty)? {
             return Ok(Shape::Any);
         }
+        if is_new_type(ty)? {
+            return self.classify_as(new_type_supertype(ty)?, id);
+        }
         if let Some(primitive) = Primitive::from_type(ty) {
             return Ok(Shape::Primitive(primitive));
         }
@@ -334,6 +338,9 @@ impl<'py> Compiler<'py> {
             }
             if is_literal_origin(origin)? {
                 return Ok(Shape::Literal(LiteralPlan::load(ty)?));
+            }
+            if is_final_origin(origin)? {
+                return self.classify_as(type_arg_or_any(ty, 0)?, id);
             }
         }
         let base = origin.unwrap_or_else(|| ty.clone());
@@ -372,6 +379,13 @@ impl<'py> Compiler<'py> {
         } else {
             Shape::Custom(base.unbind())
         })
+    }
+
+    fn constraint_subject(&self, id: NodeId) -> ConstraintSubject {
+        match &self.nodes[id].shape {
+            Shape::Constrained { inner, .. } => self.constraint_subject(*inner),
+            shape => ConstraintSubject::of(shape),
+        }
     }
 
     fn abstract_container(
@@ -416,8 +430,7 @@ impl<'py> Compiler<'py> {
             return self.classify_as(inner, id);
         }
         let inner_id = self.compile(&inner)?;
-        let inner_node = &self.nodes[inner_id];
-        let subject = ConstraintSubject::of(&inner_node.shape);
+        let subject = self.constraint_subject(inner_id);
         if let Some(constraint) = constraints
             .iter()
             .find(|constraint| !constraint.applies_to(subject))
@@ -429,7 +442,7 @@ impl<'py> Compiler<'py> {
                 ty.repr()?
             )));
         }
-        let accepted_kinds = inner_node.accepted_kinds;
+        let accepted_kinds = self.nodes[inner_id].accepted_kinds;
         self.constraint_sets.push(ConstraintSet {
             subject,
             constraints,
@@ -880,6 +893,9 @@ impl Validator {
         if is_typevar(ty)? {
             return self.visit_typevar(ty);
         }
+        if is_new_type(ty)? {
+            return self.visit(&new_type_supertype(ty)?);
+        }
         let origin = type_origin(ty)?;
         let base = origin.clone().unwrap_or_else(|| ty.clone());
         if is_struct_class(&base)? {
@@ -935,6 +951,8 @@ impl Validator {
             self.visit_alias(ty, origin)
         } else if is_annotated_origin(origin)? {
             self.visit(&ty.getattr(intern!(ty.py(), "__origin__"))?)
+        } else if is_final_origin(origin)? {
+            self.visit(&type_arg_or_any(ty, 0)?)
         } else {
             Ok(())
         }
@@ -977,6 +995,7 @@ pub(crate) struct Field {
     pub(crate) name: Box<str>,
     pub(crate) key: Py<PyString>,
     pub(crate) ty: Py<PyAny>,
+    pub(crate) accepts_unset: bool,
 }
 
 impl Field {
@@ -984,8 +1003,36 @@ impl Field {
         Ok(Self {
             name: key.to_str()?.into(),
             key: key.unbind(),
+            accepts_unset: accepts_unset(&ty)?,
             ty: ty.unbind(),
         })
+    }
+}
+
+fn accepts_unset(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if is_unset_type(ty)? {
+        return Ok(true);
+    }
+    if is_new_type(ty)? {
+        return accepts_unset(&new_type_supertype(ty)?);
+    }
+    if is_type_alias(ty) {
+        return accepts_unset(&expand_type_alias(ty)?);
+    }
+    let Some(origin) = type_origin(ty)? else {
+        return Ok(false);
+    };
+    if is_union_origin(&origin)? {
+        for arg in type_args(ty)? {
+            if accepts_unset(&arg)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    } else if is_annotated_origin(&origin)? || is_final_origin(&origin)? {
+        accepts_unset(&type_arg_or_any(ty, 0)?)
+    } else {
+        Ok(false)
     }
 }
 
@@ -994,6 +1041,7 @@ const OMIT_DEFAULTS_FLAG: u8 = 2;
 const FORBID_UNKNOWN_FIELDS_FLAG: u8 = 4;
 const RENAMED_FLAG: u8 = 16;
 
+#[derive(Default)]
 pub(crate) struct StructSettings {
     pub(crate) tag: Option<Py<PyAny>>,
     pub(crate) tag_field: String,
@@ -1028,9 +1076,19 @@ impl StructSettings {
 pub(crate) struct StructLayout {
     pub(crate) fields: Vec<Field>,
     pub(crate) settings: StructSettings,
+    pub(crate) has_unset_fields: bool,
 }
 
 impl StructLayout {
+    fn new(fields: Vec<Field>, settings: StructSettings) -> Self {
+        let has_unset_fields = fields.iter().any(|field| field.accepts_unset);
+        Self {
+            fields,
+            settings,
+            has_unset_fields,
+        }
+    }
+
     pub(crate) fn load(ty: &Bound<'_, PyAny>, class: &Bound<'_, PyAny>) -> PyResult<Self> {
         let mut fields: Vec<Field> = if class.is(ty) {
             struct_field_pairs(ty, class)?
@@ -1053,7 +1111,19 @@ impl StructLayout {
                     .into_boxed_str();
             }
         }
-        Ok(Self { fields, settings })
+        Ok(Self::new(fields, settings))
+    }
+
+    pub(crate) fn load_plain(class: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let fields = plain_class_fields(class.py())?
+            .call1((class,))?
+            .try_iter()?
+            .map(|pair| {
+                let (key, field_ty) = pair?.extract()?;
+                Field::new(key, field_ty)
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(Self::new(fields, StructSettings::default()))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1965,6 +2035,7 @@ pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) depth_left: usize,
     pub(crate) hook: Option<Bound<'py, PyAny>>,
     pub(crate) decimal_format: &'f DecimalFormat,
+    pub(crate) order: Order,
     pub(crate) encoding_decimal_replacement: bool,
     pub(crate) kinds: RuneMap<usize, (Bound<'py, PyType>, Kind)>,
     pub(crate) enum_values: RuneMap<usize, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
@@ -1998,6 +2069,8 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Enum
         } else if is_struct_class(&ty)? {
             Kind::Struct(Rc::new(StructLayout::load(&ty, &ty)?))
+        } else if is_plain_class(&ty)? {
+            Kind::Struct(Rc::new(StructLayout::load_plain(&ty)?))
         } else if ty.is(decimal_type(ty.py())?)
             || is_temporal_type(&ty)?
             || is_frozendict_type(&ty)?
@@ -2035,6 +2108,10 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Dict => return self.encode_dict(obj.cast::<PyDict>()?),
             Kind::List => return self.encode_items(obj.cast::<PyList>()?.iter()),
             Kind::Tuple => return self.encode_items(obj.cast::<PyTuple>()?.iter()),
+            Kind::Set if self.order.sorts_containers() => return self.encode_sorted_items(obj),
+            Kind::FrozenSet if self.order.sorts_containers() => {
+                return self.encode_sorted_items(obj);
+            }
             Kind::Set => return self.encode_items(obj.cast::<PySet>()?.iter()),
             Kind::FrozenSet => return self.encode_items(obj.cast::<PyFrozenSet>()?.iter()),
             Kind::Struct(layout) => return self.encode_struct(obj, &layout),
@@ -2110,6 +2187,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(())
     }
 
+    #[inline(always)]
     fn nested(&mut self, body: impl FnOnce(&mut Self) -> PyResult<()>) -> PyResult<()> {
         if self.depth_left == 0 {
             return Err(PyRecursionError::new_err("Recursion limit exceeded"));
@@ -2120,6 +2198,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(())
     }
 
+    #[inline(always)]
     fn encode_container(
         &mut self,
         start: Token<'_>,
@@ -2171,7 +2250,46 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         })
     }
 
+    #[inline(never)]
+    fn encode_sorted_items(&mut self, items: &Bound<'py, PyAny>) -> PyResult<()> {
+        let sorted = PyList::new(items.py(), items.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        sorted.sort()?;
+        self.encode_container(Token::ArrayStart(sorted.len()), |encoder| {
+            for item in sorted.iter() {
+                encoder.encode(&item)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[inline(never)]
+    fn encode_sorted_map(&mut self, pairs: &Bound<'py, PyList>) -> PyResult<()> {
+        for pair in pairs.iter() {
+            let key = pair.get_item(0)?;
+            if !key.is_instance_of::<PyString>() {
+                return Err(PyTypeError::new_err(format!(
+                    "Only dicts with str keys can be encoded with `order`, got key {}",
+                    key.repr()?
+                )));
+            }
+        }
+        pairs.sort()?;
+        self.encode_container(Token::MapStart(pairs.len()), |encoder| {
+            for pair in pairs.iter() {
+                let key = pair.get_item(0)?;
+                let value = pair.get_item(1)?;
+                let kind = encoder.kind_of(&key)?;
+                encoder.encode_as::<true>(&key, kind)?;
+                encoder.encode(&value)?;
+            }
+            Ok(())
+        })
+    }
+
     fn encode_dict(&mut self, dict: &Bound<'py, PyDict>) -> PyResult<()> {
+        if self.order.sorts_containers() {
+            return self.encode_sorted_map(&dict.items());
+        }
         self.encode_container(Token::MapStart(dict.len()), |encoder| {
             for (key, value) in dict.iter() {
                 let kind = encoder.kind_of(&key)?;
@@ -2185,6 +2303,13 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     #[inline(never)]
     fn encode_frozendict(&mut self, frozendict: &Bound<'py, PyAny>) -> PyResult<()> {
         let items = frozendict.call_method0(intern!(frozendict.py(), "items"))?;
+        if self.order.sorts_containers() {
+            let pairs = PyList::new(
+                frozendict.py(),
+                items.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+            )?;
+            return self.encode_sorted_map(&pairs);
+        }
         self.encode_container(Token::MapStart(frozendict.len()?), |encoder| {
             for item in items.try_iter()? {
                 let (key, value) = item?.extract::<(Bound<'py, PyAny>, Bound<'py, PyAny>)>()?;
@@ -2200,8 +2325,10 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     fn encode_struct(&mut self, obj: &Bound<'py, PyAny>, layout: &StructLayout) -> PyResult<()> {
         let py = obj.py();
         let settings = &layout.settings;
-        if settings.omit_defaults && !settings.array_like {
-            return self.encode_struct_omitting_defaults(obj, layout);
+        if !settings.array_like
+            && (settings.omit_defaults || layout.has_unset_fields || self.order.sorts_fields())
+        {
+            return self.encode_struct_filtered(obj, layout);
         }
         let start = if settings.array_like {
             Token::ArrayStart(layout.len())
@@ -2226,34 +2353,47 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     }
 
     #[inline(never)]
-    fn encode_struct_omitting_defaults(
+    fn encode_struct_filtered(
         &mut self,
         obj: &Bound<'py, PyAny>,
         layout: &StructLayout,
     ) -> PyResult<()> {
         let py = obj.py();
         let class = obj.get_type().into_any();
-        let mut present = Vec::with_capacity(layout.fields.len());
+        let settings = &layout.settings;
+        let mut entries: Vec<(&str, Bound<'py, PyAny>)> = Vec::with_capacity(layout.len());
+        if let Some(tag) = &settings.tag {
+            entries.push((settings.tag_field.as_str(), tag.bind(py).clone()));
+        }
         for field in &layout.fields {
             let value = obj.getattr(field.key.bind(py))?;
-            if !is_field_default(&class, field, &value)? {
-                present.push((field, value));
+            if !is_omitted_field(&class, field, &value, settings.omit_defaults)? {
+                entries.push((&*field.name, value));
             }
         }
-        let settings = &layout.settings;
-        let tag_entries = usize::from(settings.tag.is_some());
-        self.encode_container(Token::MapStart(present.len() + tag_entries), |encoder| {
-            if let Some(tag) = &settings.tag {
-                encoder.writer.write_key(Token::Str(&settings.tag_field));
-                encoder.encode(tag.bind(py))?;
-            }
-            for (field, value) in &present {
-                encoder.writer.write_key(Token::Str(&field.name));
-                encoder.encode(value)?;
+        if self.order.sorts_fields() {
+            entries.sort_by_key(|(name, _)| *name);
+        }
+        self.encode_container(Token::MapStart(entries.len()), move |encoder| {
+            for (name, value) in entries {
+                encoder.writer.write_key(Token::Str(name));
+                encoder.encode(&value)?;
             }
             Ok(())
         })
     }
+}
+
+fn is_omitted_field(
+    class: &Bound<'_, PyAny>,
+    field: &Field,
+    value: &Bound<'_, PyAny>,
+    omit_defaults: bool,
+) -> PyResult<bool> {
+    if field.accepts_unset && value.is(unset(value.py())?) {
+        return Ok(true);
+    }
+    Ok(omit_defaults && is_field_default(class, field, value)?)
 }
 
 fn is_field_default(

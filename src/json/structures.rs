@@ -355,6 +355,10 @@ impl<'a> Reader<'a> for Parser<'a> {
         Ok(Some(&self.text[start..self.position]))
     }
 
+    fn skip_trailing_whitespace(&mut self) {
+        self.skip_whitespace();
+    }
+
     fn read_value(&mut self) -> Result<Value<'a>, ParseError> {
         self.skip_whitespace();
         if self.consume(b'[') {

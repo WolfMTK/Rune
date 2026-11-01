@@ -56,6 +56,8 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
         Ok(None)
     }
 
+    fn skip_trailing_whitespace(&mut self) {}
+
     fn enter_array(&mut self) -> Result<Option<usize>, ParseError> {
         let len = self.open_array()?;
         self.enter()?;

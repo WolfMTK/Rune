@@ -309,8 +309,8 @@ impl Plan {
                 let node = &self.nodes[id];
                 if !node.children_call_user_code
                     && node
-                        .shape
-                        .any_child(|child| self.nodes[child].calls_user_code)
+                    .shape
+                    .any_child(|child| self.nodes[child].calls_user_code)
                 {
                     let node = &mut self.nodes[id];
                     node.children_call_user_code = true;
@@ -1627,9 +1627,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     pub(crate) fn decode_document(mut self) -> Decoded<'py> {
         let value = self.decode_node(self.plan.root())?;
         if !self.wire.is_exhausted() {
-            return Err(self.wire.error("Trailing characters after value").into());
+            self.expect_only_trailing_whitespace()?;
         }
         Ok(value)
+    }
+
+    #[cold]
+    fn expect_only_trailing_whitespace(&mut self) -> Outcome<()> {
+        self.wire.skip_trailing_whitespace();
+        if self.wire.is_exhausted() {
+            Ok(())
+        } else {
+            Err(self.wire.error("Trailing characters after value").into())
+        }
     }
 
     fn decode_node(&mut self, id: NodeId) -> Decoded<'py> {
@@ -2883,7 +2893,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: None,
         }
-        .into()
+            .into()
     }
 
     pub(crate) fn mismatch(expected: &str, got: &str) -> Self {
@@ -2905,7 +2915,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: Some(err),
         }
-        .into()
+            .into()
     }
 
     pub(crate) fn at(mut self, segment: PathSegment) -> Self {

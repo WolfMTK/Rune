@@ -36,6 +36,7 @@ impl JsonWriter {
             Token::Int(value) => write_integer(&mut self.out, value),
             Token::UInt(value) => write_integer(&mut self.out, value),
             Token::Str(value) => write_escaped(&mut self.out, value),
+            Token::Bytes(_) => unreachable!("JSON has no binary tokens"),
             Token::ArrayStart(_) => self.out.push(b'['),
             Token::MapStart(_) => self.out.push(b'{'),
             Token::ArrayEnd => self.out.push(b']'),
@@ -45,6 +46,8 @@ impl JsonWriter {
 }
 
 impl Writer for JsonWriter {
+    const BINARY: bool = false;
+
     fn write(&mut self, token: Token<'_>) {
         if self.needs_separator && !matches!(token, Token::ArrayEnd | Token::MapEnd) {
             self.out.push(b',');

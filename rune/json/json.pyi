@@ -14,8 +14,9 @@ def decode(
     buf: bytes,
     /,
     *,
-    type: Any = None,
+    type: Any = ...,
     dec_hook: Callable[[Any, Any], Any] | None = None,
+    strict: bool = True,
 ) -> Any: ...
 
 class Decoder(Generic[T]):
@@ -24,9 +25,10 @@ class Decoder(Generic[T]):
     @overload
     def __init__(
         self: Decoder[Any],
-        type: None = None,
+        type: Any = ...,
         *,
         dec_hook: Callable[[Any, Any], Any] | None = None,
+        strict: bool = True,
     ) -> None: ...
     @overload
     def __init__(
@@ -34,7 +36,10 @@ class Decoder(Generic[T]):
         type: type[T] | Any,
         *,
         dec_hook: Callable[[Any, Any], Any] | None = None,
+        strict: bool = True,
     ) -> None: ...
+    @property
+    def strict(self) -> bool: ...
     def __class_getitem__(cls, item: Any) -> Any: ...
     def decode(self, buf: bytes, /) -> T: ...
 
@@ -44,9 +49,12 @@ class Encoder:
         *,
         enc_hook: Callable[[Any], Any] | None = None,
         order: Literal["deterministic", "sorted"] | None = None,
+        uuid_format: Literal["canonical", "hex"] | None = None,
     ) -> None: ...
     @property
     def enc_hook(self) -> Callable[[Any], Any] | None: ...
     @property
     def order(self) -> Literal["deterministic", "sorted"] | None: ...
+    @property
+    def uuid_format(self) -> Literal["canonical", "hex"]: ...
     def encode(self, obj: Any) -> bytes: ...

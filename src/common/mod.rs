@@ -11,11 +11,13 @@ pub(crate) mod datetime_format;
 pub(crate) mod enums;
 pub(crate) mod failure;
 pub(crate) mod helpers;
+pub(crate) mod lax;
 pub(crate) mod macros;
 pub(crate) mod py_typing;
 pub(crate) mod reader;
 pub(crate) mod structures;
 pub(crate) mod types;
+pub(crate) mod uuid_format;
 pub(crate) mod validate;
 pub(crate) mod writer;
 

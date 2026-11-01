@@ -1,4 +1,4 @@
-use crate::common::enums::{DecimalFormat, Insertion, Order, Primitive, Token};
+use crate::common::enums::{DecimalFormat, Insertion, Order, Primitive, Token, UuidFormat};
 use crate::common::py_typing::{
     any, default_factory_type, enum_type, is_type_alias, is_union_origin, resolve_type_alias,
     type_alias_of, type_args, type_name, type_origin,
@@ -223,7 +223,7 @@ pub(crate) fn insert_new<K, T>(entry: Entry<'_, K, T>, value: T) -> Insertion {
 
 pub(crate) fn untyped_plan(py: Python<'_>) -> PyResult<&'static Plan> {
     static PLAN: PyOnceLock<Plan> = PyOnceLock::new();
-    PLAN.get_or_try_init(py, || Plan::compile(any(py)?, false))
+    PLAN.get_or_try_init(py, || Plan::compile(any(py)?, false, false))
 }
 
 pub(crate) fn encode_object<'py, W: Writer>(
@@ -232,6 +232,7 @@ pub(crate) fn encode_object<'py, W: Writer>(
     hook: &Hook,
     decimal_format: &DecimalFormat,
     order: Order,
+    uuid_format: UuidFormat,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut encoder = Encoder {
         writer: W::default(),
@@ -239,6 +240,7 @@ pub(crate) fn encode_object<'py, W: Writer>(
         hook: hook.bind(py),
         decimal_format,
         order,
+        uuid_format,
         encoding_decimal_replacement: false,
         kinds: RuneMap::default(),
         enum_values: RuneMap::default(),

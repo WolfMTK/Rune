@@ -27,6 +27,8 @@ const MAP: LengthMarkers = LengthMarkers {
 };
 
 impl Writer for MsgpackWriter {
+    const BINARY: bool = true;
+
     fn write(&mut self, token: Token<'_>) {
         match token {
             Token::Null => self.out.push(0xc0),
@@ -36,6 +38,7 @@ impl Writer for MsgpackWriter {
             Token::UInt(value) => self.write_unsigned(value),
             Token::Float(value) => self.write_tagged(0xcb, &value.to_be_bytes()),
             Token::Str(value) => self.write_string(value),
+            Token::Bytes(value) => self.write_binary(value),
             Token::ArrayStart(len) => self.write_length(len, &ARRAY),
             Token::MapStart(len) => self.write_length(len, &MAP),
             Token::ArrayEnd | Token::MapEnd => {}

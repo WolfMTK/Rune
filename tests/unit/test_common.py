@@ -5084,3 +5084,510 @@ class TestAttrs:
         msg = proto.encode([])
         with pytest.raises(ValidationError, match="Expected `object`, got `array`"):
             dec.decode(msg)
+
+
+class TestUUID:
+    def test_encoder_uuid_format(self, proto):
+        assert proto.Encoder().uuid_format == "canonical"
+        assert proto.Encoder(uuid_format="canonical").uuid_format == "canonical"
+        assert proto.Encoder(uuid_format="hex").uuid_format == "hex"
+
+        if proto is rune.msgpack:
+            assert proto.Encoder(uuid_format="bytes").uuid_format == "bytes"
+        else:
+            with pytest.raises(
+                ValueError,
+                match="`uuid_format` must be 'canonical' or 'hex', got 'bytes'",
+            ):
+                proto.Encoder(uuid_format="bytes")
+
+    def test_encoder_invalid_uuid_format(self, proto):
+        if proto is rune.json:
+            msg = "`uuid_format` must be 'canonical' or 'hex', got {!r}"
+        else:
+            msg = "`uuid_format` must be 'canonical', 'hex', or 'bytes', got {!r}"
+
+        for bad in ["bad", 1]:
+            with pytest.raises(ValueError, match=msg.format(bad)):
+                proto.Encoder(uuid_format=bad)
+
+    @pytest.mark.parametrize("format", ["canonical", "hex"])
+    def test_encode_uuid(self, format, proto):
+        u = uuid.uuid4()
+        enc = proto.Encoder(uuid_format=format)
+        res = enc.encode(u)
+        if format == "canonical":
+            sol = enc.encode(str(u))
+        else:
+            sol = enc.encode(u.hex)
+        assert res == sol
+
+    def test_encode_uuid_bytes(self):
+        u = uuid.uuid4()
+        enc = rune.msgpack.Encoder(uuid_format="bytes")
+        res = enc.encode(u)
+        sol = enc.encode(u.bytes)
+        assert res == sol
+
+    def test_encode_uuid_subclass(self, proto):
+        class Ex(uuid.UUID):
+            pass
+
+        s = "4184defa-4d1a-4497-a140-fd1ec0b22383"
+        assert proto.encode(Ex(s)) == proto.encode(s)
+
+    def test_encode_uuid_malformed_internals(self, proto):
+        """Ensure that if some other code mutates the uuid object, we error
+        nicely rather than segfaulting"""
+        u = uuid.uuid4()
+        object.__delattr__(u, "int")
+
+        with pytest.raises(AttributeError):
+            proto.encode(u)
+
+        u = uuid.uuid4()
+        object.__setattr__(u, "int", "oops")
+
+        with pytest.raises(TypeError):
+            proto.encode(u)
+
+    @pytest.mark.parametrize("upper", [False, True])
+    @pytest.mark.parametrize("hyphens", [False, True])
+    def test_decode_uuid(self, proto, upper, hyphens):
+        u = uuid.uuid4()
+        s = str(u) if hyphens else u.hex
+        if upper:
+            s = s.upper()
+        msg = proto.encode(s)
+        res = proto.decode(msg, type=uuid.UUID)
+        assert res == u
+        assert res.is_safe == u.is_safe
+
+    def test_decode_uuid_from_bytes(self):
+        sol = uuid.uuid4()
+        msg = rune.msgpack.encode(sol.bytes)
+        res = rune.msgpack.decode(msg, type=uuid.UUID)
+        assert res == sol
+
+        bad_msg = rune.msgpack.encode(b"x" * 8)
+        with pytest.raises(rune.ValidationError, match="Invalid UUID bytes"):
+            rune.msgpack.decode(bad_msg, type=uuid.UUID)
+
+    @pytest.mark.parametrize(
+        "uuid_str",
+        [
+            # Truncated
+            "12345678-1234-1234-1234-1234567890a",
+            "123456781234123412341234567890a",
+            # Truncated segments
+            "1234567-1234-1234-1234-1234567890abc",
+            "12345678-123-1234-1234-1234567890abc",
+            "12345678-1234-123-1234-1234567890abc",
+            "12345678-1234-1234-123-1234567890abc",
+            "12345678-1234-1234-1234-1234567890a-",
+            # Invalid character
+            "123456x81234123412341234567890ab",
+            "123456x8-1234-1234-1234-1234567890ab",
+            "1234567x-1234-1234-1234-1234567890ab",
+            "12345678-123x-1234-1234-1234567890ab",
+            "12345678-1234-123x-1234-1234567890ab",
+            "12345678-1234-1234-123x-1234567890ab",
+            "12345678-1234-1234-1234-1234567890ax",
+            # Invalid dash
+            "12345678.1234-1234-1234-1234567890ab",
+            "12345678-1234.1234-1234-1234567890ab",
+            "12345678-1234-1234.1234-1234567890ab",
+            "12345678-1234-1234-1234.1234567890ab",
+            # Trailing data
+            "12345678-1234-1234-1234-1234567890ab-",
+            "12345678-1234-1234-1234-1234567890abc",
+        ],
+    )
+    def test_decode_uuid_malformed(self, proto, uuid_str):
+        msg = proto.encode(uuid_str)
+        with pytest.raises(ValidationError, match="Invalid UUID"):
+            proto.decode(msg, type=uuid.UUID)
+
+
+class TestUnset:
+    def test_unset_type_annotation_ignored(self, proto):
+        class Ex(Struct):
+            x: int | UnsetType
+
+        dec = proto.Decoder(Ex)
+        msg = proto.encode({"x": 1})
+        assert dec.decode(msg) == Ex(1)
+
+    def test_encode_unset_errors_other_contexts(self, proto):
+        with pytest.raises(TypeError):
+            proto.encode(UNSET)
+
+    @pytest.mark.parametrize("kind", ["struct", "dataclass", "attrs"])
+    def test_unset_encode(self, kind, proto):
+        if kind == "struct":
+
+            class Ex(Struct):
+                x: int | UnsetType
+                y: int | UnsetType
+
+        elif kind == "dataclass":
+
+            @dataclass
+            class Ex:
+                x: int | UnsetType
+                y: int | UnsetType
+
+        elif kind == "attrs":
+            attrs = pytest.importorskip("attrs")
+
+            @attrs.define
+            class Ex:
+                x: int | UnsetType
+                y: int | UnsetType
+
+        res = proto.encode(Ex(1, UNSET))
+        sol = proto.encode({"x": 1})
+        assert res == sol
+
+        res = proto.encode(Ex(UNSET, 2))
+        sol = proto.encode({"y": 2})
+        assert res == sol
+
+        res = proto.encode(Ex(UNSET, UNSET))
+        sol = proto.encode({})
+        assert res == sol
+
+    def test_unset_encode_struct_omit_defaults(self, proto):
+        class Ex(Struct, omit_defaults=True):
+            x: int | UnsetType = UNSET
+            y: int | UnsetType = UNSET
+            z: int = 0
+
+        for x, y in [(Ex(), {}), (Ex(y=2), {"y": 2}), (Ex(z=1), {"z": 1})]:
+            res = proto.encode(x)
+            sol = proto.encode(y)
+            assert res == sol
+
+
+def assert_eq(x, y):
+    assert x == y
+    assert type(x) is type(y)
+
+
+class TestLax:
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_strict_lax_decoder(self, proto, strict):
+        dec = proto.Decoder(list[int], strict=strict)
+
+        assert dec.strict is strict
+
+        msg = proto.encode(["1", "2"])
+
+        if strict:
+            with pytest.raises(ValidationError):
+                dec.decode(msg)
+        else:
+            assert dec.decode(msg) == [1, 2]
+
+    def test_lax_none(self, proto):
+        for x in ["null", "Null", "nUll", "nuLl", "nulL"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=None, strict=False) is None
+
+        for x in ["xull", "nxll", "nuxl", "nulx"]:
+            msg = proto.encode(x)
+            with pytest.raises(ValidationError, match="Expected `null`, got `str`"):
+                proto.decode(msg, type=None, strict=False)
+
+    def test_lax_bool_true(self, proto):
+        for x in [1, "1", "true", "True", "tRue", "trUe", "truE"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=bool, strict=False) is True
+
+        for x in [-1, 3, "x", "xx", "xrue", "txue", "trxe", "trux"]:
+            msg = proto.encode(x)
+            typ = type(x).__name__
+            with pytest.raises(ValidationError, match=f"Expected `bool`, got `{typ}`"):
+                assert proto.decode(msg, type=bool, strict=False)
+
+    def test_lax_bool_false(self, proto):
+        for x in [0, "0", "false", "False", "fAlse", "faLse", "falSe", "falsE"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=bool, strict=False) is False
+
+        for x in [-1, 3, "x", "xx", "xalse", "fxlse", "faxse", "falxe", "falsx"]:
+            msg = proto.encode(x)
+            typ = type(x).__name__
+            with pytest.raises(ValidationError, match=f"Expected `bool`, got `{typ}`"):
+                assert proto.decode(msg, type=bool, strict=False)
+
+    def test_lax_int(self, proto):
+        for x in ["1", "-1", "123456"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=int, strict=False) == int(x)
+
+        for x in ["a", "1a", "1.5", "1..", "nan", "inf"]:
+            msg = proto.encode(x)
+            with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+                proto.decode(msg, type=int, strict=False)
+
+    def test_lax_int_from_float(self, proto):
+        bound = float(1 << 53)
+        for x in [-bound, -1.0, -0.0, 0.0, 1.0, bound]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=int, strict=False) == int(x)
+
+        for x in [-bound - 2, -1.5, 0.001, 1.5, bound + 2]:
+            msg = proto.encode(x)
+            with pytest.raises(ValidationError, match="Expected `int`, got `float`"):
+                proto.decode(msg, type=int, strict=False)
+
+    def test_lax_int_constr(self, proto):
+        typ = typing.Annotated[int, rune.Meta(ge=0)]
+        msg = proto.encode("1")
+        assert proto.decode(msg, type=typ, strict=False) == 1
+
+        msg = proto.encode("-1")
+        with pytest.raises(ValidationError):
+            proto.decode(msg, type=typ, strict=False)
+
+    def test_lax_int_enum(self, proto):
+        class Ex(enum.IntEnum):
+            x = 1
+            y = -2
+
+        def roundtrip(msg):
+            return proto.decode(proto.encode(msg), type=Ex, strict=False)
+
+        assert roundtrip("1") is Ex.x
+        assert roundtrip("-2") is Ex.y
+        with pytest.raises(ValidationError, match="Invalid enum value 3"):
+            roundtrip("3")
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            roundtrip("A")
+
+    def test_lax_int_literal(self, proto):
+        typ = Literal[1, -2]
+
+        def roundtrip(msg):
+            return proto.decode(proto.encode(msg), type=typ, strict=False)
+
+        assert roundtrip("1") == 1
+        assert roundtrip("-2") == -2
+        with pytest.raises(ValidationError, match="Invalid enum value 3"):
+            roundtrip("3")
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            roundtrip("A")
+
+    def test_lax_float(self, proto):
+        for x in ["1", "-1", "123456", "1.5", "-1.5", "inf"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=float, strict=False) == float(x)
+
+        for x in ["a", "1a", "1.0.0", "1.."]:
+            msg = proto.encode(x)
+            with pytest.raises(ValidationError, match="Expected `float`, got `str`"):
+                proto.decode(msg, type=float, strict=False)
+
+    def test_lax_float_constr(self, proto):
+        msg = proto.encode("1.5")
+        assert proto.decode(msg, type=typing.Annotated[float, rune.Meta(ge=0)], strict=False) == 1.5
+
+        msg = proto.encode("-1.0")
+        with pytest.raises(ValidationError):
+            proto.decode(msg, type=typing.Annotated[float, rune.Meta(ge=0)], strict=False)
+
+    def test_lax_str(self, proto):
+        for x in ["1", "1.5", "false", "null"]:
+            msg = proto.encode(x)
+            assert proto.decode(msg, type=str, strict=False) == x
+
+    def test_lax_str_constr(self, proto):
+        typ = typing.Annotated[str, rune.Meta(max_length=10)]
+        msg = proto.encode("xxx")
+        assert proto.decode(msg, type=typ, strict=False) == "xxx"
+
+        msg = proto.encode("x" * 20)
+        with pytest.raises(ValidationError):
+            proto.decode(msg, type=typ, strict=False)
+
+    @pytest.mark.parametrize(
+        "x",
+        [
+            1234.0000004,
+            1234.0000006,
+            1234.000567,
+            1234.567,
+            1234.0,
+            0.123,
+            0.0,
+            1234,
+            0,
+        ],
+    )
+    @pytest.mark.parametrize("sign", [-1, 1])
+    @pytest.mark.parametrize("transform", [None, str])
+    def test_lax_datetime(self, x, sign, transform, proto):
+        timestamp = x * sign
+        msg = proto.encode(transform(timestamp) if transform else timestamp)
+        sol = datetime.datetime.fromtimestamp(timestamp, UTC)
+        res = proto.decode(msg, type=datetime.datetime, strict=False)
+        assert res == sol
+
+    def test_lax_datetime_nonfinite_values(self, proto):
+        values = ["nan", "-inf", "inf"]
+        if proto is rune.msgpack:
+            values.extend([float(v) for v in values])
+        for val in values:
+            msg = proto.encode(val)
+            with pytest.raises(ValidationError, match="Invalid epoch timestamp"):
+                proto.decode(msg, type=datetime.datetime, strict=False)
+
+    @pytest.mark.parametrize("val", [-62135596801, 253402300801])
+    @pytest.mark.parametrize("type", [int, float, str])
+    def test_lax_datetime_out_of_range(self, val, type, proto):
+        msg = proto.encode(type(val))
+        with pytest.raises(ValidationError, match="out of range"):
+            proto.decode(msg, type=datetime.datetime, strict=False)
+
+    def test_lax_datetime_invalid_numeric_str(self, proto):
+        for bad in ["", "12e", "1234a", "1234-1", "1234.a"]:
+            msg = proto.encode(bad)
+            with pytest.raises(ValidationError, match="Invalid"):
+                proto.decode(msg, type=datetime.datetime, strict=False)
+
+    @pytest.mark.parametrize("val", [123, -123, 123.456, "123.456"])
+    def test_lax_datetime_naive_required(self, val, proto):
+        msg = proto.encode(val)
+        with pytest.raises(ValidationError, match="no timezone component"):
+            proto.decode(
+                msg, type=typing.Annotated[datetime.datetime, rune.Meta(tz=False)], strict=False
+            )
+
+    @pytest.mark.parametrize(
+        "x",
+        [
+            1234.0000004,
+            1234.0000006,
+            1234.000567,
+            1234.567,
+            1234.0,
+            0.123,
+            0.0,
+            1234,
+            0,
+        ],
+    )
+    @pytest.mark.parametrize("sign", [-1, 1])
+    @pytest.mark.parametrize("transform", [None, str])
+    def test_lax_timedelta(self, x, sign, transform, proto):
+        timestamp = x * sign
+        msg = proto.encode(transform(timestamp) if transform else timestamp)
+        sol = datetime.timedelta(seconds=timestamp)
+        res = proto.decode(msg, type=datetime.timedelta, strict=False)
+        assert res == sol
+
+    def test_lax_timedelta_nonfinite_values(self, proto):
+        values = ["nan", "-inf", "inf"]
+        if proto is rune.msgpack:
+            values.extend([float(v) for v in values])
+        for val in values:
+            msg = proto.encode(val)
+            with pytest.raises(ValidationError, match="out of range"):
+                proto.decode(msg, type=datetime.timedelta, strict=False)
+
+    @pytest.mark.parametrize("val", [86400000000001, -86399999913601])
+    @pytest.mark.parametrize("type", [int, float, str])
+    def test_lax_timedelta_out_of_range(self, val, type, proto):
+        msg = proto.encode(type(val))
+        with pytest.raises(ValidationError, match="out of range"):
+            proto.decode(msg, type=datetime.timedelta, strict=False)
+
+    def test_lax_timedelta_invalid_numeric_str(self, proto):
+        for bad in ["", "12e", "1234a", "1234-1", "1234.a"]:
+            msg = proto.encode(bad)
+            with pytest.raises(ValidationError, match="Invalid"):
+                proto.decode(msg, type=datetime.timedelta, strict=False)
+
+    @pytest.mark.parametrize(
+        "x, sol",
+        [
+            ("1", 1),
+            ("0", 0),
+            ("-1", -1),
+            ("12.5", 12.5),
+            ("inf", float("inf")),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        ],
+    )
+    def test_lax_union_valid(self, x, sol, proto):
+        typ = int | float | bool | None
+        msg = proto.encode(x)
+        assert_eq(proto.decode(msg, type=typ, strict=False), sol)
+
+    @pytest.mark.parametrize("x", ["1a", "1.5a", "falsx", "trux", "nulx"])
+    def test_lax_union_invalid(self, x, proto):
+        typ = int | float | bool | None
+        msg = proto.encode(x)
+        with pytest.raises(ValidationError, match="Expected `int | float | bool | null`"):  # noqa
+            proto.decode(msg, type=typ, strict=False)
+
+    @pytest.mark.parametrize(
+        "x, err",
+        [
+            ("-1", "`int` >= 0"),
+            ("2000", "`int` <= 1000"),
+            ("18446744073709551616", "`int` <= 1000"),
+            ("-9223372036854775809", "`int` >= 0"),
+            ("100.5", "`float` <= 100.0"),
+        ],
+    )
+    def test_lax_union_invalid_constr(self, x, err, proto):
+        """Ensure that values that parse properly but don't meet the specified
+        constraints error with a specific constraint error"""
+        msg = proto.encode(x)
+        typ = (
+            typing.Annotated[int, rune.Meta(ge=0), rune.Meta(le=1000)]
+            | typing.Annotated[float, rune.Meta(le=100)]
+        )
+        with pytest.raises(ValidationError, match=err):
+            proto.decode(msg, type=typ, strict=False)
+
+    @pytest.mark.parametrize(
+        "x, sol",
+        [
+            ("1", 1),
+            ("1.5", 1.5),
+            ("false", False),
+            ("true", True),
+            ("null", None),
+            ("2022-05-02", datetime.date(2022, 5, 2)),
+        ],
+    )
+    def test_lax_union_extended(self, proto, x, sol):
+        typ = int | float | bool | datetime.date | None
+        msg = proto.encode(x)
+        assert_eq(proto.decode(msg, type=typ, strict=False), sol)
+
+
+@py315_or_later_only
+class TestFrozendict:
+    def test_decode_frozendict_not_object(self, proto):
+        dec = proto.Decoder(frozendict[str, int])
+        msg = proto.encode([])
+        with pytest.raises(ValidationError, match="Expected `object`, got `array`"):
+            dec.decode(msg)
+
+    def test_decode_frozendict_typed(self, proto):
+        dec = proto.Decoder(frozendict[str, int])
+        msg = proto.encode(frozendict({"abc": 1}))
+
+        res = dec.decode(msg)
+        assert res == {"abc": 1}
+        assert type(res) is frozendict
+
+        msg = proto.encode(frozendict({"abc": "xyz"}))
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            dec.decode(msg)

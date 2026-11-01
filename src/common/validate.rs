@@ -6,7 +6,8 @@ use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
     date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_enum_class,
     is_final_origin, is_literal_origin, is_new_type, is_plain_class, is_type, is_typeddict_class,
-    is_typevar, new_type_supertype, origin_or_self, time, timedelta, type_args, type_origin, uuid,
+    is_typevar, is_unset_type, new_type_supertype, origin_or_self, time, timedelta, type_args,
+    type_origin, uuid,
 };
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
@@ -70,18 +71,21 @@ pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind
 }
 pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     use UnionKind::*;
-    let options = union_members(ty)?
-        .into_iter()
-        .filter(|arg| !is_type::<PyNone>(arg))
-        .map(|option| {
-            let settings = struct_class(&option)?
-                .map(|class| StructSettings::of_class(&class))
-                .transpose()?;
-            Ok((option, settings))
-        })
-        .collect::<PyResult<Vec<UnionOption<'_>>>>()?;
-    if options.len() < 2 {
+    let mut members = Vec::new();
+    for member in union_members(ty)? {
+        if !is_type::<PyNone>(&member) && !is_unset_type(&member)? {
+            members.push(member);
+        }
+    }
+    if members.len() < 2 {
         return Ok(());
+    }
+    let mut options: Vec<UnionOption<'_>> = Vec::with_capacity(members.len());
+    for option in members {
+        let settings = struct_class(&option)?
+            .map(|class| StructSettings::of_class(&class))
+            .transpose()?;
+        options.push((option, settings));
     }
     ensure_union_structs_are_valid(ty, &options)?;
     let mut seen_tagged = false;

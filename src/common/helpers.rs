@@ -1,4 +1,4 @@
-use crate::common::enums::{Insertion, Primitive, Token};
+use crate::common::enums::{DecimalFormat, Insertion, Primitive, Token};
 use crate::common::py_typing::{
     any, enum_type, is_type_alias, is_union_origin, resolve_type_alias, type_alias, type_args,
     type_name, type_origin,
@@ -159,11 +159,14 @@ pub(crate) fn encode_object<'py, W: Writer>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
     hook: &Hook,
+    decimal_format: &DecimalFormat,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut encoder = Encoder {
         writer: W::default(),
         depth_left: recursion_limit(py)?,
         hook: hook.bind(py),
+        decimal_format,
+        encoding_decimal_replacement: false,
         kinds: RuneMap::default(),
         enum_values: RuneMap::default(),
     };

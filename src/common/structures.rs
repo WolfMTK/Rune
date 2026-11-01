@@ -1,7 +1,7 @@
 use crate::common::cache::{cached_fields, cached_tag_lookup, enum_cache, literal_cache};
 use crate::common::enums::{
-    ArrayOutput, Constraint, ConstraintSubject, Constructor, Failure, Insertion, Kind, PathSegment,
-    Primitive, Scalar, Shape, Token, Value,
+    ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat, Failure, Insertion,
+    Kind, PathSegment, Primitive, Scalar, Shape, Token, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
@@ -13,9 +13,9 @@ use crate::common::helpers::{
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
-    any, deque, is_annotated_origin, is_enum_class, is_literal_origin, is_type, is_type_alias,
-    is_typevar, is_union_origin, resolve_generic_fields, resolve_namedtuple_fields, type_args,
-    type_name, type_origin,
+    any, decimal_type, deque, is_annotated_origin, is_enum_class, is_literal_origin, is_type,
+    is_type_alias, is_typevar, is_union_origin, resolve_generic_fields, resolve_namedtuple_fields,
+    type_args, type_name, type_origin,
 };
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
@@ -26,7 +26,7 @@ use crate::common::writer::Writer;
 use crate::common::{Format, recursion_limit};
 use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS};
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
-use pyo3::exceptions::{PyRecursionError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyArithmeticError, PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyFrozenSetMethods;
 use pyo3::types::PyListMethods;
@@ -350,6 +350,8 @@ impl<'py> Compiler<'py> {
                 node: id,
             };
             Shape::Struct(Box::new(self.structure(&member)?))
+        } else if base.is(decimal_type(self.py)?) {
+            Shape::Decimal
         } else if is_type_alias(&base) {
             self.classify_alias(ty, id)?
         } else if is_annotated_origin(&base)? {
@@ -1297,10 +1299,34 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Struct(_) => self.decode_struct(id),
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
             Shape::Custom(base) => self.decode_custom(node.ty.bind(self.py), base.bind(self.py)),
+            Shape::Decimal => self.decode_decimal(node.ty.bind(self.py)),
             Shape::Constrained {
                 inner, constraints, ..
             } => self.decode_constrained(*inner, *constraints),
         }
+    }
+
+    fn decode_decimal(&mut self, ty: &Bound<'py, PyAny>) -> Decoded<'py> {
+        let py = self.py;
+        self.expect_kind(kind::NUMBER_OR_STR, ty, kind::name)?;
+        let decimal = decimal_type(py)?;
+        if let Some(text) = self.wire.read_number_text()? {
+            return Ok(decimal.call1((text,))?);
+        }
+        let argument = match self.wire.read_scalar()? {
+            Scalar::Str(text) => {
+                return decimal.call1((text.as_ref(),)).map_err(|err| {
+                    if err.is_instance_of::<PyArithmeticError>(py) {
+                        Fail::invalid("Invalid decimal string".to_owned())
+                    } else {
+                        Fail::from(err)
+                    }
+                });
+            }
+            Scalar::Float(value) => PyFloat::new(py, value).str()?.into_any(),
+            scalar => scalar.to_py(py),
+        };
+        Ok(decimal.call1((argument,))?)
     }
 
     fn decode_constrained(&mut self, inner: NodeId, constraints: ConstraintSetId) -> Decoded<'py> {
@@ -1698,15 +1724,17 @@ struct TagGroup<'g, 'py> {
     tag_index: Option<&'g TagIndex>,
 }
 
-pub(crate) struct Encoder<'py, W> {
+pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) writer: W,
     pub(crate) depth_left: usize,
     pub(crate) hook: Option<Bound<'py, PyAny>>,
+    pub(crate) decimal_format: &'f DecimalFormat,
+    pub(crate) encoding_decimal_replacement: bool,
     pub(crate) kinds: RuneMap<usize, (Bound<'py, PyType>, Kind)>,
     pub(crate) enum_values: RuneMap<usize, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
 }
 
-impl<'py, W: Writer> Encoder<'py, W> {
+impl<'py, W: Writer> Encoder<'_, 'py, W> {
     pub(crate) fn encode(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
         let kind = self.kind_of(obj)?;
         self.encode_as::<false>(obj, kind)
@@ -1727,6 +1755,8 @@ impl<'py, W: Writer> Encoder<'py, W> {
             Kind::Enum
         } else if is_struct_class(&ty)? {
             Kind::Struct(Rc::new(StructLayout::load(&ty, &ty)?))
+        } else if ty.is(decimal_type(ty.py())?) {
+            Kind::Decimal
         } else {
             Kind::Unknown
         };
@@ -1755,19 +1785,64 @@ impl<'py, W: Writer> Encoder<'py, W> {
                     encoder.encode_as::<AS_KEY>(&value, kind)
                 });
             }
-            _ if AS_KEY => return Err(unsupported_key_error(obj)),
+            _ if AS_KEY => return self.encode_other_key(obj, kind),
             Kind::Dict => return self.encode_dict(obj.cast::<PyDict>()?),
             Kind::List => return self.encode_items(obj.cast::<PyList>()?.iter()),
             Kind::Tuple => return self.encode_items(obj.cast::<PyTuple>()?.iter()),
             Kind::Set => return self.encode_items(obj.cast::<PySet>()?.iter()),
             Kind::FrozenSet => return self.encode_items(obj.cast::<PyFrozenSet>()?.iter()),
             Kind::Struct(layout) => return self.encode_struct(obj, &layout),
+            Kind::Decimal => return self.encode_decimal::<false>(obj),
             Kind::Unknown => return self.encode_with_hook(obj),
         };
         if AS_KEY {
             self.writer.write_key(token);
         } else {
             self.writer.write(token);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn encode_other_key(&mut self, key: &Bound<'py, PyAny>, kind: Kind) -> PyResult<()> {
+        match kind {
+            Kind::Decimal => self.encode_decimal::<true>(key),
+            _ => Err(unsupported_key_error(key)),
+        }
+    }
+
+    #[inline(never)]
+    fn encode_decimal<const AS_KEY: bool>(&mut self, decimal: &Bound<'py, PyAny>) -> PyResult<()> {
+        if self.encoding_decimal_replacement {
+            return Err(PyTypeError::new_err(
+                "`decimal_format` callable returned a value containing a Decimal",
+            ));
+        }
+        let decimal_format = self.decimal_format;
+        match decimal_format {
+            DecimalFormat::String => {
+                let text = decimal.str()?;
+                let token = Token::Str(text.to_str()?);
+                if AS_KEY {
+                    self.writer.write_key(token);
+                } else {
+                    self.writer.write(token);
+                }
+            }
+            DecimalFormat::Number => {
+                let text = decimal.str()?;
+                self.writer.write_decimal(text.to_str()?, AS_KEY);
+            }
+            DecimalFormat::Callable(format) => {
+                let replacement = format.bind(decimal.py()).call1((decimal,))?;
+                self.encoding_decimal_replacement = true;
+                let encoded = self.nested(|encoder| {
+                    let kind = encoder.kind_of(&replacement)?;
+                    encoder.encode_as::<AS_KEY>(&replacement, kind)
+                });
+                self.encoding_decimal_replacement = false;
+                encoded?;
+            }
         }
         Ok(())
     }

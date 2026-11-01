@@ -51,6 +51,10 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
         index: usize,
     ) -> Result<Option<Cow<'a, str>>, ParseError>;
 
+    fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
+        Ok(None)
+    }
+
     fn enter_array(&mut self) -> Result<Option<usize>, ParseError> {
         let len = self.open_array()?;
         self.enter()?;

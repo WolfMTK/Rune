@@ -69,6 +69,21 @@ impl Writer for JsonWriter {
         self.needs_separator = false;
     }
 
+    fn write_decimal(&mut self, text: &str, as_key: bool) {
+        let is_finite = text.ends_with(|c: char| c.is_ascii_digit());
+        if as_key {
+            self.write_key(Token::Str(if is_finite { text } else { "null" }));
+        } else if is_finite {
+            if self.needs_separator {
+                self.out.push(b',');
+            }
+            self.needs_separator = true;
+            self.out.extend_from_slice(text.as_bytes());
+        } else {
+            self.write(Token::Null);
+        }
+    }
+
     fn finish(self) -> Vec<u8> {
         self.out
     }
@@ -157,22 +172,8 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<Scalar<'a>, ParseError> {
         let start = self.position;
-        let negative = self.consume(b'-');
-        let digits_start = self.position;
-        let magnitude = self.parse_digits()?;
-        if self.bytes[digits_start] == b'0' && self.position - digits_start > 1 {
-            return Err(self.error("Invalid number"));
-        }
-        let has_fraction = self.consume(b'.');
-        if has_fraction {
-            self.parse_digits()?;
-        }
-        let has_exponent = self.consume(b'e') || self.consume(b'E');
-        if has_exponent {
-            let _ = self.consume(b'+') || self.consume(b'-');
-            self.parse_digits()?;
-        }
-        if has_fraction || has_exponent {
+        let (negative, magnitude, is_float) = self.scan_number()?;
+        if is_float {
             return self.text[start..self.position]
                 .parse()
                 .map(Scalar::Float)
@@ -188,6 +189,26 @@ impl<'a> Parser<'a> {
             })
             .map(Scalar::Int)
             .ok_or_else(|| self.error("Integer is out of range"))
+    }
+
+    #[inline(always)]
+    fn scan_number(&mut self) -> Result<(bool, Option<u64>, bool), ParseError> {
+        let negative = self.consume(b'-');
+        let digits_start = self.position;
+        let magnitude = self.parse_digits()?;
+        if self.bytes[digits_start] == b'0' && self.position - digits_start > 1 {
+            return Err(self.error("Invalid number"));
+        }
+        let has_fraction = self.consume(b'.');
+        if has_fraction {
+            self.parse_digits()?;
+        }
+        let has_exponent = self.consume(b'e') || self.consume(b'E');
+        if has_exponent {
+            let _ = self.consume(b'+') || self.consume(b'-');
+            self.parse_digits()?;
+        }
+        Ok((negative, magnitude, has_fraction || has_exponent))
     }
 
     fn parse_digits(&mut self) -> Result<Option<u64>, ParseError> {
@@ -319,6 +340,16 @@ impl<'a> Reader<'a> for Parser<'a> {
 
     fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
         self.parse_scalar()
+    }
+
+    fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
+        self.skip_whitespace();
+        if !matches!(self.peek(), Some(b'-' | b'0'..=b'9')) {
+            return Ok(None);
+        }
+        let start = self.position;
+        self.scan_number()?;
+        Ok(Some(&self.text[start..self.position]))
     }
 
     fn read_value(&mut self) -> Result<Value<'a>, ParseError> {

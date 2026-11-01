@@ -26,6 +26,7 @@ cached_objects! {
     date => "datetime"."date",
     time => "datetime"."time",
     uuid => "uuid"."UUID",
+    decimal_type => "decimal"."Decimal",
     get_recursion_limit => "sys"."getrecursionlimit",
     resolve_generic_fields => "rune.struct"."resolve_generic_fields",
     resolve_namedtuple_fields => "rune.struct"."resolve_namedtuple_fields",

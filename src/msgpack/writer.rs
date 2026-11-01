@@ -42,6 +42,11 @@ impl Writer for MsgpackWriter {
         }
     }
 
+    fn write_decimal(&mut self, text: &str, _as_key: bool) {
+        let value = text.parse::<f64>().unwrap_or(f64::NAN);
+        self.write_tagged(0xcb, &value.to_be_bytes());
+    }
+
     fn finish(self) -> Vec<u8> {
         self.out
     }

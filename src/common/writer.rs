@@ -7,5 +7,7 @@ pub(crate) trait Writer: Default {
         self.write(token);
     }
 
+    fn write_decimal(&mut self, text: &str, as_key: bool);
+
     fn finish(self) -> Vec<u8>;
 }

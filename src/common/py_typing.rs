@@ -25,6 +25,7 @@ cached_objects! {
     datetime => "datetime"."datetime",
     date => "datetime"."date",
     time => "datetime"."time",
+    timedelta => "datetime"."timedelta",
     uuid => "uuid"."UUID",
     decimal_type => "decimal"."Decimal",
     abc_collection => "collections.abc"."Collection",
@@ -77,6 +78,11 @@ pub(crate) fn is_type_alias(ty: &Bound<'_, PyAny>) -> bool {
 
 pub(crate) fn is_decimal(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(obj.get_type().is(decimal_type(obj.py())?))
+}
+
+pub(crate) fn is_temporal_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = ty.py();
+    Ok(ty.is(datetime(py)?) || ty.is(date(py)?) || ty.is(time(py)?) || ty.is(timedelta(py)?))
 }
 
 pub(crate) fn is_frozendict_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {

@@ -6,7 +6,7 @@ use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
     date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_dataclass,
     is_enum_class, is_literal_origin, is_type, is_typeddict, is_typevar, origin_or_self, time,
-    type_args, type_origin, uuid,
+    timedelta, type_args, type_origin, uuid,
 };
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
@@ -313,5 +313,6 @@ fn is_strict_str_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
         || ty.is(date(py)?)
         || ty.is(time(py)?)
         || ty.is(uuid(py)?)
-        || ty.is(decimal_type(py)?))
+        || ty.is(decimal_type(py)?)
+        || ty.is(timedelta(py)?))
 }

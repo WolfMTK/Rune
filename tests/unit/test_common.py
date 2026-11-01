@@ -2544,3 +2544,78 @@ class TestDecimal:
         res = proto.decode(msg, type=decimal.Decimal)
         assert str(res) == str(sol)
         assert type(res) is decimal.Decimal
+
+
+class TestAbstractTypes:
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            typing.Collection,
+            typing.MutableSequence,
+            typing.Sequence,
+            collections.abc.Collection,
+            collections.abc.MutableSequence,
+            collections.abc.Sequence,
+            typing.MutableSet,
+            typing.AbstractSet,
+            collections.abc.MutableSet,
+            collections.abc.Set,
+        ],
+    )
+    def test_abstract_sequence(self, proto, typ):
+        # Hacky, but it works
+        if "Set" in str(typ):
+            sol = {1, 2}
+        else:
+            sol = [1, 2]
+        msg = proto.encode(sol)
+        assert proto.decode(msg, type=typ) == sol
+        with pytest.raises(ValidationError, match="Expected `array`, got `str`"):
+            proto.decode(proto.encode("a"), type=typ)
+
+        assert proto.decode(msg, type=typ[int]) == sol
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            proto.decode(proto.encode(["a"]), type=typ[int])
+
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            typing.MutableMapping,
+            typing.Mapping,
+            collections.abc.MutableMapping,
+            collections.abc.Mapping,
+        ],
+    )
+    def test_abstract_mapping(self, proto, typ):
+        sol = {"x": 1, "y": 2}
+        msg = proto.encode(sol)
+        assert proto.decode(msg, type=typ) == sol
+        with pytest.raises(ValidationError, match="Expected `object`, got `str`"):
+            proto.decode(proto.encode("a"), type=typ)
+
+        assert proto.decode(msg, type=typ[str, int]) == sol
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            proto.decode(proto.encode({"a": "b"}), type=typ[str, int])
+
+    @py315_or_later_only
+    @pytest.mark.parametrize(
+        "typ",
+        [
+            typing.MutableMapping,
+            typing.Mapping,
+            collections.abc.MutableMapping,
+            collections.abc.Mapping,
+        ],
+    )
+    def test_abstract_mapping_frozendict(self, proto, typ):
+        sol = frozendict({"x": 1, "y": 2})
+        msg = proto.encode(sol)
+        res = proto.decode(msg, type=typ)
+        assert res == sol
+        assert type(res) is dict  # does not roundtrip
+        with pytest.raises(ValidationError, match="Expected `object`, got `str`"):
+            proto.decode(proto.encode("a"), type=typ)
+
+        assert proto.decode(msg, type=typ[str, int]) == sol
+        with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
+            proto.decode(proto.encode(frozendict({"a": "b"})), type=typ[str, int])

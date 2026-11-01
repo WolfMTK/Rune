@@ -1,4 +1,4 @@
-use crate::common::enums::UnionKind;
+use crate::common::enums::{AbstractContainer, UnionKind};
 use crate::common::helpers::{
     is_named_tuple_class, resolve_type_aliases, struct_class, union_members,
 };
@@ -62,7 +62,10 @@ pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind
     } else if ty.is(deque(ty.py())?) {
         Some(UnionKind::Deque)
     } else {
-        None
+        AbstractContainer::of(ty)?.map(|container| match container {
+            AbstractContainer::Mapping => UnionKind::Dict,
+            AbstractContainer::Sequence | AbstractContainer::Set => UnionKind::Array,
+        })
     })
 }
 pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {

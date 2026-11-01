@@ -5,11 +5,11 @@ use crate::common::enums::{
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
-    ExpectedName, class_tag, default_value, enter_type_alias, expand_type_alias,
-    has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_named_tuple_class,
-    is_single_primitive, is_struct_class, named_tuple_field_pairs, parametrized_identity,
-    struct_class, struct_field_pairs, type_arg_or_any, typevar_bound, union_members,
-    union_mismatch, untyped_plan,
+    ExpectedName, class_default, class_tag, default_value, enter_type_alias, expand_type_alias,
+    has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_default_factory,
+    is_named_tuple_class, is_single_primitive, is_struct_class, named_tuple_field_pairs,
+    parametrized_identity, struct_class, struct_field_pairs, type_arg_or_any, typevar_bound,
+    union_members, union_mismatch, untyped_plan,
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::py_typing::{
@@ -474,19 +474,34 @@ impl<'py> Compiler<'py> {
         let layout = StructLayout::load(ty, &member.class)?;
         let mut fields = Vec::with_capacity(layout.fields.len());
         for field in layout.fields {
+            let class_value = ty.getattr_opt(field.key.bind(self.py))?;
+            let has_default_factory = match &class_value {
+                Some(value) => is_default_factory(value)?,
+                None => false,
+            };
             fields.push(FieldPlan {
                 node: self.compile(field.ty.bind(self.py))?,
-                is_required: !ty.hasattr(field.key.bind(self.py))?,
+                is_required: class_value.is_none(),
+                has_default_factory,
                 name: field.name,
                 key: field.key,
             });
         }
-        let slot_by_name = fields
+        let slot_by_name: RuneMap<Box<str>, usize> = fields
             .iter()
             .enumerate()
             .map(|(slot, field)| (field.name.clone(), slot))
             .collect();
-        let required_count = fields.iter().filter(|field| field.is_required).count();
+        if slot_by_name.len() != fields.len() {
+            return Err(PyTypeError::new_err(format!(
+                "{} has duplicate field names after applying `rename`",
+                type_name(ty)?
+            )));
+        }
+        let min_array_length = fields
+            .iter()
+            .rposition(|field| field.is_required)
+            .map_or(0, |last_required| last_required + 1);
         let settings = layout.settings;
         let has_str_tag = settings
             .tag
@@ -499,12 +514,13 @@ impl<'py> Compiler<'py> {
         Ok(StructPlan {
             target: ty.clone().unbind(),
             slot_by_name,
-            required_count,
+            min_array_length,
             fields,
             has_str_tag,
             tag: settings.tag,
             tag_field: settings.tag_field,
             array_like: settings.array_like,
+            forbid_unknown_fields: settings.forbid_unknown_fields,
             constructor: Constructor::detect(ty, &member.class)?,
             tag_index,
         })
@@ -722,17 +738,19 @@ pub(crate) struct FieldPlan {
     pub(crate) key: Py<PyString>,
     pub(crate) node: NodeId,
     pub(crate) is_required: bool,
+    pub(crate) has_default_factory: bool,
 }
 
 pub(crate) struct StructPlan {
     pub(crate) target: Py<PyAny>,
     pub(crate) fields: Vec<FieldPlan>,
     pub(crate) slot_by_name: RuneMap<Box<str>, usize>,
-    pub(crate) required_count: usize,
+    pub(crate) min_array_length: usize,
     pub(crate) tag: Option<Py<PyAny>>,
     pub(crate) has_str_tag: bool,
     pub(crate) tag_field: String,
     pub(crate) array_like: bool,
+    pub(crate) forbid_unknown_fields: bool,
     pub(crate) constructor: Constructor,
     pub(crate) tag_index: Option<TagIndex>,
 }
@@ -743,6 +761,26 @@ impl StructPlan {
             Some(field) if &*field.name == key => Some(expected_slot),
             _ => self.slot_by_name.get(key).copied(),
         }
+    }
+
+    fn check_unknown_key(&self, key: &str) -> Outcome<()> {
+        let is_tag_key = self.tag.is_some() && key == self.tag_field;
+        if self.forbid_unknown_fields && !is_tag_key {
+            return Err(Fail::invalid(format!(
+                "Object contains unknown field `{key}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_extra_array_item(&self, leading_items: usize) -> Outcome<()> {
+        if self.forbid_unknown_fields {
+            return Err(Fail::invalid(format!(
+                "Expected `array` of at most length {}",
+                self.fields.len() + leading_items
+            )));
+        }
+        Ok(())
     }
 
     fn instantiate<'py>(&self, py: Python<'py>, values: FieldValues<'py>) -> Decoded<'py> {
@@ -851,14 +889,6 @@ impl Validator {
         }
     }
 
-    fn visit_alias(&mut self, ty: &Bound<'_, PyAny>, alias: &Bound<'_, PyAny>) -> PyResult<()> {
-        let value = expand_type_alias(ty)?;
-        enter_type_alias(&mut self.expanding_aliases, alias)?;
-        let visited = self.visit(&value);
-        self.expanding_aliases.pop();
-        visited
-    }
-
     fn visit_record<'py>(
         &mut self,
         class: &Bound<'py, PyAny>,
@@ -875,6 +905,28 @@ impl Validator {
             self.visit(&pair?.get_item(1)?)?;
         }
         Ok(())
+    }
+
+    fn visit_alias(&mut self, ty: &Bound<'_, PyAny>, alias: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = expand_type_alias(ty)?;
+        enter_type_alias(&mut self.expanding_aliases, alias)?;
+        let visited = self.visit(&value);
+        self.expanding_aliases.pop();
+        visited
+    }
+
+    fn visit_special_form(
+        &mut self,
+        ty: &Bound<'_, PyAny>,
+        origin: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if is_type_alias(origin) {
+            self.visit_alias(ty, origin)
+        } else if is_annotated_origin(origin)? {
+            self.visit(&ty.getattr(intern!(ty.py(), "__origin__"))?)
+        } else {
+            Ok(())
+        }
     }
 
     fn visit_typevar(&mut self, ty: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -908,20 +960,6 @@ impl Validator {
         }
         Ok(())
     }
-
-    fn visit_special_form(
-        &mut self,
-        ty: &Bound<'_, PyAny>,
-        origin: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        if is_type_alias(origin) {
-            self.visit_alias(ty, origin)
-        } else if is_annotated_origin(origin)? {
-            self.visit(&ty.getattr(intern!(ty.py(), "__origin__"))?)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 pub(crate) struct Field {
@@ -940,23 +978,38 @@ impl Field {
     }
 }
 
+const ARRAY_LIKE_FLAG: u8 = 1;
+const OMIT_DEFAULTS_FLAG: u8 = 2;
+const FORBID_UNKNOWN_FIELDS_FLAG: u8 = 4;
+const RENAMED_FLAG: u8 = 16;
+
 pub(crate) struct StructSettings {
     pub(crate) tag: Option<Py<PyAny>>,
     pub(crate) tag_field: String,
     pub(crate) array_like: bool,
+    pub(crate) omit_defaults: bool,
+    pub(crate) forbid_unknown_fields: bool,
+    pub(crate) rename: Option<Py<PyAny>>,
 }
 
 impl StructSettings {
     pub(crate) fn of_class(class: &Bound<'_, PyAny>) -> PyResult<Self> {
         let py = class.py();
+        let flags: u8 = class.getattr(intern!(py, "__struct_flags__"))?.extract()?;
+        let rename = if flags & RENAMED_FLAG != 0 {
+            Some(class.getattr(intern!(py, "__struct_rename__"))?.unbind())
+        } else {
+            None
+        };
         Ok(Self {
             tag: class_tag(class)?.map(Bound::unbind),
             tag_field: class
                 .getattr(intern!(py, "__struct_tag_field__"))?
                 .extract()?,
-            array_like: class
-                .getattr(intern!(py, "__struct_array_like__"))
-                .map_or(Ok(false), |flag| flag.is_truthy())?,
+            array_like: flags & ARRAY_LIKE_FLAG != 0,
+            omit_defaults: flags & OMIT_DEFAULTS_FLAG != 0,
+            forbid_unknown_fields: flags & FORBID_UNKNOWN_FIELDS_FLAG != 0,
+            rename,
         })
     }
 }
@@ -968,7 +1021,7 @@ pub(crate) struct StructLayout {
 
 impl StructLayout {
     pub(crate) fn load(ty: &Bound<'_, PyAny>, class: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let fields = if class.is(ty) {
+        let mut fields: Vec<Field> = if class.is(ty) {
             struct_field_pairs(ty, class)?
                 .try_iter()?
                 .map(|pair| {
@@ -979,10 +1032,17 @@ impl StructLayout {
         } else {
             cached_fields(ty, resolve_generic_fields(ty.py())?, "Struct")?
         };
-        Ok(Self {
-            fields,
-            settings: StructSettings::of_class(class)?,
-        })
+        let settings = StructSettings::of_class(class)?;
+        if let Some(rename) = &settings.rename {
+            for field in &mut fields {
+                field.name = rename
+                    .bind(ty.py())
+                    .call1((field.key.bind(ty.py()),))?
+                    .extract::<String>()?
+                    .into_boxed_str();
+            }
+        }
+        Ok(Self { fields, settings })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1069,11 +1129,14 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
     fn decode_array_struct(&mut self, id: NodeId) -> Decoded<'py> {
         let plan = self.plan.struct_plan(id);
         let mut values = vec![None; plan.fields.len()];
-        let length = Length::at_least(plan.required_count);
+        let length = Length::at_least(plan.min_array_length);
         self.decode_sequence(&length, self.fields_call_user_code(id), |this, index| {
             match plan.fields.get(index) {
                 Some(field) => values[index] = Some(this.decode_node(field.node)?),
-                None => this.skip()?,
+                None => {
+                    plan.check_extra_array_item(0)?;
+                    this.skip()?;
+                }
             }
             Ok(())
         })?;
@@ -1106,7 +1169,10 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         self.each_entry(len, first_index, |this, key, index| {
             match plan.slot_of(&key, index - first_index) {
                 Some(slot) => values[slot] = Some(this.decode_node(plan.fields[slot].node)?),
-                None => this.skip()?,
+                None => {
+                    plan.check_unknown_key(&key)?;
+                    this.skip()?;
+                }
             }
             Ok(())
         })?;
@@ -1144,6 +1210,8 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         for (entry, (key, _)) in entries.items.iter().enumerate() {
             if let Some(&slot) = plan.slot_by_name.get(key.as_ref()) {
                 latest_entry[slot] = Some(entry);
+            } else {
+                plan.check_unknown_key(key)?;
             }
         }
         let mut values = Vec::with_capacity(plan.fields.len());
@@ -1188,7 +1256,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         let id = self.resolve_tag(group, || PathSegment::Index(0))?;
         let after_tag = self.wire.checkpoint();
         let plan = self.plan.struct_plan(id);
-        let length = Length::at_least(plan.required_count + 1);
+        let length = Length::at_least(plan.min_array_length + 1);
         let must_count_first = self.fields_call_user_code(id);
         let mut values = vec![None; plan.fields.len()];
         self.decode_items(
@@ -1200,7 +1268,10 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
             |this, index| {
                 match plan.fields.get(index - 1) {
                     Some(field) => values[index - 1] = Some(this.decode_node(field.node)?),
-                    None => this.skip()?,
+                    None => {
+                        plan.check_extra_array_item(1)?;
+                        this.skip()?;
+                    }
                 }
                 Ok(())
             },
@@ -1773,15 +1844,22 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         self.encode_as::<false>(obj, kind)
     }
 
+    #[inline(always)]
     fn kind_of(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<Kind> {
         if let Some(kind) = Kind::from_exact_instance(obj) {
             return Ok(kind);
         }
-        let ty = obj.get_type();
-        let key = ty.as_ptr() as usize;
+        let key = obj.get_type().as_ptr() as usize;
         if let Some((_, kind)) = self.kinds.get(&key) {
             return Ok(kind.clone());
         }
+        self.classify_kind(obj)
+    }
+
+    #[inline(never)]
+    fn classify_kind(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<Kind> {
+        let ty = obj.get_type();
+        let key = ty.as_ptr() as usize;
         let kind = if let Some(kind) = Kind::from_instance(obj) {
             kind
         } else if is_enum_class(&ty)? {
@@ -1975,9 +2053,13 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         })
     }
 
+    #[inline(never)]
     fn encode_struct(&mut self, obj: &Bound<'py, PyAny>, layout: &StructLayout) -> PyResult<()> {
         let py = obj.py();
         let settings = &layout.settings;
+        if settings.omit_defaults && !settings.array_like {
+            return self.encode_struct_omitting_defaults(obj, layout);
+        }
         let start = if settings.array_like {
             Token::ArrayStart(layout.len())
         } else {
@@ -1999,6 +2081,47 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Ok(())
         })
     }
+
+    #[inline(never)]
+    fn encode_struct_omitting_defaults(
+        &mut self,
+        obj: &Bound<'py, PyAny>,
+        layout: &StructLayout,
+    ) -> PyResult<()> {
+        let py = obj.py();
+        let class = obj.get_type().into_any();
+        let mut present = Vec::with_capacity(layout.fields.len());
+        for field in &layout.fields {
+            let value = obj.getattr(field.key.bind(py))?;
+            if !is_field_default(&class, field, &value)? {
+                present.push((field, value));
+            }
+        }
+        let settings = &layout.settings;
+        let tag_entries = usize::from(settings.tag.is_some());
+        self.encode_container(Token::MapStart(present.len() + tag_entries), |encoder| {
+            if let Some(tag) = &settings.tag {
+                encoder.writer.write_key(Token::Str(&settings.tag_field));
+                encoder.encode(tag.bind(py))?;
+            }
+            for (field, value) in &present {
+                encoder.writer.write_key(Token::Str(&field.name));
+                encoder.encode(value)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn is_field_default(
+    class: &Bound<'_, PyAny>,
+    field: &Field,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let Some(default) = class_default(class, field.key.bind(class.py()))? else {
+        return Ok(false);
+    };
+    Ok(value.get_type().is(default.get_type()) && value.eq(&default)?)
 }
 
 pub(crate) struct Fail(Box<Failure>);

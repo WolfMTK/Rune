@@ -1,7 +1,7 @@
 use crate::common::enums::{DecimalFormat, Insertion, Primitive, Token};
 use crate::common::py_typing::{
-    any, enum_type, is_type_alias, is_union_origin, resolve_type_alias, type_alias, type_args,
-    type_name, type_origin,
+    any, default_factory_type, enum_type, is_type_alias, is_union_origin, resolve_type_alias,
+    type_alias_of, type_args, type_name, type_origin,
 };
 use crate::common::py_typing::{
     is_typevar, origin_or_self, resolve_generic_fields, resolve_namedtuple_fields, struct_base,
@@ -18,10 +18,81 @@ use pyo3::exceptions::{PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyTypeMethods};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyListMethods;
-use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple, PyType};
+use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyString, PyTuple, PyType};
 use pyo3::{Bound, PyAny, PyErr, PyResult, intern};
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
+
+pub(crate) fn expand_type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    resolve_type_alias(ty.py())?.call1((ty,))
+}
+
+pub(crate) fn enter_type_alias(
+    expanding: &mut Vec<usize>,
+    alias: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let key = alias.as_ptr() as usize;
+    if expanding.contains(&key) {
+        return Err(PyRecursionError::new_err(format!(
+            "Recursive type alias {} is not supported",
+            alias.repr()?
+        )));
+    }
+    expanding.push(key);
+    Ok(())
+}
+
+pub(crate) fn resolve_type_aliases<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let mut resolved = ty.clone();
+    while is_type_alias(&resolved) {
+        resolved = expand_type_alias(&resolved)?;
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn union_members<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let args = type_args(ty)?;
+    if !contains_type_alias(&args)? {
+        return Ok(args);
+    }
+    let mut members = Vec::with_capacity(args.len());
+    let mut expanding = Vec::new();
+    for arg in args {
+        collect_union_member(arg, &mut expanding, &mut members)?;
+    }
+    Ok(members)
+}
+
+fn contains_type_alias(types: &[Bound<'_, PyAny>]) -> PyResult<bool> {
+    for ty in types {
+        if !ty.is_instance_of::<PyType>() && type_alias_of(ty)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_union_member<'py>(
+    ty: Bound<'py, PyAny>,
+    expanding: &mut Vec<usize>,
+    members: &mut Vec<Bound<'py, PyAny>>,
+) -> PyResult<()> {
+    let Some(alias) = type_alias_of(&ty)? else {
+        members.push(ty);
+        return Ok(());
+    };
+    let value = expand_type_alias(&ty)?;
+    enter_type_alias(expanding, &alias)?;
+    let value_members = match type_origin(&value)? {
+        Some(origin) if is_union_origin(&origin)? => type_args(&value)?,
+        _ => vec![value],
+    };
+    for member in value_members {
+        collect_union_member(member, expanding, members)?;
+    }
+    expanding.pop();
+    Ok(())
+}
 
 #[inline(always)]
 pub(crate) fn typevar_bound<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -208,7 +279,33 @@ pub(crate) fn default_value<'py>(
             field.name
         )));
     };
+    if field.has_default_factory {
+        return call_default_factory(&value);
+    }
     copy_if_mutable(value)
+}
+
+pub(crate) fn class_default<'py>(
+    class: &Bound<'py, PyAny>,
+    key: &Bound<'py, PyString>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(value) = class.getattr_opt(key)? else {
+        return Ok(None);
+    };
+    if is_default_factory(&value)? {
+        return call_default_factory(&value).map(Some);
+    }
+    Ok(Some(value))
+}
+
+#[inline(always)]
+pub(crate) fn is_default_factory(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(value.get_type().is(default_factory_type(value.py())?))
+}
+
+#[inline(never)]
+fn call_default_factory<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    value.getattr(intern!(value.py(), "factory"))?.call0()
 }
 
 pub(crate) fn is_single_primitive(py: Python<'_>, union: &UnionPlan) -> bool {
@@ -239,76 +336,6 @@ pub(crate) fn union_mismatch(
         &names.join(" | "),
         kind::container_name(found),
     ))
-}
-
-pub(crate) fn expand_type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    resolve_type_alias(ty.py())?.call1((ty,))
-}
-
-pub(crate) fn enter_type_alias(
-    expanding: &mut Vec<usize>,
-    alias: &Bound<'_, PyAny>,
-) -> PyResult<()> {
-    let key = alias.as_ptr() as usize;
-    if expanding.contains(&key) {
-        return Err(PyRecursionError::new_err(format!(
-            "Recursive type alias {} is not supported",
-            alias.repr()?
-        )));
-    }
-    expanding.push(key);
-    Ok(())
-}
-
-pub(crate) fn resolve_type_aliases<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    let mut resolved = ty.clone();
-    while is_type_alias(&resolved) {
-        resolved = expand_type_alias(&resolved)?;
-    }
-    Ok(resolved)
-}
-pub(crate) fn union_members<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let args = type_args(ty)?;
-    if !contains_type_alias(&args)? {
-        return Ok(args);
-    }
-    let mut members = Vec::with_capacity(args.len());
-    let mut expanding = Vec::new();
-    for arg in args {
-        collect_union_member(arg, &mut expanding, &mut members)?;
-    }
-    Ok(members)
-}
-
-fn contains_type_alias(types: &[Bound<'_, PyAny>]) -> PyResult<bool> {
-    for ty in types {
-        if !ty.is_instance_of::<PyType>() && type_alias(ty)?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn collect_union_member<'py>(
-    ty: Bound<'py, PyAny>,
-    expanding: &mut Vec<usize>,
-    members: &mut Vec<Bound<'py, PyAny>>,
-) -> PyResult<()> {
-    let Some(alias) = type_alias(&ty)? else {
-        members.push(ty);
-        return Ok(());
-    };
-    let value = expand_type_alias(&ty)?;
-    enter_type_alias(expanding, &alias)?;
-    let value_members = match type_origin(&value)? {
-        Some(origin) if is_union_origin(&origin)? => type_args(&value)?,
-        _ => vec![value],
-    };
-    for member in value_members {
-        collect_union_member(member, expanding, members)?;
-    }
-    expanding.pop();
-    Ok(())
 }
 
 pub(crate) trait ExpectedName {

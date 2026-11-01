@@ -43,6 +43,7 @@ cached_objects! {
     struct_meta => "rune.struct"."StructMeta",
     object_type => "builtins"."object",
     meta_type => "rune.meta"."Meta",
+    default_factory_type => "rune.struct"."_DefaultFactory",
     compile_regex => "re"."compile",
 }
 
@@ -58,25 +59,6 @@ pub(crate) fn frozendict(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     .map(|frozendict| frozendict.bind(py))
 }
 
-pub(crate) fn is_decimal(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
-    Ok(obj.get_type().is(decimal_type(obj.py())?))
-}
-
-pub(crate) fn is_frozendict_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {
-    frozendict(ty.py()).map_or(Ok(false), |frozendict| ty.is_subclass(frozendict))
-}
-
-pub(crate) fn type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-    if is_type_alias(ty) {
-        return Ok(Some(ty.clone()));
-    }
-    Ok(type_origin(ty)?.filter(is_type_alias))
-}
-
-pub(crate) fn is_type_alias(ty: &Bound<'_, PyAny>) -> bool {
-    type_alias_type(ty.py()).is_some_and(|alias_type| ty.get_type().is(alias_type))
-}
-
 fn type_alias_type(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     static CELL: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
     CELL.get_or_init(py, || {
@@ -87,6 +69,25 @@ fn type_alias_type(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     })
     .as_ref()
     .map(|alias_type| alias_type.bind(py))
+}
+
+pub(crate) fn is_type_alias(ty: &Bound<'_, PyAny>) -> bool {
+    type_alias_type(ty.py()).is_some_and(|alias_type| ty.get_type().is(alias_type))
+}
+
+pub(crate) fn is_decimal(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(obj.get_type().is(decimal_type(obj.py())?))
+}
+
+pub(crate) fn is_frozendict_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {
+    frozendict(ty.py()).map_or(Ok(false), |frozendict| ty.is_subclass(frozendict))
+}
+
+pub(crate) fn type_alias_of<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if is_type_alias(ty) {
+        return Ok(Some(ty.clone()));
+    }
+    Ok(type_origin(ty)?.filter(is_type_alias))
 }
 
 pub(crate) fn type_origin<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {

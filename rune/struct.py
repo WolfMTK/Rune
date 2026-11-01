@@ -1,7 +1,16 @@
 import inspect
 import reprlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, get_args, get_origin, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+    overload,
+)
 
 _T = TypeVar("_T")
 
@@ -19,9 +28,42 @@ TypeMapping = dict[Any, Any]
 _MISSING: Any = object()
 _COPIED_DEFAULT_TYPES = frozenset({list, dict, set})
 _I64_MIN, _I64_MAX = -(2**63), 2**63 - 1
+_RENAME_RULES: dict[str, Callable[[str], str]] = {"upper": str.upper, "lower": str.lower}
+_ARRAY_LIKE_FLAG = 1
+_OMIT_DEFAULTS_FLAG = 2
+_FORBID_UNKNOWN_FIELDS_FLAG = 4
+_KW_ONLY_FLAG = 8
+_RENAMED_FLAG = 16
 
 
-@dataclass_transform()
+class _DefaultFactory:
+    __slots__ = ("factory",)
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self.factory = factory
+
+
+@overload
+def field(*, default: _T) -> _T: ...
+
+
+@overload
+def field(*, default_factory: Callable[[], _T]) -> _T: ...
+
+
+def field(*, default: Any = _MISSING, default_factory: Any = _MISSING) -> Any:
+    if default is not _MISSING and default_factory is not _MISSING:
+        raise TypeError("field() accepts either `default` or `default_factory`, not both")
+    if default_factory is not _MISSING:
+        if not callable(default_factory):
+            raise TypeError(f"`default_factory` must be callable, got {default_factory!r}")
+        return _DefaultFactory(default_factory)
+    if default is _MISSING:
+        raise TypeError("field() requires either `default` or `default_factory`")
+    return default
+
+
+@dataclass_transform(field_specifiers=(field,))
 class StructMeta(type):
     pass
 
@@ -40,23 +82,35 @@ class _Lazy:
 class Struct(metaclass=StructMeta):
     __struct_fields__: ClassVar[Fields] = ()
     __match_args__: ClassVar[tuple[str, ...]] = ()
-    __struct_array_like__: ClassVar[bool] = False
+    __struct_flags__: ClassVar[int] = 0
     __struct_tag__: ClassVar[str | int | None] = None
     __struct_tag_field__: ClassVar[str] = "type"
+    __struct_rename__: ClassVar[Callable[[str], str] | None] = None
 
     def __init_subclass__(
         cls,
         tag: str | int | bool | None = None,
         tag_field: str | None = None,
         array_like: bool | None = None,
+        omit_defaults: bool | None = None,
+        forbid_unknown_fields: bool | None = None,
+        kw_only: bool | None = None,
+        rename: str | Callable[[str], str] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
         cls.__struct_fields__ = _Lazy("__struct_fields__", _resolve_fields)
         if "__match_args__" not in cls.__dict__:
             cls.__match_args__ = _Lazy("__match_args__", _field_names)
-        if array_like is not None:
-            cls.__struct_array_like__ = array_like
+        flags = cls.__struct_flags__
+        flags = _with_flag(flags, _ARRAY_LIKE_FLAG, array_like)
+        flags = _with_flag(flags, _OMIT_DEFAULTS_FLAG, omit_defaults)
+        flags = _with_flag(flags, _FORBID_UNKNOWN_FIELDS_FLAG, forbid_unknown_fields)
+        flags = _with_flag(flags, _KW_ONLY_FLAG, kw_only)
+        if rename is not None:
+            cls.__struct_rename__ = _resolve_rename(rename)
+            flags |= _RENAMED_FLAG
+        cls.__struct_flags__ = flags
         if tag_field is not None:
             cls.__struct_tag_field__ = tag_field
         cls.__struct_tag__ = _resolve_tag(cls, tag)
@@ -71,7 +125,9 @@ class Struct(metaclass=StructMeta):
                 value = getattr(cls, name, _MISSING)
                 if value is _MISSING:
                     raise TypeError(f"Missing required field `{name}`")
-                if type(value) in _COPIED_DEFAULT_TYPES:
+                if type(value) is _DefaultFactory:
+                    value = value.factory()
+                elif type(value) in _COPIED_DEFAULT_TYPES:
                     value = value.copy()
             setattr(self, name, value)
 
@@ -104,16 +160,6 @@ def resolve_generic_fields(tp: Any) -> Fields:
     return tuple(_fields(origin, _type_mapping(tp, origin)).items())
 
 
-def resolve_namedtuple_fields(tp: Any) -> Fields:
-    origin = get_origin(tp) or tp
-    annotations = get_type_hints(origin)
-    hints = {name: annotations.get(name, Any) for name in origin._fields}
-    if origin is tp:
-        return tuple(hints.items())
-    mapping = _type_mapping(tp, origin)
-    return tuple((name, _substitute(hint, mapping)) for name, hint in hints.items())
-
-
 def resolve_type_alias(tp: Any) -> Any:
     alias = get_origin(tp) or tp
     if alias is tp:
@@ -125,11 +171,23 @@ def resolve_type_alias(tp: Any) -> Any:
     return _substitute(alias.__value__, dict(zip(params, args, strict=True)))
 
 
+def resolve_namedtuple_fields(tp: Any) -> Fields:
+    origin = get_origin(tp) or tp
+    annotations = get_type_hints(origin)
+    hints = {name: annotations.get(name, Any) for name in origin._fields}
+    if origin is tp:
+        return tuple(hints.items())
+    mapping = _type_mapping(tp, origin)
+    return tuple((name, _substitute(hint, mapping)) for name, hint in hints.items())
+
+
 def _resolve_fields(cls: type) -> Fields:
     return tuple(_fields(cls, {}).items())
 
 
 def _field_names(cls: type) -> tuple[str, ...]:
+    if cls.__struct_flags__ & _KW_ONLY_FLAG:
+        return ()
     return tuple(name for name, _ in cls.__struct_fields__)
 
 
@@ -214,9 +272,28 @@ def _resolve_tag(cls: type, tag: Any) -> str | int | None:
     raise TypeError(f"Struct tag must be a str, an int, True or False, got {tag!r}")
 
 
+def _resolve_rename(rename: str | Callable[[str], str]) -> Callable[[str], str]:
+    if isinstance(rename, str):
+        if rename not in _RENAME_RULES:
+            options = ", ".join(repr(name) for name in _RENAME_RULES)
+            raise TypeError(f"Unknown rename rule {rename!r}, expected one of {options}")
+        return _RENAME_RULES[rename]
+    if callable(rename):
+        return rename
+    raise TypeError(f"`rename` must be a str or a callable, got {rename!r}")
+
+
+def _with_flag(flags: int, flag: int, enabled: bool | None) -> int:
+    if enabled is None:
+        return flags
+    return flags | flag if enabled else flags & ~flag
+
+
 def _merge_positional_args(
     cls: type, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> dict[str, Any]:
+    if cls.__struct_flags__ & _KW_ONLY_FLAG:
+        raise TypeError(f"{cls.__name__}() takes no positional arguments")
     fields = cls.__struct_fields__
     if len(args) > len(fields):
         raise TypeError(

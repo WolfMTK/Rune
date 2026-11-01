@@ -2619,3 +2619,241 @@ class TestAbstractTypes:
         assert proto.decode(msg, type=typ[str, int]) == sol
         with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
             proto.decode(proto.encode(frozendict({"a": "b"})), type=typ[str, int])
+
+
+class TestStructOmitDefaults:
+    def test_omit_defaults(self, proto):
+        class Test(Struct, omit_defaults=True):
+            a: int = 0
+            b: bool = False
+            c: str | None = None
+            d: list = []  # noqa
+            e: list | set = set()  # noqa
+            f: dict = {}  # noqa
+
+        cases = [
+            (Test(), {}),
+            (Test(1), {"a": 1}),
+            (Test(1, False), {"a": 1}),
+            (Test(1, True), {"a": 1, "b": True}),
+            (Test(1, c=None), {"a": 1}),
+            (Test(1, c="test"), {"a": 1, "c": "test"}),
+            (Test(1, d=[1]), {"a": 1, "d": [1]}),
+            (Test(1, e={1}), {"a": 1, "e": [1]}),
+            (Test(1, e=[]), {"a": 1, "e": []}),
+            (Test(1, f={"a": 1}), {"a": 1, "f": {"a": 1}}),
+        ]
+
+        for obj, sol in cases:
+            res = proto.decode(proto.encode(obj))
+            assert res == sol
+
+    @pytest.mark.parametrize("typ", [tuple, list, set, frozenset, dict])
+    def test_omit_defaults_collections(self, proto, typ):
+        """Check that using empty collections as default values are detected
+        regardless if they're specified by value or as a default_factory."""
+
+        class Test(Struct, omit_defaults=True):
+            a: typ = rune.field(default_factory=typ)
+            b: typ = rune.field(default=typ())
+            c: typ = typ()
+
+        ex = {"x": 1} if typ is dict else [1]
+
+        assert proto.encode(Test()) == proto.encode({})
+        for n in ["a", "b", "c"]:
+            assert proto.encode(Test(**{n: typ(ex)})) == proto.encode({n: ex})
+
+    def test_omit_defaults_positional(self, proto):
+        class Test(Struct, omit_defaults=True):
+            a: int
+            b: bool = False
+
+        cases = [
+            (Test(1), {"a": 1}),
+            (Test(1, False), {"a": 1}),
+            (Test(1, True), {"a": 1, "b": True}),
+        ]
+
+        for obj, sol in cases:
+            res = proto.decode(proto.encode(obj))
+            assert res == sol
+
+    def test_omit_defaults_tagged(self, proto):
+        class Test(Struct, omit_defaults=True, tag=True):
+            a: int
+            b: bool = False
+
+        cases = [
+            (Test(1), {"type": "Test", "a": 1}),
+            (Test(1, False), {"type": "Test", "a": 1}),
+            (Test(1, True), {"type": "Test", "a": 1, "b": True}),
+        ]
+
+        for obj, sol in cases:
+            res = proto.decode(proto.encode(obj))
+            assert res == sol
+
+    def test_omit_defaults_ignored_for_array_like(self, proto):
+        class Test(Struct, omit_defaults=True, array_like=True):
+            a: int
+            b: bool = False
+
+        cases = [
+            (Test(1), [1, False]),
+            (Test(1, False), [1, False]),
+            (Test(1, True), [1, True]),
+        ]
+
+        for obj, sol in cases:
+            res = proto.decode(proto.encode(obj))
+            assert res == sol
+
+
+class TestStructForbidUnknownFields:
+    def test_forbid_unknown_fields(self, proto):
+        class Test(Struct, forbid_unknown_fields=True):
+            x: int
+            y: int
+
+        good = Test(1, 2)
+        assert proto.decode(proto.encode(good), type=Test) == good
+
+        bad = proto.encode({"x": 1, "y": 2, "z": 3})
+        with pytest.raises(ValidationError, match="Object contains unknown field `z`"):
+            proto.decode(bad, type=Test)
+
+    def test_forbid_unknown_fields_array_like(self, proto):
+        class Test(Struct, forbid_unknown_fields=True, array_like=True):
+            x: int
+            y: int
+
+        good = Test(1, 2)
+        assert proto.decode(proto.encode(good), type=Test) == good
+
+        bad = proto.encode([1, 2, 3])
+        with pytest.raises(ValidationError, match="Expected `array` of at most length 2"):
+            proto.decode(bad, type=Test)
+
+
+class PointUpper(Struct, rename="upper"):
+    x: int
+    y: int
+
+
+class TestStructRename:
+    def test_rename_encode_struct(self, proto):
+        res = proto.encode(PointUpper(1, 2))
+        exp = proto.encode({"X": 1, "Y": 2})
+        assert res == exp
+
+    def test_rename_decode_struct(self, proto):
+        msg = proto.encode({"X": 1, "Y": 2})
+        res = proto.decode(msg, type=PointUpper)
+        assert res == PointUpper(1, 2)
+
+    def test_rename_decode_struct_wrong_type(self, proto):
+        msg = proto.encode({"X": 1, "Y": "bad"})
+        with pytest.raises(ValidationError) as rec:
+            proto.decode(msg, type=PointUpper)
+        assert "Expected `int`, got `str` - at `$.Y`" == str(rec.value)
+
+    def test_rename_decode_struct_missing_field(self, proto):
+        msg = proto.encode({"X": 1})
+        with pytest.raises(ValidationError) as rec:
+            proto.decode(msg, type=PointUpper)
+        assert "Object missing required field `Y`" == str(rec.value)
+
+
+class TestStructKeywordOnly:
+    def test_keyword_only_object(self, proto):
+        class Test(Struct, kw_only=True):
+            a: int
+            b: int = 2
+            c: int
+            d: int = 4
+
+        sol = Test(a=1, b=2, c=3, d=4)
+        msg = proto.encode({"a": 1, "b": 2, "c": 3, "d": 4})
+        res = proto.decode(msg, type=Test)
+        assert res == sol
+
+        msg = proto.encode({"a": 1, "c": 3})
+        res = proto.decode(msg, type=Test)
+        assert res == sol
+
+        sol = Test(a=1, b=3, c=5)
+        msg = proto.encode({"a": 1, "b": 3, "c": 5})
+        res = proto.decode(msg, type=Test)
+        assert res == sol
+
+        msg = proto.encode({"a": 1, "b": 2})
+        with pytest.raises(
+            ValidationError,
+            match="missing required field `c`",
+        ):
+            proto.decode(msg, type=Test)
+
+        msg = proto.encode({"c": 1, "b": 2})
+        with pytest.raises(
+            ValidationError,
+            match="missing required field `a`",
+        ):
+            proto.decode(msg, type=Test)
+
+    def test_keyword_only_array(self, proto):
+        class Test(Struct, kw_only=True, array_like=True):
+            a: int
+            b: int = 2
+            c: int
+            d: int = 4
+
+        msg = proto.encode([5, 6, 7, 8])
+        res = proto.decode(msg, type=Test)
+        assert res == Test(a=5, b=6, c=7, d=8)
+
+        msg = proto.encode([5, 6, 7])
+        res = proto.decode(msg, type=Test)
+        assert res == Test(a=5, b=6, c=7, d=4)
+
+        msg = proto.encode([5, 6])
+        with pytest.raises(
+            ValidationError,
+            match="Expected `array` of at least length 3, got 2",
+        ):
+            proto.decode(msg, type=Test)
+
+        msg = proto.encode([])
+        with pytest.raises(
+            ValidationError,
+            match="Expected `array` of at least length 3, got 0",
+        ):
+            proto.decode(msg, type=Test)
+
+
+class TestStructDefaults:
+    def test_struct_defaults(self, proto):
+        class Test(Struct):
+            a: int = 1
+            b: list = []  # noqa
+            c: int = rune.field(default=2)
+            d: dict = rune.field(default_factory=dict)
+
+        sol = Test()
+
+        res = proto.decode(proto.encode(sol), type=Test)
+        assert res == sol
+
+        res = proto.decode(proto.encode({}), type=Test)
+        assert res == sol
+
+    def test_struct_default_factory_errors(self, proto):
+        def bad():
+            raise ValueError("Oh no!")
+
+        class Test(Struct):
+            a: int = rune.field(default_factory=bad)
+
+        msg = proto.encode({})
+        with pytest.raises(Exception, match="Oh no!"):
+            proto.decode(msg, type=Test)

@@ -4,12 +4,14 @@ use crate::common::py_typing::{
     abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence, abc_mutable_set,
     abc_sequence, abc_set, compile_regex, is_type, meta_type, object_type,
 };
+use crate::common::raw::Raw;
 use crate::common::reader::kind;
 use crate::common::structures::{
     ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
 };
 use crate::common::types::{ConstraintSetId, NodeId};
 use crate::exceptions::ParseError;
+use crate::msgpack::ext::Ext;
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyStringMethods};
@@ -44,35 +46,38 @@ pub(crate) enum Scalar<'a> {
     Float(f64),
     Str(Cow<'a, str>),
     Bytes(Cow<'a, [u8]>),
+    Ext { code: i8, data: &'a [u8] },
 }
 
 impl Scalar<'_> {
-    #[inline]
-    pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
-        match self {
+    #[inline(always)]
+    pub(crate) fn to_py_checked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match self {
             Scalar::Null => py.None().into_bound(py),
             Scalar::Bool(value) => PyBool::new(py, *value).to_owned().into_any(),
             Scalar::Int(value) => PyInt::new(py, *value).into_any(),
             Scalar::UInt(value) => PyInt::new(py, *value).into_any(),
-            Scalar::BigInt(_) => unreachable!("big integers are converted by to_py_checked"),
+            Scalar::BigInt(digits) => return big_integer(py, digits),
             Scalar::Float(value) => PyFloat::new(py, *value).into_any(),
             Scalar::Str(value) => PyString::new(py, value).into_any(),
             Scalar::Bytes(value) => PyBytes::new(py, value).into_any(),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn to_py_checked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        match self {
-            Scalar::BigInt(digits) => big_integer(py, digits),
-            scalar => Ok(scalar.to_py(py)),
-        }
+            Scalar::Ext { code, data } => return extension(py, *code, data),
+        })
     }
 }
 
 #[cold]
 pub(crate) fn big_integer<'py>(py: Python<'py>, digits: &str) -> PyResult<Bound<'py, PyAny>> {
     py.get_type::<PyInt>().call1((digits,))
+}
+
+#[cold]
+pub(crate) fn extension<'py>(
+    py: Python<'py>,
+    code: i8,
+    data: &[u8],
+) -> PyResult<Bound<'py, PyAny>> {
+    Ext::create(py, code, data)
 }
 
 pub(crate) enum Value<'a> {
@@ -124,9 +129,11 @@ pub(crate) enum Shape {
     TimeDelta,
     Uuid,
     Bytes(BytesType),
+    Raw,
+    Ext,
     Constrained {
         inner: NodeId,
-        accepted_kinds: u8,
+        accepted_kinds: u16,
         constraints: ConstraintSetId,
     },
 }
@@ -160,9 +167,10 @@ impl Shape {
         }
     }
 
-    pub(crate) fn accepted_kinds(&self, lax: bool) -> u8 {
+    pub(crate) fn accepted_kinds(&self, lax: bool) -> u16 {
         match self {
-            Self::Any | Self::Custom(_) | Self::Union(_) => kind::ANY,
+            Self::Any | Self::Custom(_) | Self::Union(_) | Self::Raw => kind::ANY,
+            Self::Ext => kind::EXT,
             Self::Primitive(primitive) => primitive.accepted_kinds(lax),
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
@@ -255,7 +263,7 @@ impl Primitive {
         }
     }
 
-    pub(crate) fn exact_kinds(self) -> u8 {
+    pub(crate) fn exact_kinds(self) -> u16 {
         match self {
             Self::None => kind::NULL,
             Self::Bool => kind::BOOL,
@@ -265,7 +273,7 @@ impl Primitive {
         }
     }
 
-    fn accepted_kinds(self, lax: bool) -> u8 {
+    fn accepted_kinds(self, lax: bool) -> u16 {
         let lax_kinds = match self {
             Self::None if lax => kind::STR,
             Self::Bool if lax => kind::INT | kind::STR,
@@ -517,6 +525,8 @@ pub(crate) enum Kind {
     Enum,
     Uncommon,
     Struct(Rc<StructLayout>),
+    Raw,
+    Ext,
     Unknown,
 }
 
@@ -540,6 +550,12 @@ impl Kind {
             PyBool => Bool, PyDict => Dict, PyList => List, PyTuple => Tuple, PySet => Set,
             PyFrozenSet => FrozenSet, PyString => Str, PyInt => Int, PyFloat => Float,
         );
+        if obj.is_exact_instance_of::<Raw>() {
+            return Some(Self::Raw);
+        }
+        if obj.is_exact_instance_of::<Ext>() {
+            return Some(Self::Ext);
+        }
         None
     }
 

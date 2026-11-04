@@ -11,6 +11,7 @@ use crate::common::py_typing::{
 };
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
+use crate::msgpack::ext::ext_type;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
 use pyo3::prelude::{PyAnyMethods, PySetMethods};
 use pyo3::types::{
@@ -309,6 +310,8 @@ fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
         kind
     } else if is_plain_or_typeddict(ty)? {
         Dict
+    } else if ty.is(ext_type(ty.py())) {
+        Other
     } else {
         Custom
     })

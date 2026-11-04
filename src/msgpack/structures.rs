@@ -62,6 +62,23 @@ impl<'a> Parser<'a> {
             0xc2 => Ok(Scalar::Bool(false)),
             0xc3 => Ok(Scalar::Bool(true)),
             0xc4..=0xc6 => Ok(Scalar::Bytes(Cow::Borrowed(self.read_binary(tag)?))),
+            0xc7 => {
+                let len = usize::from(self.read_u8()?);
+                self.read_extension(len)
+            }
+            0xc8 => {
+                let len = usize::from(self.read_u16()?);
+                self.read_extension(len)
+            }
+            0xc9 => {
+                let len = self.read_u32()? as usize;
+                self.read_extension(len)
+            }
+            0xd4 => self.read_extension(1),
+            0xd5 => self.read_extension(2),
+            0xd6 => self.read_extension(4),
+            0xd7 => self.read_extension(8),
+            0xd8 => self.read_extension(16),
             0xca => Ok(Scalar::Float(self.read_f32()?.into())),
             0xcb => Ok(Scalar::Float(self.read_f64()?)),
             0xcc => Ok(Scalar::Int(self.read_u8()?.into())),
@@ -103,6 +120,12 @@ impl<'a> Parser<'a> {
         self.read_bytes(len)
     }
 
+    fn read_extension(&mut self, len: usize) -> Result<Scalar<'a>, ParseError> {
+        let code = self.read_i8()?;
+        let data = self.read_bytes(len)?;
+        Ok(Scalar::Ext { code, data })
+    }
+
     fn read_container(&mut self, tag: u8) -> Result<Option<Container>, ParseError> {
         Ok(Some(match tag {
             0x80..=0x8f => Container::Map(usize::from(tag & 0x0f)),
@@ -119,12 +142,13 @@ impl<'a> Parser<'a> {
 impl<'a> Reader<'a> for Parser<'a> {
     const BINARY: bool = true;
 
-    fn peek_kind(&mut self) -> Result<u8, ParseError> {
+    fn peek_kind(&mut self) -> Result<u16, ParseError> {
         Ok(match self.peek_bytes(0, 1)?[0] {
             0x00..=0x7f | 0xcc..=0xd3 | 0xe0..=0xff => kind::INT,
             0xc0 => kind::NULL,
             0xc2 | 0xc3 => kind::BOOL,
             0xc4..=0xc6 => kind::BYTES,
+            0xc7..=0xc9 | 0xd4..=0xd8 => kind::EXT,
             0xca | 0xcb => kind::FLOAT,
             0xa0..=0xbf | 0xd9..=0xdb => kind::STR,
             0x90..=0x9f | 0xdc | 0xdd => kind::ARRAY,

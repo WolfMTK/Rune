@@ -45,7 +45,7 @@ pub(crate) fn numeric<'py>(
             .parse::<f64>()
             .ok()
             .map(|value| PyFloat::new(py, value).into_any()),
-        Scalar::Null | Scalar::Bool(_) | Scalar::Bytes(_) => None,
+        Scalar::Null | Scalar::Bool(_) | Scalar::Bytes(_) | Scalar::Ext { .. } => None,
     })
 }
 

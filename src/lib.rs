@@ -18,8 +18,14 @@ mod rune {
     #[pymodule]
     mod msgpack {
         #[pymodule_export]
+        use crate::msgpack::ext::Ext;
+
+        #[pymodule_export]
         use crate::msgpack::{Decoder, Encoder, decode, encode};
     }
+
+    #[pymodule_export]
+    use crate::common::raw::Raw;
 
     #[pymodule_export]
     use crate::exceptions::{DecodeError, ValidationError};

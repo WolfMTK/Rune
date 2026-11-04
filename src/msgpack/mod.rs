@@ -1,6 +1,7 @@
 use crate::common::macros::format_bindings;
 
 mod enums;
+pub(crate) mod ext;
 mod helpers;
 mod reader;
 mod structures;

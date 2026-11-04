@@ -100,6 +100,15 @@ impl Writer for JsonWriter {
         self.out.push(b'"');
     }
 
+    #[inline(never)]
+    fn write_raw(&mut self, data: &[u8]) {
+        if self.needs_separator {
+            self.out.push(b',');
+        }
+        self.needs_separator = true;
+        self.out.extend_from_slice(data);
+    }
+
     fn write_big_integer(&mut self, digits: &str, as_key: bool) {
         self.write_decimal(digits, as_key);
     }
@@ -349,7 +358,7 @@ impl<'a> Parser<'a> {
 impl<'a> Reader<'a> for Parser<'a> {
     const BINARY: bool = false;
 
-    fn peek_kind(&mut self) -> Result<u8, ParseError> {
+    fn peek_kind(&mut self) -> Result<u16, ParseError> {
         self.skip_whitespace();
         match self.peek() {
             Some(b'[') => Ok(kind::ARRAY),
@@ -376,6 +385,10 @@ impl<'a> Reader<'a> for Parser<'a> {
         let start = self.position;
         self.scan_number()?;
         Ok(Some(&self.text[start..self.position]))
+    }
+
+    fn skip_leading_whitespace(&mut self) {
+        self.skip_whitespace();
     }
 
     fn skip_trailing_whitespace(&mut self) {

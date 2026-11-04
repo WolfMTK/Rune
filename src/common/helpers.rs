@@ -333,7 +333,7 @@ pub(crate) fn invalid_enum_value(raw: &Bound<'_, PyAny>) -> PyResult<Fail> {
 
 pub(crate) fn union_mismatch(
     py: Python<'_>,
-    found: u8,
+    found: u16,
     union: &UnionPlan,
     tagged_group: Option<&str>,
 ) -> PyResult<Fail> {

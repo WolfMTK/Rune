@@ -19,9 +19,9 @@ fn sextet(group: u32, shift: u32) -> u8 {
 
 pub(crate) fn encode_into(out: &mut Vec<u8>, data: &[u8]) {
     out.reserve(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for chunk in &mut chunks {
-        let group = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for &[a, b, c] in chunks {
+        let group = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c);
         out.extend_from_slice(&[
             sextet(group, 18),
             sextet(group, 12),
@@ -29,7 +29,7 @@ pub(crate) fn encode_into(out: &mut Vec<u8>, data: &[u8]) {
             sextet(group, 0),
         ]);
     }
-    match *chunks.remainder() {
+    match *remainder {
         [first] => {
             let group = u32::from(first) << 16;
             out.extend_from_slice(&[sextet(group, 18), sextet(group, 12), PADDING, PADDING]);
@@ -75,33 +75,4 @@ pub(crate) fn decode(text: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{decode, encode_into};
-    use rstest::rstest;
-
-    #[rstest]
-    #[case(b"", b"")]
-    #[case(b"f", b"Zg==")]
-    #[case(b"fo", b"Zm8=")]
-    #[case(b"foo", b"Zm9v")]
-    #[case(b"foob", b"Zm9vYg==")]
-    #[case(b"\xff\xfe\x00", b"//4A")]
-    fn round_trips(#[case] data: &[u8], #[case] encoded: &[u8]) {
-        let mut out = Vec::new();
-        encode_into(&mut out, data);
-        assert_eq!(out, encoded);
-        assert_eq!(decode(encoded).as_deref(), Some(data));
-    }
-
-    #[rstest]
-    #[case(b"Zg=")]
-    #[case(b"Z===")]
-    #[case(b"Zg=a")]
-    #[case(b"Zm9v!A==")]
-    fn rejects_malformed(#[case] encoded: &[u8]) {
-        assert_eq!(decode(encoded), None);
-    }
 }

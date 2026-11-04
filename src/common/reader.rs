@@ -40,6 +40,8 @@ pub(crate) mod kind {
 }
 
 pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
+    const BINARY: bool;
+
     fn peek_kind(&mut self) -> Result<u8, ParseError>;
     fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError>;
     fn read_value(&mut self) -> Result<Value<'a>, ParseError>;

@@ -11,10 +11,11 @@ use crate::common::structures::{
 use crate::common::types::{ConstraintSetId, NodeId};
 use crate::exceptions::ParseError;
 use pyo3::basic::CompareOp;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyStringMethods};
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyNone, PySet, PyString, PyTuple,
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
+    PyNone, PySet, PyString, PyTuple,
 };
 use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
 use std::borrow::Cow;
@@ -39,6 +40,7 @@ pub(crate) enum Scalar<'a> {
     Bool(bool),
     Int(i64),
     UInt(u64),
+    BigInt(&'a str),
     Float(f64),
     Str(Cow<'a, str>),
     Bytes(Cow<'a, [u8]>),
@@ -52,11 +54,25 @@ impl Scalar<'_> {
             Scalar::Bool(value) => PyBool::new(py, *value).to_owned().into_any(),
             Scalar::Int(value) => PyInt::new(py, *value).into_any(),
             Scalar::UInt(value) => PyInt::new(py, *value).into_any(),
+            Scalar::BigInt(_) => unreachable!("big integers are converted by to_py_checked"),
             Scalar::Float(value) => PyFloat::new(py, *value).into_any(),
             Scalar::Str(value) => PyString::new(py, value).into_any(),
             Scalar::Bytes(value) => PyBytes::new(py, value).into_any(),
         }
     }
+
+    #[inline]
+    pub(crate) fn to_py_checked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self {
+            Scalar::BigInt(digits) => big_integer(py, digits),
+            scalar => Ok(scalar.to_py(py)),
+        }
+    }
+}
+
+#[cold]
+pub(crate) fn big_integer<'py>(py: Python<'py>, digits: &str) -> PyResult<Bound<'py, PyAny>> {
+    py.get_type::<PyInt>().call1((digits,))
 }
 
 pub(crate) enum Value<'a> {
@@ -88,10 +104,14 @@ pub(crate) enum Shape {
     Union(UnionPlan),
     Array(ArrayPlan),
     AbstractArray(NodeId),
-    Dict(NodeId),
+    Dict {
+        keys: Option<ConstraintSetId>,
+        values: NodeId,
+    },
     AbstractDict(NodeId),
     Frozendict {
         class: Py<PyAny>,
+        keys: Option<ConstraintSetId>,
         values: NodeId,
     },
     Struct(Box<StructPlan>),
@@ -103,6 +123,7 @@ pub(crate) enum Shape {
     DateTime,
     TimeDelta,
     Uuid,
+    Bytes(BytesType),
     Constrained {
         inner: NodeId,
         accepted_kinds: u8,
@@ -120,7 +141,7 @@ impl Shape {
                 .chain(union.tagged.iter().copied())
                 .any(matches),
             Self::Array(array) => array.items.iter().copied().any(matches),
-            Self::Dict(values) | Self::Frozendict { values, .. } => matches(*values),
+            Self::Dict { values, .. } | Self::Frozendict { values, .. } => matches(*values),
             Self::AbstractArray(inner) | Self::AbstractDict(inner) => matches(*inner),
             Self::Struct(plan) => plan.fields.iter().map(|field| field.node).any(matches),
             Self::NamedTuple(plan) => plan.fields.iter().copied().any(matches),
@@ -146,16 +167,54 @@ impl Shape {
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
             Self::Date | Self::Time => kind::STR,
-            Self::Uuid => kind::STR | kind::BYTES,
+            Self::Uuid | Self::Bytes(_) => kind::STR | kind::BYTES,
             Self::DateTime | Self::TimeDelta if lax => kind::NUMBER_OR_STR,
             Self::DateTime | Self::TimeDelta => kind::STR,
             Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
-            Self::Dict(_) | Self::AbstractDict(_) | Self::Frozendict { .. } | Self::Struct(_) => {
-                kind::MAP
-            }
+            Self::Dict { .. }
+            | Self::AbstractDict(_)
+            | Self::Frozendict { .. }
+            | Self::Struct(_) => kind::MAP,
             Self::Constrained { accepted_kinds, .. } => *accepted_kinds,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BytesType {
+    Bytes,
+    ByteArray,
+    MemoryView,
+}
+
+impl BytesType {
+    pub(crate) fn from_type(ty: &Bound<'_, PyAny>) -> Option<Self> {
+        if is_type::<PyBytes>(ty) {
+            Some(Self::Bytes)
+        } else if is_type::<PyByteArray>(ty) {
+            Some(Self::ByteArray)
+        } else if is_type::<PyMemoryView>(ty) {
+            Some(Self::MemoryView)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::ByteArray => "bytearray",
+            Self::MemoryView => "memoryview",
+        }
+    }
+
+    pub(crate) fn create<'py>(self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match self {
+            Self::Bytes => PyBytes::new(py, data).into_any(),
+            Self::ByteArray => PyByteArray::new(py, data).into_any(),
+            Self::MemoryView => PyMemoryView::from(PyBytes::new(py, data).as_any())?.into_any(),
+        })
     }
 }
 
@@ -534,6 +593,18 @@ impl Comparison {
             Self::LessOrEqual => CompareOp::Le,
         }
     }
+
+    fn is_lower_bound(self) -> bool {
+        matches!(self, Self::Greater | Self::GreaterOrEqual)
+    }
+
+    fn inclusive_integer_limit(self, limit: i128) -> (Self, i128) {
+        match self {
+            Self::Greater => (Self::GreaterOrEqual, limit + 1),
+            Self::Less => (Self::LessOrEqual, limit - 1),
+            inclusive => (inclusive, limit),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -541,9 +612,11 @@ pub(crate) enum ConstraintSubject {
     Int,
     Float,
     Str,
+    Bytes,
     Array,
     Object,
     DateTime,
+    Time,
     Other,
 }
 
@@ -554,8 +627,10 @@ impl ConstraintSubject {
             Shape::Primitive(Primitive::Float) => Self::Float,
             Shape::Primitive(Primitive::Str) => Self::Str,
             Shape::Array(_) | Shape::AbstractArray(_) => Self::Array,
-            Shape::Dict(_) | Shape::AbstractDict(_) | Shape::Frozendict { .. } => Self::Object,
+            Shape::Dict { .. } | Shape::AbstractDict(_) | Shape::Frozendict { .. } => Self::Object,
             Shape::DateTime => Self::DateTime,
+            Shape::Time => Self::Time,
+            Shape::Bytes(_) => Self::Bytes,
             _ => Self::Other,
         }
     }
@@ -565,9 +640,11 @@ impl ConstraintSubject {
             Self::Int => "int",
             Self::Float => "float",
             Self::Str => "str",
+            Self::Bytes => "bytes",
             Self::Array => "array",
             Self::Object => "object",
             Self::DateTime => "datetime",
+            Self::Time => "time",
             Self::Other => "value",
         }
     }
@@ -594,45 +671,109 @@ pub(crate) enum Constraint {
 }
 
 impl Constraint {
-    pub(crate) fn from_metadata(metadata: &Bound<'_, PyAny>) -> PyResult<Vec<Self>> {
-        let py = metadata.py();
-        let mut constraints = Vec::new();
-        for item in metadata.try_iter()? {
+    pub(crate) fn from_annotated(annotated: &Bound<'_, PyAny>) -> PyResult<Vec<Self>> {
+        let py = annotated.py();
+        let mut constraints: Vec<Self> = Vec::new();
+        for item in annotated.getattr(intern!(py, "__metadata__"))?.try_iter()? {
             let meta = item?;
             if !meta.is_instance(meta_type(py)?)? {
                 continue;
             }
-            let field = |name: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
-                let value = meta.getattr(name)?;
-                Ok((!value.is_none()).then_some(value))
-            };
-            for comparison in Comparison::ALL {
-                if let Some(limit) = field(comparison.field())? {
-                    constraints.push(Self::Bound(comparison, limit.unbind()));
+            for constraint in Self::from_meta(&meta)? {
+                if let Some(existing) = constraints
+                    .iter()
+                    .find(|existing| existing.conflicts_with(&constraint))
+                {
+                    return Err(existing.conflict_error(&constraint, annotated)?);
                 }
-            }
-            if let Some(factor) = field("multiple_of")? {
-                constraints.push(Self::MultipleOf(factor.unbind()));
-            }
-            if let Some(pattern) = field("pattern")? {
-                constraints.push(Self::Pattern {
-                    source: pattern.repr()?.to_string(),
-                    regex: compile_regex(py)?.call1((pattern,))?.unbind(),
-                });
-            }
-            if let Some(min) = field("min_length")? {
-                constraints.push(Self::MinLength(min.extract()?));
-            }
-            if let Some(max) = field("max_length")? {
-                constraints.push(Self::MaxLength(max.extract()?));
-            }
-            if let Some(aware) = field("tz")? {
-                constraints.push(Self::Timezone {
-                    aware: aware.is_truthy()?,
-                });
+                constraints.push(constraint);
             }
         }
         Ok(constraints)
+    }
+
+    fn from_meta(meta: &Bound<'_, PyAny>) -> PyResult<Vec<Self>> {
+        let py = meta.py();
+        let mut constraints = Vec::new();
+        let field = |name: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+            let value = meta.getattr(name)?;
+            Ok((!value.is_none()).then_some(value))
+        };
+        for comparison in Comparison::ALL {
+            if let Some(limit) = field(comparison.field())? {
+                constraints.push(Self::Bound(comparison, limit.unbind()));
+            }
+        }
+        if let Some(factor) = field("multiple_of")? {
+            constraints.push(Self::MultipleOf(factor.unbind()));
+        }
+        if let Some(pattern) = field("pattern")? {
+            constraints.push(Self::Pattern {
+                source: pattern.repr()?.to_string(),
+                regex: compile_regex(py)?.call1((pattern,))?.unbind(),
+            });
+        }
+        if let Some(min) = field("min_length")? {
+            constraints.push(Self::MinLength(min.extract()?));
+        }
+        if let Some(max) = field("max_length")? {
+            constraints.push(Self::MaxLength(max.extract()?));
+        }
+        if let Some(aware) = field("tz")? {
+            constraints.push(Self::Timezone {
+                aware: aware.is_truthy()?,
+            });
+        }
+        Ok(constraints)
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bound(current, _), Self::Bound(added, _)) => {
+                current.is_lower_bound() == added.is_lower_bound()
+            }
+            _ => self.field() == other.field(),
+        }
+    }
+
+    fn conflict_error(&self, added: &Self, annotated: &Bound<'_, PyAny>) -> PyResult<PyErr> {
+        let reason = if self.field() == added.field() {
+            format!(
+                "Multiple `Meta` annotations setting `{}` found",
+                self.field()
+            )
+        } else {
+            format!("Cannot set both `{}` and `{}`", self.field(), added.field())
+        };
+        Ok(PyTypeError::new_err(format!(
+            "{reason} - type `{}` is not supported",
+            annotated.repr()?
+        )))
+    }
+
+    pub(crate) fn for_subject(self, py: Python<'_>, subject: ConstraintSubject) -> PyResult<Self> {
+        let Self::Bound(comparison, limit) = &self else {
+            return Ok(self);
+        };
+        let limit = limit.bind(py);
+        if subject != ConstraintSubject::Int || !limit.is_instance_of::<PyInt>() {
+            return Ok(self);
+        }
+        let integer_limit = limit
+            .extract::<i128>()
+            .ok()
+            .map(|value| comparison.inclusive_integer_limit(value))
+            .and_then(|(inclusive, value)| Some((inclusive, i64::try_from(value).ok()?)));
+        let Some((inclusive, value)) = integer_limit else {
+            return Err(PyValueError::new_err(format!(
+                "Integer `{}` bounds outside the 64-bit signed integer range are not supported",
+                comparison.field()
+            )));
+        };
+        Ok(Self::Bound(
+            inclusive,
+            PyInt::new(py, value).into_any().unbind(),
+        ))
     }
 
     pub(crate) fn field(&self) -> &'static str {
@@ -650,8 +791,8 @@ impl Constraint {
         match self {
             Self::Bound(..) | Self::MultipleOf(_) => "a numeric type",
             Self::Pattern { .. } => "a str type",
-            Self::MinLength(_) | Self::MaxLength(_) => "a str or collection type",
-            Self::Timezone { .. } => "a datetime type",
+            Self::MinLength(_) | Self::MaxLength(_) => "a str, bytes, or collection type",
+            Self::Timezone { .. } => "a datetime or time type",
         }
     }
 
@@ -660,8 +801,10 @@ impl Constraint {
         match self {
             Self::Bound(..) | Self::MultipleOf(_) => matches!(subject, Int | Float),
             Self::Pattern { .. } => subject == Str,
-            Self::MinLength(_) | Self::MaxLength(_) => matches!(subject, Str | Array | Object),
-            Self::Timezone { .. } => subject == DateTime,
+            Self::MinLength(_) | Self::MaxLength(_) => {
+                matches!(subject, Str | Bytes | Array | Object)
+            }
+            Self::Timezone { .. } => matches!(subject, DateTime | Time),
         }
     }
 
@@ -704,10 +847,10 @@ impl Constraint {
             Self::MinLength(min) => format!("Expected `{subject_name}` of length >= {min}"),
             Self::MaxLength(max) => format!("Expected `{subject_name}` of length <= {max}"),
             Self::Timezone { aware: true } => {
-                "Expected `datetime` with a timezone component".to_owned()
+                format!("Expected `{subject_name}` with a timezone component")
             }
             Self::Timezone { aware: false } => {
-                "Expected `datetime` with no timezone component".to_owned()
+                format!("Expected `{subject_name}` with no timezone component")
             }
         }
     }

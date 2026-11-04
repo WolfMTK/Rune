@@ -5,19 +5,19 @@ from typing import Any, Generic, Literal, TypeVar, overload
 T = TypeVar("T")
 
 def encode(
-        obj: Any,
-        /,
-        *,
-        enc_hook: Callable[[Any], Any] | None = None,
-        order: Literal["deterministic", "sorted"] | None = None,
+    obj: Any,
+    /,
+    *,
+    enc_hook: Callable[[Any], Any] | None = None,
+    order: Literal["deterministic", "sorted"] | None = None,
 ) -> bytes: ...
 def decode(
-        buf: bytes,
-        /,
-        *,
-        type: Any = ...,
-        dec_hook: Callable[[Any, Any], Any] | None = None,
-        strict: bool = True,
+    buf: bytes,
+    /,
+    *,
+    type: Any = ...,
+    dec_hook: Callable[[Any, Any], Any] | None = None,
+    strict: bool = True,
 ) -> Any: ...
 @overload
 def format(buf: str, /, *, indent: int = 2) -> str: ...
@@ -29,21 +29,21 @@ class Decoder(Generic[T]):
 
     @overload
     def __init__(
-            self: Decoder[Any],
-            type: Any = ...,
-            *,
-            dec_hook: Callable[[Any, Any], Any] | None = None,
-            strict: bool = True,
-            float_hook: Callable[[str], Any] | None = None,
+        self: Decoder[Any],
+        type: Any = ...,
+        *,
+        dec_hook: Callable[[Any, Any], Any] | None = None,
+        strict: bool = True,
+        float_hook: Callable[[str], Any] | None = None,
     ) -> None: ...
     @overload
     def __init__(
-            self,
-            type: builtins.type[T] | Any,
-            *,
-            dec_hook: Callable[[Any, Any], Any] | None = None,
-            strict: bool = True,
-            float_hook: Callable[[str], Any] | None = None,
+        self,
+        type: builtins.type[T] | Any,
+        *,
+        dec_hook: Callable[[Any, Any], Any] | None = None,
+        strict: bool = True,
+        float_hook: Callable[[str], Any] | None = None,
     ) -> None: ...
     @property
     def type(self) -> Any: ...
@@ -57,12 +57,12 @@ class Decoder(Generic[T]):
 
 class Encoder:
     def __init__(
-            self,
-            *,
-            enc_hook: Callable[[Any], Any] | None = None,
-            decimal_format: Literal["string", "number"] | Callable[[Any], Any] | None = None,
-            order: Literal["deterministic", "sorted"] | None = None,
-            uuid_format: Literal["canonical", "hex"] | None = None,
+        self,
+        *,
+        enc_hook: Callable[[Any], Any] | None = None,
+        decimal_format: Literal["string", "number"] | Callable[[Any], Any] | None = None,
+        order: Literal["deterministic", "sorted"] | None = None,
+        uuid_format: Literal["canonical", "hex"] | None = None,
     ) -> None: ...
     @property
     def enc_hook(self) -> Callable[[Any], Any] | None: ...

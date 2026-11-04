@@ -19,9 +19,9 @@ fn sextet(group: u32, shift: u32) -> u8 {
 
 pub(crate) fn encode_into(out: &mut Vec<u8>, data: &[u8]) {
     out.reserve(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for chunk in &mut chunks {
-        let group = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for &[a, b, c] in chunks {
+        let group = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c);
         out.extend_from_slice(&[
             sextet(group, 18),
             sextet(group, 12),
@@ -29,7 +29,7 @@ pub(crate) fn encode_into(out: &mut Vec<u8>, data: &[u8]) {
             sextet(group, 0),
         ]);
     }
-    match *chunks.remainder() {
+    match *remainder {
         [first] => {
             let group = u32::from(first) << 16;
             out.extend_from_slice(&[sextet(group, 18), sextet(group, 12), PADDING, PADDING]);

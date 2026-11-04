@@ -1,4 +1,6 @@
+import math
 import re
+import sys
 from functools import partial
 from typing import Any
 
@@ -6,7 +8,28 @@ Number = int | float
 
 _NUMERIC_FIELDS = ("gt", "ge", "lt", "le", "multiple_of")
 _LENGTH_FIELDS = ("min_length", "max_length")
-_FIELDS = (*_NUMERIC_FIELDS, "pattern", *_LENGTH_FIELDS, "tz")
+_NON_NUMERIC_CONSTRAINT_FIELDS = ("pattern", *_LENGTH_FIELDS)
+_FIELDS = (
+    *_NUMERIC_FIELDS,
+    *_NON_NUMERIC_CONSTRAINT_FIELDS,
+    "tz",
+    "title",
+    "description",
+    "examples",
+    "extra_json_schema",
+    "extra",
+)
+_TYPED_FIELDS: dict[str, type] = {
+    "pattern": str,
+    "tz": bool,
+    "title": str,
+    "description": str,
+    "examples": list,
+    "extra_json_schema": dict,
+    "extra": dict,
+}
+_UNHASHABLE_FIELDS = frozenset({"examples", "extra_json_schema", "extra"})
+_SSIZE_MIN, _SSIZE_MAX = -sys.maxsize - 1, sys.maxsize
 
 
 class Meta:
@@ -21,6 +44,11 @@ class Meta:
     min_length: int | None
     max_length: int | None
     tz: bool | None
+    title: str | None
+    description: str | None
+    examples: list[Any] | None
+    extra_json_schema: dict[str, Any] | None
+    extra: dict[str, Any] | None
 
     def __init__(
         self,
@@ -34,37 +62,59 @@ class Meta:
         min_length: int | None = None,
         max_length: int | None = None,
         tz: bool | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        examples: list[Any] | None = None,
+        extra_json_schema: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
-        values = (gt, ge, lt, le, multiple_of, pattern, min_length, max_length, tz)
+        values = (
+            gt,
+            ge,
+            lt,
+            le,
+            multiple_of,
+            pattern,
+            min_length,
+            max_length,
+            tz,
+            title,
+            description,
+            examples,
+            extra_json_schema,
+            extra,
+        )
         for name, value in zip(_FIELDS, values, strict=True):
             object.__setattr__(self, name, value)
         self._validate()
 
     def _validate(self) -> None:
         for name in _NUMERIC_FIELDS:
+            _check_finite_number(name, getattr(self, name))
+        for name in _LENGTH_FIELDS:
+            _check_length(name, getattr(self, name))
+        for name, expected in _TYPED_FIELDS.items():
             value = getattr(self, name)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, Number)):
-                raise TypeError(f"`{name}` must be an int or float, got {type(value).__name__}")
-        if self.gt is not None and self.ge is not None:
-            raise TypeError("Cannot set both `gt` and `ge`")
-        if self.lt is not None and self.le is not None:
-            raise TypeError("Cannot set both `lt` and `le`")
+            if value is not None and not isinstance(value, expected):
+                raise TypeError(
+                    f"`{name}` must be a {expected.__name__}, got {type(value).__name__}"
+                )
         if self.multiple_of is not None and self.multiple_of <= 0:
             raise ValueError("`multiple_of` must be > 0")
         if self.pattern is not None:
-            if not isinstance(self.pattern, str):
-                raise TypeError(f"`pattern` must be a str, got {type(self.pattern).__name__}")
             re.compile(self.pattern)
-        for name in _LENGTH_FIELDS:
-            value = getattr(self, name)
-            if value is None:
-                continue
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"`{name}` must be an int, got {type(value).__name__}")
-            if value < 0:
-                raise ValueError(f"`{name}` must be >= 0")
-        if self.tz is not None and not isinstance(self.tz, bool):
-            raise TypeError(f"`tz` must be a bool, got {type(self.tz).__name__}")
+        if self.gt is not None and self.ge is not None:
+            raise ValueError("Cannot specify both `gt` and `ge`")
+        if self.lt is not None and self.le is not None:
+            raise ValueError("Cannot specify both `lt` and `le`")
+        if self._any_set(_NUMERIC_FIELDS) and self._any_set(_NON_NUMERIC_CONSTRAINT_FIELDS):
+            raise ValueError(
+                "Cannot mix numeric constraints (gt, lt, ge, le, multiple_of) "
+                "with non-numeric constraints (pattern, min_length, max_length)"
+            )
+
+    def _any_set(self, names: tuple[str, ...]) -> bool:
+        return any(getattr(self, name) is not None for name in names)
 
     def _specified_fields(self) -> dict[str, Any]:
         values = ((name, getattr(self, name)) for name in _FIELDS)
@@ -82,11 +132,39 @@ class Meta:
         return self._specified_fields() == other._specified_fields()
 
     def __hash__(self) -> int:
-        return hash(tuple(self._specified_fields().items()))
+        fields = self._specified_fields().items()
+        return hash(tuple(item for item in fields if item[0] not in _UNHASHABLE_FIELDS))
 
     def __repr__(self) -> str:
         fields = ", ".join(f"{name}={value!r}" for name, value in self._specified_fields().items())
-        return f"Meta({fields})"
+        return f"rune.Meta({fields})"
+
+    def __rich_repr__(self) -> list[tuple[str, Any]]:
+        return list(self._specified_fields().items())
 
     def __reduce__(self) -> tuple[Any, ...]:
         return partial(Meta, **self._specified_fields()), ()
+
+
+def _check_finite_number(name: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, Number):
+        raise TypeError(f"`{name}` must be an int or float, got {type(value).__name__}")
+    try:
+        as_float = float(value)
+    except OverflowError:
+        raise ValueError(f"`{name}` is out of range") from None
+    if not math.isfinite(as_float):
+        raise ValueError(f"`{name}` must be finite")
+
+
+def _check_length(name: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"`{name}` must be an int, got {type(value).__name__}")
+    if not _SSIZE_MIN <= value <= _SSIZE_MAX:
+        raise ValueError(f"`{name}` is out of range")
+    if value < 0:
+        raise ValueError(f"`{name}` must be >= 0, got {value}")

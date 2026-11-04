@@ -1,11 +1,12 @@
+use crate::common::base64;
 use crate::common::cache::{
     cached_fields, cached_tag_lookup, enum_cache, literal_cache, plain_field_cache, plain_fields,
 };
 use crate::common::datetime_format;
 use crate::common::enums::{
-    AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor, DecimalFormat,
-    Failure, Insertion, Kind, Order, PathSegment, Primitive, Scalar, Shape, Token, UuidFormat,
-    Value,
+    AbstractContainer, ArrayOutput, BytesType, Constraint, ConstraintSubject, Constructor,
+    DecimalFormat, Failure, Insertion, Kind, Order, PathSegment, Primitive, Scalar, Shape, Token,
+    UuidFormat, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
 use crate::common::helpers::{
@@ -43,7 +44,10 @@ use pyo3::types::PyFrozenSetMethods;
 use pyo3::types::PyListMethods;
 use pyo3::types::PySetMethods;
 use pyo3::types::PyTupleMethods;
-use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyList, PyNone, PySet, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyByteArrayMethods, PyDict, PyFrozenSet, PyList, PyNone, PySet, PyString,
+    PyTuple,
+};
 use pyo3::types::{PyBoolMethods, PyInt};
 use pyo3::types::{
     PyBytes, PyBytesMethods, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyTime,
@@ -388,12 +392,15 @@ impl<'py> Compiler<'py> {
             let item = self.compile(&type_arg_or_any(ty, 0)?)?;
             Shape::Array(ArrayPlan::new(vec![item], true, base))
         } else if frozendict(self.py).is_some_and(|class| base.is(class)) {
+            let (keys, values) = self.dict_entries(ty)?;
             Shape::Frozendict {
                 class: base.clone().unbind(),
-                values: self.compile(&type_arg_or_any(ty, 1)?)?,
+                keys,
+                values,
             }
         } else if is_type::<PyDict>(&base) {
-            Shape::Dict(self.compile(&type_arg_or_any(ty, 1)?)?)
+            let (keys, values) = self.dict_entries(ty)?;
+            Shape::Dict { keys, values }
         } else if is_type::<PyTuple>(&base) {
             self.tuple(ty, base)?
         } else if is_named_tuple_class(&base)? {
@@ -417,6 +424,8 @@ impl<'py> Compiler<'py> {
             Shape::TimeDelta
         } else if base.is(uuid(self.py)?) {
             Shape::Uuid
+        } else if let Some(bytes_type) = BytesType::from_type(&base) {
+            Shape::Bytes(bytes_type)
         } else if is_typeddict_class(&base)? || is_plain_class(&base)? {
             Shape::Struct(Box::new(self.plain_structure(ty, &base)?))
         } else if let Some(container) = AbstractContainer::of(&base)? {
@@ -427,6 +436,35 @@ impl<'py> Compiler<'py> {
             self.annotated(ty, id)?
         } else {
             Shape::Custom(base.unbind())
+        })
+    }
+
+    fn dict_entries(
+        &mut self,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<(Option<ConstraintSetId>, NodeId)> {
+        let mut args = type_args(ty)?.into_iter();
+        let key = args.next();
+        let values = match args.next() {
+            Some(values) => self.compile(&values)?,
+            None => self.compile(any(self.py)?)?,
+        };
+        let keys = match key {
+            Some(key) if !key.is_instance_of::<PyType>() => self.key_constraints(&key)?,
+            _ => None,
+        };
+        Ok((keys, values))
+    }
+
+    fn key_constraints(&mut self, key: &Bound<'py, PyAny>) -> PyResult<Option<ConstraintSetId>> {
+        let key_id = self.compile(key)?;
+        Ok(match &self.nodes[key_id].shape {
+            Shape::Constrained { constraints, .. }
+                if self.constraint_subject(key_id) == ConstraintSubject::Str =>
+            {
+                Some(*constraints)
+            }
+            _ => None,
         })
     }
 
@@ -473,8 +511,7 @@ impl<'py> Compiler<'py> {
 
     fn annotated(&mut self, ty: &Bound<'py, PyAny>, id: NodeId) -> PyResult<Shape> {
         let inner = ty.getattr(intern!(self.py, "__origin__"))?;
-        let constraints =
-            Constraint::from_metadata(&ty.getattr(intern!(self.py, "__metadata__"))?)?;
+        let constraints = Constraint::from_annotated(ty)?;
         if constraints.is_empty() {
             return self.classify_as(inner, id);
         }
@@ -491,6 +528,10 @@ impl<'py> Compiler<'py> {
                 ty.repr()?
             )));
         }
+        let constraints = constraints
+            .into_iter()
+            .map(|constraint| constraint.for_subject(self.py, subject))
+            .collect::<PyResult<Vec<_>>>()?;
         let accepted_kinds = self.nodes[inner_id].accepted_kinds;
         self.constraint_sets.push(ConstraintSet {
             subject,
@@ -1591,7 +1632,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         if let Some(&id) = group.tag_index.and_then(|tags| tags.get(&scalar)) {
             return Ok(id);
         }
-        let tag = scalar.to_py(py);
+        let tag = scalar.to_py_checked(py)?;
         let member = match (group.lookup, &first.tag) {
             (Some(lookup), _) => lookup.get_item(&tag)?.and_then(|class| {
                 let is_class = |&member: &NodeId| self.plan.node(member).ty.bind(py).is(&class);
@@ -1654,10 +1695,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Union(union) => self.decode_union(union),
             Shape::Array(array) => self.decode_array(array, user_code_inside),
             Shape::AbstractArray(inner) => self.decode_abstract(*inner, kind::ARRAY, "array"),
-            Shape::Dict(values) => self.decode_dict(*values),
-            Shape::Frozendict { class, values } => {
-                self.decode_frozendict(class.bind(self.py), *values)
-            }
+            Shape::Dict { keys, values } => self.decode_dict(*keys, *values),
+            Shape::Frozendict {
+                class,
+                keys,
+                values,
+            } => self.decode_frozendict(class.bind(self.py), *keys, *values),
             Shape::AbstractDict(inner) => self.decode_abstract(*inner, kind::MAP, "object"),
             Shape::Struct(_) => self.decode_struct(id),
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
@@ -1668,6 +1711,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::DateTime => self.decode_datetime(node.accepted_kinds),
             Shape::TimeDelta => self.decode_timedelta(node.accepted_kinds),
             Shape::Uuid => self.decode_uuid(),
+            Shape::Bytes(output) => self.decode_bytes(*output),
             Shape::Constrained {
                 inner, constraints, ..
             } => self.decode_constrained(*inner, *constraints),
@@ -1698,7 +1742,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 });
             }
             Scalar::Float(value) => PyFloat::new(py, value).str()?.into_any(),
-            scalar => scalar.to_py(py),
+            scalar => scalar.to_py_checked(py)?,
         };
         Ok(decimal.call1((argument,))?)
     }
@@ -1841,6 +1885,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         parse(&text).ok_or_else(|| Fail::invalid(invalid_message.to_owned()))
     }
 
+    fn decode_bytes(&mut self, output: BytesType) -> Decoded<'py> {
+        let wire_kind = if W::BINARY { kind::BYTES } else { kind::STR };
+        self.expect_kind(wire_kind, output.name(), kind::name)?;
+        let data = match self.wire.read_scalar()? {
+            Scalar::Bytes(data) => data,
+            Scalar::Str(text) => base64::decode(text.as_bytes())
+                .map(Cow::Owned)
+                .ok_or_else(|| Fail::invalid("Invalid base64 encoded string".to_owned()))?,
+            _ => unreachable!("kind is checked as bytes or str above"),
+        };
+        Ok(output.create(self.py, &data)?)
+    }
+
     fn decode_constrained(&mut self, inner: NodeId, constraints: ConstraintSetId) -> Decoded<'py> {
         let value = self.decode_node(inner)?;
         self.plan.constraint_set(constraints).check(&value)?;
@@ -1895,7 +1952,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     #[inline(always)]
     fn decode_any(&mut self) -> Decoded<'py> {
         match self.wire.read_value()? {
-            Value::Scalar(scalar) => Ok(scalar.to_py(self.py)),
+            Value::Scalar(scalar) => Ok(scalar.to_py_checked(self.py)?),
             Value::Array(len) => self.decode_untyped_array(len),
             Value::Map(len) => self.decode_untyped_map(len),
         }
@@ -2035,7 +2092,11 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             (Primitive::Float, Scalar::Int(number)) => {
                 Ok(PyFloat::new(self.py, number as f64).into_any())
             }
-            (_, scalar) => Ok(scalar.to_py(self.py)),
+            (Primitive::Float, Scalar::UInt(number)) => {
+                Ok(PyFloat::new(self.py, number as f64).into_any())
+            }
+            (Primitive::Float, Scalar::BigInt(digits)) => Ok(big_integer_as_float(self.py, digits)),
+            (_, scalar) => Ok(scalar.to_py_checked(self.py)?),
         }
     }
 
@@ -2109,7 +2170,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 }
                 lax::integer(py, text)?
             }
-            _ => scalar.to_py(py),
+            _ => scalar.to_py_checked(py)?,
         };
         let member = match members.by_value.bind(py).get_item(&raw)? {
             Some(member) => Ok(member),
@@ -2230,7 +2291,10 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         })
     }
 
-    fn decode_dict(&mut self, values: NodeId) -> Decoded<'py> {
+    fn decode_dict(&mut self, keys: Option<ConstraintSetId>, values: NodeId) -> Decoded<'py> {
+        if let Some(keys) = keys {
+            return self.decode_dict_with_checked_keys(keys, values);
+        }
         self.expect_kind(kind::MAP, "dict", kind::name)?;
         let len = self.wire.enter_map()?;
         self.decode_entries(len, |this, key| {
@@ -2239,9 +2303,36 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         })
     }
 
-    fn decode_frozendict(&mut self, class: &Bound<'py, PyAny>, values: NodeId) -> Decoded<'py> {
+    #[inline(never)]
+    fn decode_dict_with_checked_keys(
+        &mut self,
+        keys: ConstraintSetId,
+        values: NodeId,
+    ) -> Decoded<'py> {
+        self.expect_kind(kind::MAP, "dict", kind::name)?;
+        let len = self.wire.enter_map()?;
+        let plan = self.plan;
+        let dict = PyDict::new(self.py);
+        self.each_entry(len, 0, |this, key, _| {
+            let key_object = this.keys.get(this.py, &key);
+            plan.constraint_set(keys).check(&key_object)?;
+            let value = this
+                .decode_node(values)
+                .map_err(|fail| fail.at(PathSegment::Key(key.to_string())))?;
+            Ok(dict.set_item(key_object, value)?)
+        })?;
+        self.wire.leave();
+        Ok(dict.into_any())
+    }
+
+    fn decode_frozendict(
+        &mut self,
+        class: &Bound<'py, PyAny>,
+        keys: Option<ConstraintSetId>,
+        values: NodeId,
+    ) -> Decoded<'py> {
         self.expect_kind(kind::MAP, "object", kind::container_name)?;
-        let dict = self.decode_dict(values)?;
+        let dict = self.decode_dict(keys, values)?;
         Ok(class.call1((dict,))?)
     }
 
@@ -2271,6 +2362,14 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         }
         Ok(value)
     }
+}
+
+#[cold]
+fn big_integer_as_float<'py>(py: Python<'py>, digits: &str) -> Bound<'py, PyAny> {
+    let value = digits
+        .parse()
+        .expect("integer literals are valid float literals");
+    PyFloat::new(py, value).into_any()
 }
 
 fn overflow_failure(py: Python<'_>, err: PyErr, message: &str) -> Fail {
@@ -2432,7 +2531,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Uncommon
         } else if ty.is_subclass(uuid(ty.py())?)? {
             Kind::Uuid
-        } else if W::BINARY && is_type::<PyBytes>(&ty) {
+        } else if BytesType::from_type(&ty).is_some() {
             Kind::Bytes
         } else {
             Kind::Unknown
@@ -2449,7 +2548,11 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         let token = match kind {
             Kind::Null => Token::Null,
             Kind::Bool => Token::Bool(obj.extract()?),
-            Kind::Int => int_token(obj)?,
+            Kind::Int => match int_token(obj) {
+                Ok(token) => token,
+                Err(_) if W::BIG_INTEGERS => return self.encode_big_integer::<AS_KEY>(obj),
+                Err(err) => return Err(err),
+            },
             Kind::Float => Token::Float(obj.extract()?),
             Kind::Str => Token::Str(obj.cast::<PyString>()?.to_str()?),
             Kind::Enum => {
@@ -2486,6 +2589,18 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(())
     }
 
+    #[cold]
+    fn encode_big_integer<const AS_KEY: bool>(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        let py = obj.py();
+        let digits = py
+            .get_type::<PyInt>()
+            .getattr(intern!(py, "__repr__"))?
+            .call1((obj,))?;
+        self.writer
+            .write_big_integer(digits.cast::<PyString>()?.to_str()?, AS_KEY);
+        Ok(())
+    }
+
     #[inline(never)]
     fn encode_other_key(&mut self, key: &Bound<'py, PyAny>, kind: Kind) -> PyResult<()> {
         match kind {
@@ -2508,8 +2623,21 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     }
 
     fn encode_bytes(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
-        let value = obj.cast::<PyBytes>()?;
-        self.writer.write(Token::Bytes(value.as_bytes()));
+        let Ok(value) = obj.cast::<PyBytes>() else {
+            return self.encode_bytes_like(obj);
+        };
+        self.writer.write_bytes(value.as_bytes());
+        Ok(())
+    }
+
+    #[cold]
+    fn encode_bytes_like(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        if let Ok(value) = obj.cast::<PyByteArray>() {
+            self.writer.write_bytes(&value.to_vec());
+        } else {
+            let value = obj.call_method0(intern!(obj.py(), "tobytes"))?;
+            self.writer.write_bytes(value.cast::<PyBytes>()?.as_bytes());
+        }
         Ok(())
     }
 

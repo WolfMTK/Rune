@@ -38,6 +38,7 @@ pub(crate) fn numeric<'py>(
     Ok(match scalar {
         Scalar::Int(value) => Some(PyInt::new(py, *value).into_any()),
         Scalar::UInt(value) => Some(PyInt::new(py, *value).into_any()),
+        Scalar::BigInt(digits) => Some(integer(py, digits)?),
         Scalar::Float(value) => Some(PyFloat::new(py, *value).into_any()),
         Scalar::Str(text) if is_integer_text(text) => Some(integer(py, text)?),
         Scalar::Str(text) => text

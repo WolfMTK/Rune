@@ -117,6 +117,8 @@ impl<'a> Parser<'a> {
 }
 
 impl<'a> Reader<'a> for Parser<'a> {
+    const BINARY: bool = true;
+
     fn peek_kind(&mut self) -> Result<u8, ParseError> {
         Ok(match self.peek_bytes(0, 1)?[0] {
             0x00..=0x7f | 0xcc..=0xd3 | 0xe0..=0xff => kind::INT,

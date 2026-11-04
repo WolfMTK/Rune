@@ -1,3 +1,4 @@
+use crate::common::base64;
 use crate::common::enums::{Scalar, Token, Value};
 use crate::common::reader::{Reader, kind};
 use crate::common::structures::Cursor;
@@ -47,6 +48,7 @@ impl JsonWriter {
 
 impl Writer for JsonWriter {
     const BINARY: bool = false;
+    const BIG_INTEGERS: bool = true;
 
     fn write(&mut self, token: Token<'_>) {
         if self.needs_separator && !matches!(token, Token::ArrayEnd | Token::MapEnd) {
@@ -85,6 +87,21 @@ impl Writer for JsonWriter {
         } else {
             self.write(Token::Null);
         }
+    }
+
+    #[inline(never)]
+    fn write_bytes(&mut self, data: &[u8]) {
+        if self.needs_separator {
+            self.out.push(b',');
+        }
+        self.needs_separator = true;
+        self.out.push(b'"');
+        base64::encode_into(&mut self.out, data);
+        self.out.push(b'"');
+    }
+
+    fn write_big_integer(&mut self, digits: &str, as_key: bool) {
+        self.write_decimal(digits, as_key);
     }
 
     fn finish(self) -> Vec<u8> {
@@ -182,16 +199,20 @@ impl<'a> Parser<'a> {
                 .map(Scalar::Float)
                 .map_err(|_| self.error("Invalid number"));
         }
-        magnitude
-            .and_then(|magnitude| {
-                if negative {
-                    0i64.checked_sub_unsigned(magnitude)
-                } else {
-                    i64::try_from(magnitude).ok()
-                }
-            })
-            .map(Scalar::Int)
-            .ok_or_else(|| self.error("Integer is out of range"))
+        if let Some(magnitude) = magnitude {
+            let value = if negative {
+                0i64.checked_sub_unsigned(magnitude)
+            } else {
+                i64::try_from(magnitude).ok()
+            };
+            if let Some(value) = value {
+                return Ok(Scalar::Int(value));
+            }
+            if !negative {
+                return Ok(Scalar::UInt(magnitude));
+            }
+        }
+        Ok(Scalar::BigInt(&self.text[start..self.position]))
     }
 
     #[inline(always)]
@@ -326,6 +347,8 @@ impl<'a> Parser<'a> {
     }
 }
 impl<'a> Reader<'a> for Parser<'a> {
+    const BINARY: bool = false;
+
     fn peek_kind(&mut self) -> Result<u8, ParseError> {
         self.skip_whitespace();
         match self.peek() {

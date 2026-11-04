@@ -15,6 +15,7 @@ pub(crate) mod helpers;
 pub(crate) mod lax;
 pub(crate) mod macros;
 pub(crate) mod py_typing;
+pub(crate) mod raw;
 pub(crate) mod reader;
 pub(crate) mod structures;
 pub(crate) mod types;

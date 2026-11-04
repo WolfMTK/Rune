@@ -28,7 +28,18 @@ TypeMapping = dict[Any, Any]
 _MISSING: Any = object()
 _COPIED_DEFAULT_TYPES = frozenset({list, dict, set})
 _I64_MIN, _I64_MAX = -(2**63), 2**63 - 1
-_RENAME_RULES: dict[str, Callable[[str], str]] = {"upper": str.upper, "lower": str.lower}
+
+
+def _camel_case(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest if part)
+
+
+_RENAME_RULES: dict[str, Callable[[str], str]] = {
+    "upper": str.upper,
+    "lower": str.lower,
+    "camel": _camel_case,
+}
 _ARRAY_LIKE_FLAG = 1
 _OMIT_DEFAULTS_FLAG = 2
 _FORBID_UNKNOWN_FIELDS_FLAG = 4
@@ -63,9 +74,28 @@ def field(*, default: Any = _MISSING, default_factory: Any = _MISSING) -> Any:
     return default
 
 
+class _NoDefault:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NODEFAULT"
+
+    def __reduce__(self) -> str:
+        return "NODEFAULT"
+
+
+NODEFAULT: Any = _NoDefault()
+
+
 @dataclass_transform(field_specifiers=(field,))
 class StructMeta(type):
-    pass
+    def __new__(
+        mcls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        root = globals().get("Struct")
+        if root is not None and not any(issubclass(base, root) for base in bases):
+            bases = (*(base for base in bases if base is not object), root)
+        return super().__new__(mcls, name, bases, namespace, **kwargs)
 
 
 class _Lazy:

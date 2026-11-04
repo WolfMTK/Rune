@@ -25,6 +25,7 @@ use crate::common::py_typing::{
     is_union_origin, is_unset_type, new_type_supertype, object_type, resolve_generic_fields,
     resolve_namedtuple_fields, time, timedelta, type_args, type_name, type_origin, unset, uuid,
 };
+use crate::common::raw::{Raw, raw_type};
 use crate::common::reader::{Reader, kind};
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, RuneSet, TagIndex,
@@ -35,6 +36,7 @@ use crate::common::writer::Writer;
 use crate::common::{Format, recursion_limit};
 use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS};
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
+use crate::msgpack::ext::{Ext, ext_type};
 use pyo3::exceptions::{
     PyArithmeticError, PyKeyError, PyOverflowError, PyRecursionError, PyTypeError, PyValueError,
 };
@@ -426,6 +428,8 @@ impl<'py> Compiler<'py> {
             Shape::Uuid
         } else if let Some(bytes_type) = BytesType::from_type(&base) {
             Shape::Bytes(bytes_type)
+        } else if let Some(shape) = native_shape(&base) {
+            shape
         } else if is_typeddict_class(&base)? || is_plain_class(&base)? {
             Shape::Struct(Box::new(self.plain_structure(ty, &base)?))
         } else if let Some(container) = AbstractContainer::of(&base)? {
@@ -781,7 +785,7 @@ impl<'py> Compiler<'py> {
 pub(crate) struct Node {
     pub(crate) ty: Py<PyAny>,
     pub(crate) shape: Shape,
-    pub(crate) accepted_kinds: u8,
+    pub(crate) accepted_kinds: u16,
     pub(crate) calls_user_code: bool,
     pub(crate) children_call_user_code: bool,
 }
@@ -806,8 +810,8 @@ impl LiteralPlan {
         found.map(|value| value.bind(py).clone())
     }
 
-    pub(crate) fn accepted_kinds(&self) -> u8 {
-        let flag = |present: bool, bits: u8| if present { bits } else { 0 };
+    pub(crate) fn accepted_kinds(&self) -> u16 {
+        let flag = |present: bool, bits: u16| if present { bits } else { 0 };
         flag(self.null.is_some(), kind::NULL)
             | flag(self.booleans.iter().any(Option::is_some), kind::BOOL)
             | flag(self.values.has_ints(), kind::INT)
@@ -1212,6 +1216,18 @@ impl Field {
     }
 }
 
+#[inline(never)]
+fn native_shape(base: &Bound<'_, PyAny>) -> Option<Shape> {
+    let py = base.py();
+    if base.is(raw_type(py)) {
+        Some(Shape::Raw)
+    } else if base.is(ext_type(py)) {
+        Some(Shape::Ext)
+    } else {
+        None
+    }
+}
+
 fn accepts_unset(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     if is_unset_type(ty)? {
         return Ok(true);
@@ -1531,7 +1547,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
     fn decode_tagged(
         &mut self,
         group: &TagGroup<'_, 'py>,
-        found: u8,
+        found: u16,
     ) -> Outcome<Option<Bound<'py, PyAny>>> {
         let array_like = self.plan.struct_plan(group.members[0]).array_like;
         match (array_like, found) {
@@ -1712,6 +1728,8 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::TimeDelta => self.decode_timedelta(node.accepted_kinds),
             Shape::Uuid => self.decode_uuid(),
             Shape::Bytes(output) => self.decode_bytes(*output),
+            Shape::Raw => self.decode_raw(),
+            Shape::Ext => self.decode_ext(),
             Shape::Constrained {
                 inner, constraints, ..
             } => self.decode_constrained(*inner, *constraints),
@@ -1719,7 +1737,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     }
 
     #[inline(never)]
-    fn decode_abstract(&mut self, inner: NodeId, accepted: u8, expected: &str) -> Decoded<'py> {
+    fn decode_abstract(&mut self, inner: NodeId, accepted: u16, expected: &str) -> Decoded<'py> {
         self.expect_kind(accepted, expected, kind::container_name)?;
         self.decode_node(inner)
     }
@@ -1775,7 +1793,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         Ok(value.into_any())
     }
 
-    fn decode_timedelta(&mut self, accepted: u8) -> Decoded<'py> {
+    fn decode_timedelta(&mut self, accepted: u16) -> Decoded<'py> {
         let py = self.py;
         self.expect_kind(accepted, "duration", kind::container_name)?;
         let scalar = self.wire.read_scalar()?;
@@ -1801,7 +1819,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         timedelta(py)?.call((), Some(&kwargs))
     }
 
-    fn decode_datetime(&mut self, accepted: u8) -> Decoded<'py> {
+    fn decode_datetime(&mut self, accepted: u16) -> Decoded<'py> {
         let py = self.py;
         self.expect_kind(accepted, "datetime", kind::name)?;
         let scalar = self.wire.read_scalar()?;
@@ -1898,6 +1916,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         Ok(output.create(self.py, &data)?)
     }
 
+    fn decode_raw(&mut self) -> Decoded<'py> {
+        let data = self.wire.read_raw()?;
+        Ok(Raw::create(self.py, data)?)
+    }
+
+    fn decode_ext(&mut self) -> Decoded<'py> {
+        self.expect_kind(kind::EXT, "Ext", kind::name)?;
+        let Scalar::Ext { code, data } = self.wire.read_scalar()? else {
+            unreachable!("kind is checked as ext above")
+        };
+        Ok(Ext::create(self.py, code, data)?)
+    }
+
     fn decode_constrained(&mut self, inner: NodeId, constraints: ConstraintSetId) -> Decoded<'py> {
         let value = self.decode_node(inner)?;
         self.plan.constraint_set(constraints).check(&value)?;
@@ -1910,10 +1941,10 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
 
     fn expect_kind(
         &mut self,
-        accepted: u8,
+        accepted: u16,
         expected: impl ExpectedName,
-        describe: fn(u8) -> &'static str,
-    ) -> Outcome<u8> {
+        describe: fn(u16) -> &'static str,
+    ) -> Outcome<u16> {
         let found = self.wire.peek_kind()?;
         if found & accepted == 0 {
             return Err(Fail::mismatch(&expected.expected_name()?, describe(found)));
@@ -2078,7 +2109,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         )
     }
 
-    fn decode_primitive(&mut self, primitive: Primitive, accepted: u8) -> Decoded<'py> {
+    fn decode_primitive(&mut self, primitive: Primitive, accepted: u16) -> Decoded<'py> {
         let found = self.wire.peek_kind()?;
         if found & accepted == 0 {
             return Err(Fail::mismatch(primitive.name(), kind::name(found)));
@@ -2127,7 +2158,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     fn find_literal(
         &mut self,
         literal: &LiteralPlan,
-        found: u8,
+        found: u16,
     ) -> Outcome<Option<Bound<'py, PyAny>>> {
         if found & kind::LITERAL == 0 {
             return Ok(None);
@@ -2568,6 +2599,8 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             _ if AS_KEY => return self.encode_other_key(obj, kind),
             Kind::Uuid => return self.encode_uuid(obj),
             Kind::Bytes => return self.encode_bytes(obj),
+            Kind::Raw => return self.encode_raw(obj),
+            Kind::Ext => return self.encode_ext(obj),
             Kind::Dict => return self.encode_dict(obj.cast::<PyDict>()?),
             Kind::List => return self.encode_items(obj.cast::<PyList>()?.iter()),
             Kind::Tuple => return self.encode_items(obj.cast::<PyTuple>()?.iter()),
@@ -2638,6 +2671,25 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             let value = obj.call_method0(intern!(obj.py(), "tobytes"))?;
             self.writer.write_bytes(value.cast::<PyBytes>()?.as_bytes());
         }
+        Ok(())
+    }
+
+    fn encode_raw(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        let raw = obj.cast::<Raw>()?;
+        let data = raw.get().data.bind(obj.py());
+        self.writer.write_raw(data.as_bytes());
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn encode_ext(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        if !W::EXTENSIONS {
+            return Err(unsupported_type_error(obj));
+        }
+        let ext = obj.cast::<Ext>()?;
+        let ext = ext.get();
+        let data = ext.data.bind(obj.py());
+        self.writer.write_ext(ext.code, data.as_bytes());
         Ok(())
     }
 

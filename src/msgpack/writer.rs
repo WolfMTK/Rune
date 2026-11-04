@@ -28,6 +28,7 @@ const MAP: LengthMarkers = LengthMarkers {
 
 impl Writer for MsgpackWriter {
     const BINARY: bool = true;
+    const EXTENSIONS: bool = true;
 
     fn write(&mut self, token: Token<'_>) {
         match token {
@@ -48,6 +49,31 @@ impl Writer for MsgpackWriter {
     fn write_decimal(&mut self, text: &str, _as_key: bool) {
         let value = text.parse::<f64>().unwrap_or(f64::NAN);
         self.write_tagged(0xcb, &value.to_be_bytes());
+    }
+
+    fn write_raw(&mut self, data: &[u8]) {
+        self.out.extend_from_slice(data);
+    }
+
+    fn write_ext(&mut self, code: i8, data: &[u8]) {
+        match data.len() {
+            1 => self.out.push(0xd4),
+            2 => self.out.push(0xd5),
+            4 => self.out.push(0xd6),
+            8 => self.out.push(0xd7),
+            16 => self.out.push(0xd8),
+            len => {
+                if let Ok(v) = u8::try_from(len) {
+                    self.write_tagged(0xc7, &[v]);
+                } else if let Ok(v) = u16::try_from(len) {
+                    self.write_tagged(0xc8, &v.to_be_bytes());
+                } else {
+                    self.write_tagged(0xc9, &(len as u32).to_be_bytes());
+                }
+            }
+        }
+        self.out.push(code.cast_unsigned());
+        self.out.extend_from_slice(data);
     }
 
     fn finish(self) -> Vec<u8> {

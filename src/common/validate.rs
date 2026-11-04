@@ -9,6 +9,7 @@ use crate::common::py_typing::{
     is_typevar, is_unset_type, new_type_supertype, origin_or_self, time, timedelta, type_args,
     type_origin, uuid,
 };
+use crate::common::raw::raw_type;
 use crate::common::structures::{StructSettings, Validator};
 use crate::common::types::UnionOption;
 use crate::msgpack::ext::ext_type;
@@ -77,6 +78,9 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
         if !is_type::<PyNone>(&member) && !is_unset_type(&member)? {
             members.push(member);
         }
+    }
+    if members.len() > 1 {
+        members.retain(|member| !member.is(raw_type(member.py())));
     }
     if members.len() < 2 {
         return Ok(());

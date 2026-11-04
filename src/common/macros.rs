@@ -73,11 +73,14 @@ macro_rules! format_bindings {
     ($module:literal, $format:ident, $writer:ty, $($reader:ident)::+) => {
         use pyo3::exceptions::PyValueError;
         use pyo3::prelude::PyAnyMethods;
-        use pyo3::types::{PyByteArray, PyBytes, PySlice, PyType};
+        use pyo3::types::{
+            PyByteArray, PyBytes, PyBytesMethods, PyDict, PyStringMethods, PyTuple, PyType,
+        };
         use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pyfunction, pymethods};
         use $crate::common::enums::{DecimalFormat, Order, UuidFormat};
-        use $crate::common::structures::{DecoderCore, Hook, TypeArgument};
-        use $crate::common::helpers::encode_object;
+        use $crate::common::structures::{DecoderCore, Hook, RequiredArgument, TypeArgument};
+        use $crate::common::helpers::{encode_object, encode_partial, write_into_buffer};
+        use $crate::common::raw::input_bytes;
         use $crate::common::{Format, writer::Writer};
         use $crate::exceptions::ParseError;
 
@@ -93,16 +96,22 @@ macro_rules! format_bindings {
         }
 
         #[pyfunction]
-        #[pyo3(signature = (obj, *, enc_hook = None, order = None))]
+        #[pyo3(
+            signature = (obj = RequiredArgument::Missing, *args, enc_hook = None, order = None, **kwargs),
+            text_signature = "(obj, *, enc_hook=None, order=None)"
+        )]
         pub(crate) fn encode<'py>(
             py: Python<'py>,
-            obj: &Bound<'py, PyAny>,
+            obj: RequiredArgument<'py>,
+            args: &Bound<'py, PyTuple>,
             enc_hook: Option<Bound<'py, PyAny>>,
             order: Option<Bound<'py, PyAny>>,
+            kwargs: Option<&Bound<'py, PyDict>>,
         ) -> PyResult<Bound<'py, PyBytes>> {
+            let obj = obj.only("obj", args, kwargs)?;
             encode_object::<$writer>(
                 py,
-                obj,
+                &obj,
                 &Hook::from_argument(enc_hook, "enc_hook")?,
                 &DecimalFormat::default(),
                 Order::from_argument(order)?,
@@ -171,6 +180,19 @@ macro_rules! format_bindings {
                 )
             }
 
+            fn encode_lines<'py>(
+                &self,
+                py: Python<'py>,
+                items: &Bound<'py, PyAny>,
+            ) -> PyResult<Bound<'py, PyBytes>> {
+                let mut out = Vec::new();
+                for item in items.try_iter()? {
+                    out.extend_from_slice(self.encode(py, &item?)?.as_bytes());
+                    out.push(b'\n');
+                }
+                Ok(PyBytes::new(py, &out))
+            }
+
             #[pyo3(signature = (obj, buffer, offset = 0))]
             fn encode_into<'py>(
                 &self,
@@ -179,33 +201,40 @@ macro_rules! format_bindings {
                 buffer: &Bound<'py, PyByteArray>,
                 offset: isize,
             ) -> PyResult<()> {
-                let start = match offset {
-                    -1 => isize::MAX,
-                    0.. => offset,
-                    _ => return Err(PyValueError::new_err("offset must be >= -1")),
-                };
-                let encoded = encode_object::<$writer>(
+                if offset < -1 {
+                    return Err(PyValueError::new_err("offset must be >= -1"));
+                }
+                let (result, encoded) = encode_partial::<$writer>(
                     py,
                     obj,
                     &self.hook,
                     &self.decimal_format,
                     self.order,
                     self.uuid_format,
-                )?;
-                buffer.set_item(PySlice::new(py, start, isize::MAX, 1), encoded)
+                );
+                write_into_buffer(py, buffer, offset, &encoded)?;
+                result
             }
         }
 
         #[pyfunction]
-        #[pyo3(signature = (buf, *, r#type = TypeArgument::Untyped, dec_hook = None, strict = true))]
+        #[pyo3(
+            signature = (buf = RequiredArgument::Missing, *args, r#type = TypeArgument::Untyped, dec_hook = None, strict = true, **kwargs),
+            text_signature = "(buf, *, type=..., dec_hook=None, strict=True)"
+        )]
         pub(crate) fn decode<'py>(
             py: Python<'py>,
-            buf: &[u8],
+            buf: RequiredArgument<'py>,
+            args: &Bound<'py, PyTuple>,
             r#type: TypeArgument<'py>,
             dec_hook: Option<Bound<'py, PyAny>>,
             strict: bool,
+            kwargs: Option<&Bound<'py, PyDict>>,
         ) -> PyResult<Bound<'py, PyAny>> {
-            DecoderCore::new(r#type, dec_hook, strict)?.decode::<$format>(py, buf)
+            let buf = buf.only("buf", args, kwargs)?;
+            let data = input_bytes(py, &buf, <$format as Format>::accepts_str())?;
+            DecoderCore::new(py, r#type, dec_hook, None, strict)?
+                .decode::<$format>(py, data.as_bytes())
         }
 
         #[pyclass(name = "Decoder", module = $module, frozen)]
@@ -216,15 +245,23 @@ macro_rules! format_bindings {
         #[pymethods]
         impl Decoder {
             #[new]
-            #[pyo3(signature = (r#type = TypeArgument::Untyped, *, dec_hook = None, strict = true))]
+            #[pyo3(signature = (r#type = TypeArgument::Untyped, *, dec_hook = None, strict = true, float_hook = None))]
             fn new(
+                py: Python<'_>,
                 r#type: TypeArgument<'_>,
                 dec_hook: Option<Bound<'_, PyAny>>,
                 strict: bool,
+                float_hook: Option<Bound<'_, PyAny>>,
             ) -> PyResult<Self> {
                 Ok(Self {
-                    core: DecoderCore::new(r#type, dec_hook, strict)?,
+                    core: DecoderCore::new(py, r#type, dec_hook, float_hook, strict)?,
                 })
+            }
+
+            #[getter]
+            #[pyo3(name = "type")]
+            fn type_(&self, py: Python<'_>) -> Py<PyAny> {
+                self.core.ty().clone_ref(py)
             }
 
             #[getter]
@@ -233,8 +270,18 @@ macro_rules! format_bindings {
             }
 
             #[getter]
+            fn float_hook(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+                self.core.float_hook().get(py)
+            }
+
+            #[getter]
             fn strict(&self) -> bool {
                 self.core.strict()
+            }
+
+            fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+                let ty = self.core.ty().bind(py).repr()?;
+                Ok(format!("{}.Decoder({})", $module, ty.to_str()?))
             }
 
             #[classmethod]
@@ -245,8 +292,22 @@ macro_rules! format_bindings {
                 cls.clone()
             }
 
-            fn decode<'py>(&self, py: Python<'py>, buf: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-                self.core.decode::<$format>(py, buf)
+            fn decode<'py>(
+                &self,
+                py: Python<'py>,
+                buf: &Bound<'py, PyAny>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let data = input_bytes(py, buf, <$format as Format>::accepts_str())?;
+                self.core.decode::<$format>(py, data.as_bytes())
+            }
+
+            fn decode_lines<'py>(
+                &self,
+                py: Python<'py>,
+                buf: &Bound<'py, PyAny>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let data = input_bytes(py, buf, <$format as Format>::accepts_str())?;
+                self.core.decode_lines::<$format>(py, data.as_bytes())
             }
         }
     };

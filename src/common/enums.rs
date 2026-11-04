@@ -68,7 +68,7 @@ impl Scalar<'_> {
 
 #[cold]
 pub(crate) fn big_integer<'py>(py: Python<'py>, digits: &str) -> PyResult<Bound<'py, PyAny>> {
-    py.get_type::<PyInt>().call1((digits,))
+    crate::common::lax::big_integer(py, digits)
 }
 
 #[cold]
@@ -88,6 +88,7 @@ pub(crate) enum Value<'a> {
 
 pub(crate) enum PathSegment {
     Key(String),
+    Entry(String),
     Index(usize),
 }
 
@@ -110,13 +111,13 @@ pub(crate) enum Shape {
     Array(ArrayPlan),
     AbstractArray(NodeId),
     Dict {
-        keys: Option<ConstraintSetId>,
+        keys: Option<NodeId>,
         values: NodeId,
     },
     AbstractDict(NodeId),
     Frozendict {
         class: Py<PyAny>,
-        keys: Option<ConstraintSetId>,
+        keys: Option<NodeId>,
         values: NodeId,
     },
     Struct(Box<StructPlan>),

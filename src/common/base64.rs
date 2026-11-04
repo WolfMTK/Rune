@@ -17,11 +17,17 @@ fn sextet(group: u32, shift: u32) -> u8 {
     ALPHABET[((group >> shift) & 0x3f) as usize]
 }
 
+pub(crate) fn encode(data: &[u8]) -> String {
+    let mut out = Vec::new();
+    encode_into(&mut out, data);
+    String::from_utf8(out).expect("base64 output is ASCII")
+}
+
 pub(crate) fn encode_into(out: &mut Vec<u8>, data: &[u8]) {
     out.reserve(data.len().div_ceil(3) * 4);
     let (chunks, remainder) = data.as_chunks::<3>();
-    for &[a, b, c] in chunks {
-        let group = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c);
+    for &[first, second, third] in chunks {
+        let group = u32::from(first) << 16 | u32::from(second) << 8 | u32::from(third);
         out.extend_from_slice(&[
             sextet(group, 18),
             sextet(group, 12),

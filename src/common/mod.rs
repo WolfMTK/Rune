@@ -34,4 +34,8 @@ pub(crate) trait Format {
     type Reader<'a>: Reader<'a>;
 
     fn reader(input: &[u8], max_depth: usize) -> Result<Self::Reader<'_>, ParseError>;
+
+    fn accepts_str() -> bool {
+        !<Self::Reader<'static> as Reader<'static>>::BINARY
+    }
 }

@@ -133,27 +133,39 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn skip_whitespace(&mut self) {
+    pub(super) fn error(&self, message: &str) -> ParseError {
+        ParseError::syntax(&format!("JSON is malformed: {message}"), self.position)
+    }
+
+    pub(super) fn skip_whitespace(&mut self) {
         while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.peek() {
             self.position += 1;
         }
     }
 
-    fn consume(&mut self, expected: u8) -> bool {
+    pub(super) fn consume(&mut self, expected: u8) -> bool {
         let matched = self.peek() == Some(expected);
         self.position += usize::from(matched);
         matched
     }
 
-    fn expect(&mut self, expected: u8, message: &str) -> Result<(), ParseError> {
+    pub(super) fn expect(&mut self, expected: u8, message: &str) -> Result<(), ParseError> {
         if self.consume(expected) {
             Ok(())
+        } else if self.peek().is_none() {
+            Err(self.error("truncated"))
         } else {
             Err(self.error(message))
         }
     }
 
-    fn next_element(&mut self, index: usize, close: u8, message: &str) -> Result<bool, ParseError> {
+    pub(super) fn next_element(
+        &mut self,
+        index: usize,
+        close: u8,
+        message: &str,
+        trailing: &str,
+    ) -> Result<bool, ParseError> {
         self.skip_whitespace();
         match self.peek() {
             Some(byte) if byte == close => {
@@ -162,8 +174,13 @@ impl<'a> Parser<'a> {
             }
             Some(b',') if index > 0 => {
                 self.position += 1;
+                self.skip_whitespace();
+                if self.peek() == Some(close) {
+                    return Err(self.error(trailing));
+                }
                 Ok(true)
             }
+            None if index > 0 => Err(self.error("truncated")),
             _ if index == 0 => Ok(true),
             _ => Err(self.error(message)),
         }
@@ -179,24 +196,35 @@ impl<'a> Parser<'a> {
         matches!(rest.get(sign + digits), Some(b'.' | b'e' | b'E'))
     }
 
-    fn parse_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
+    pub(super) fn parse_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
         match self.peek() {
-            None => Err(self.error("Unexpected end of input")),
+            None => Err(self.error("truncated")),
             Some(b'n') => self.parse_keyword("null", Scalar::Null),
             Some(b't') => self.parse_keyword("true", Scalar::Bool(true)),
             Some(b'f') => self.parse_keyword("false", Scalar::Bool(false)),
             Some(b'"') => self.parse_string().map(Scalar::Str),
             Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            Some(_) => Err(self.error("Invalid character")),
+            Some(_) => Err(self.error("invalid character")),
         }
     }
 
     fn parse_keyword(&mut self, word: &str, value: Scalar<'a>) -> Result<Scalar<'a>, ParseError> {
-        if !self.rest().starts_with(word.as_bytes()) {
-            return Err(self.error("Invalid literal"));
+        let rest = self.rest();
+        if rest.starts_with(word.as_bytes()) {
+            self.position += word.len();
+            return Ok(value);
         }
-        self.position += word.len();
-        Ok(value)
+        let offset = word
+            .bytes()
+            .zip(rest)
+            .position(|(expected, &actual)| expected != actual)
+            .unwrap_or(rest.len());
+        self.position += offset;
+        Err(self.error(if offset < rest.len() {
+            "invalid character"
+        } else {
+            "truncated"
+        }))
     }
 
     fn parse_number(&mut self) -> Result<Scalar<'a>, ParseError> {
@@ -206,7 +234,7 @@ impl<'a> Parser<'a> {
             return self.text[start..self.position]
                 .parse()
                 .map(Scalar::Float)
-                .map_err(|_| self.error("Invalid number"));
+                .map_err(|_| self.error("invalid number"));
         }
         if let Some(magnitude) = magnitude {
             let value = if negative {
@@ -227,10 +255,16 @@ impl<'a> Parser<'a> {
     #[inline(always)]
     fn scan_number(&mut self) -> Result<(bool, Option<u64>, bool), ParseError> {
         let negative = self.consume(b'-');
+        if negative && !matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Err(match self.peek() {
+                None => self.error("truncated"),
+                Some(_) => self.error("invalid character"),
+            });
+        }
         let digits_start = self.position;
         let magnitude = self.parse_digits()?;
         if self.bytes[digits_start] == b'0' && self.position - digits_start > 1 {
-            return Err(self.error("Invalid number"));
+            return Err(self.error("invalid number"));
         }
         let has_fraction = self.consume(b'.');
         if has_fraction {
@@ -254,19 +288,21 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
         if self.position == start {
-            return Err(self.error("Invalid number"));
+            return Err(self.error("invalid number"));
         }
         Ok(value)
     }
 
     fn parse_key(&mut self) -> Result<Cow<'a, str>, ParseError> {
         self.skip_whitespace();
-        if self.peek() != Some(b'"') {
-            return Err(self.error("Expected a string key"));
+        match self.peek() {
+            Some(b'"') => {}
+            None => return Err(self.error("truncated")),
+            Some(_) => return Err(self.error("object keys must be strings")),
         }
         let key = self.parse_string()?;
         self.skip_whitespace();
-        self.expect(b':', "Expected `:`")?;
+        self.expect(b':', "expected ':'")?;
         self.skip_whitespace();
         Ok(key)
     }
@@ -284,7 +320,7 @@ impl<'a> Parser<'a> {
                 out.to_mut().push_str(chunk);
             }
             match self.peek() {
-                None => return Err(self.error("Unterminated string")),
+                None => return Err(self.error("truncated")),
                 Some(b'"') => {
                     self.position += 1;
                     return Ok(out);
@@ -294,14 +330,14 @@ impl<'a> Parser<'a> {
                     let unescaped = self.parse_escape()?;
                     out.to_mut().push(unescaped);
                 }
-                Some(_) => return Err(self.error("Control character in string")),
+                Some(_) => return Err(self.error("invalid character")),
             }
         }
     }
 
     fn parse_escape(&mut self) -> Result<char, ParseError> {
         let Some(byte) = self.peek() else {
-            return Err(self.error("Unterminated string"));
+            return Err(self.error("truncated"));
         };
         self.position += 1;
         Ok(match byte {
@@ -314,7 +350,7 @@ impl<'a> Parser<'a> {
             b'r' => '\r',
             b't' => '\t',
             b'u' => return self.parse_unicode_escape(),
-            _ => return Err(self.error("Invalid escape")),
+            _ => return Err(self.error("invalid escape character in string")),
         })
     }
 
@@ -322,26 +358,30 @@ impl<'a> Parser<'a> {
         let high = self.parse_hex_quad()?;
         let code = match high {
             0xD800..=0xDBFF => self.parse_low_surrogate(high)?,
-            0xDC00..=0xDFFF => return Err(self.error("Lone surrogate")),
+            0xDC00..=0xDFFF => return Err(self.error("invalid utf-16 surrogate pair")),
             _ => high,
         };
-        char::from_u32(code).ok_or_else(|| self.error("Invalid code point"))
+        char::from_u32(code).ok_or_else(|| self.error("invalid utf-16 surrogate pair"))
     }
 
     fn parse_low_surrogate(&mut self, high: u32) -> Result<u32, ParseError> {
-        if !self.rest().starts_with(b"\\u") {
-            return Err(self.error("Lone surrogate"));
+        let rest = self.rest();
+        if rest.is_empty() || rest.first() == Some(&b'"') {
+            return Err(self.error("truncated"));
+        }
+        if !rest.starts_with(b"\\u") {
+            return Err(self.error("unexpected end of escaped utf-16 surrogate pair"));
         }
         self.position += 2;
         let low = self.parse_hex_quad()?;
         if !(0xDC00..=0xDFFF).contains(&low) {
-            return Err(self.error("Invalid surrogate pair"));
+            return Err(self.error("invalid utf-16 surrogate pair"));
         }
         Ok(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
     }
 
     fn parse_hex_quad(&mut self) -> Result<u32, ParseError> {
-        let invalid = || self.error("Invalid \\u escape");
+        let invalid = || self.error("invalid character in unicode escape");
         let value =
             self.rest()
                 .get(..4)
@@ -358,6 +398,10 @@ impl<'a> Parser<'a> {
 impl<'a> Reader<'a> for Parser<'a> {
     const BINARY: bool = false;
 
+    fn error(&self, message: &str) -> ParseError {
+        Parser::error(self, message)
+    }
+
     fn peek_kind(&mut self) -> Result<u16, ParseError> {
         self.skip_whitespace();
         match self.peek() {
@@ -368,8 +412,8 @@ impl<'a> Reader<'a> for Parser<'a> {
             Some(b't' | b'f') => Ok(kind::BOOL),
             Some(b'-' | b'0'..=b'9') if self.number_has_fraction() => Ok(kind::FLOAT),
             Some(b'-' | b'0'..=b'9') => Ok(kind::INT),
-            None => Err(self.error("Unexpected end of input")),
-            Some(_) => Err(self.error("Invalid character")),
+            None => Err(self.error("truncated")),
+            Some(_) => Err(self.error("invalid character")),
         }
     }
 
@@ -415,7 +459,12 @@ impl<'a> Reader<'a> for Parser<'a> {
     }
 
     fn has_next_item(&mut self, _len: Option<usize>, index: usize) -> Result<bool, ParseError> {
-        self.next_element(index, b']', "Expected `,` or `]`")
+        self.next_element(
+            index,
+            b']',
+            "expected ',' or ']'",
+            "trailing comma in array",
+        )
     }
 
     fn next_key(
@@ -423,7 +472,12 @@ impl<'a> Reader<'a> for Parser<'a> {
         _len: Option<usize>,
         index: usize,
     ) -> Result<Option<Cow<'a, str>>, ParseError> {
-        if self.next_element(index, b'}', "Expected `,` or `}`")? {
+        if self.next_element(
+            index,
+            b'}',
+            "expected ',' or '}'",
+            "trailing comma in object",
+        )? {
             self.parse_key().map(Some)
         } else {
             Ok(None)

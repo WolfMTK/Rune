@@ -31,14 +31,24 @@ pub(crate) fn raw_type(py: Python<'_>) -> &Bound<'_, PyType> {
 #[pymethods]
 impl Raw {
     #[new]
-    fn py_new(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let data = match data.cast::<PyString>() {
-            Ok(text) => PyBytes::new(py, text.to_str()?.as_bytes()),
-            Err(_) => buffer_bytes(py, data)?,
+    #[pyo3(signature = (data = None))]
+    fn py_new(py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let data = match data {
+            None => PyBytes::new(py, b""),
+            Some(data) => match data.cast::<PyString>() {
+                Ok(text) => PyBytes::new(py, text.to_str()?.as_bytes()),
+                Err(_) => buffer_bytes(py, data)?,
+            },
         };
         Ok(Self {
             data: data.unbind(),
         })
+    }
+
+    fn copy(&self, py: Python<'_>) -> Self {
+        Self {
+            data: PyBytes::new(py, self.data.bind(py).as_bytes()).unbind(),
+        }
     }
 
     fn __bytes__(&self, py: Python<'_>) -> Py<PyBytes> {
@@ -64,6 +74,17 @@ impl Raw {
     }
 }
 
+pub(crate) fn input_bytes<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    accepts_str: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    if accepts_str && let Ok(text) = data.cast::<PyString>() {
+        return Ok(PyBytes::new(py, text.to_str()?.as_bytes()));
+    }
+    buffer_bytes(py, data)
+}
+
 pub(crate) fn buffer_bytes<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyAny>,
@@ -80,6 +101,6 @@ pub(crate) fn buffer_bytes<'py>(
     }
     Err(PyTypeError::new_err(format!(
         "Expected a bytes-like object, got {}",
-        type_name(data)?
+        type_name(data.get_type().as_any())?
     )))
 }

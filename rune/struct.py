@@ -1,5 +1,6 @@
 import inspect
 import reprlib
+import sys
 from collections.abc import Callable, Iterable
 from typing import (
     TYPE_CHECKING,
@@ -45,6 +46,7 @@ _OMIT_DEFAULTS_FLAG = 2
 _FORBID_UNKNOWN_FIELDS_FLAG = 4
 _KW_ONLY_FLAG = 8
 _RENAMED_FLAG = 16
+_NO_GC_FLAG = 32
 
 
 class _DefaultFactory:
@@ -126,6 +128,7 @@ class Struct(metaclass=StructMeta):
         forbid_unknown_fields: bool | None = None,
         kw_only: bool | None = None,
         rename: str | Callable[[str], str] | None = None,
+        gc: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
@@ -137,6 +140,7 @@ class Struct(metaclass=StructMeta):
         flags = _with_flag(flags, _OMIT_DEFAULTS_FLAG, omit_defaults)
         flags = _with_flag(flags, _FORBID_UNKNOWN_FIELDS_FLAG, forbid_unknown_fields)
         flags = _with_flag(flags, _KW_ONLY_FLAG, kw_only)
+        flags = _with_flag(flags, _NO_GC_FLAG, None if gc is None else not gc)
         if rename is not None:
             cls.__struct_rename__ = _resolve_rename(rename)
             flags |= _RENAMED_FLAG
@@ -240,12 +244,20 @@ def _own_annotations(cls: type) -> dict[str, Any]:
     cached = cls.__dict__.get("__struct_annotations__")
     if cached is not None:
         return cached
-    hints = get_type_hints(cls, include_extras=True)
+    try:
+        hints = get_type_hints(cls, include_extras=True)
+    except NameError:
+        hints = get_type_hints(cls, localns=_self_namespace(cls), include_extras=True)
     annotations = {
         name: hints[name] for name in inspect.get_annotations(cls) if not _is_class_var(hints[name])
     }
     cls.__struct_annotations__ = annotations
     return annotations
+
+
+def _self_namespace(cls: type) -> dict[str, Any]:
+    module = sys.modules.get(cls.__module__)
+    return {cls.__name__: cls, **vars(cls), **getattr(module, "__dict__", {})}
 
 
 def _substitute(tp: Any, mapping: TypeMapping) -> Any:

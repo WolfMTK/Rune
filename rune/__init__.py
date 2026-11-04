@@ -1,6 +1,7 @@
 from rune import rune as rune  # isort: skip
 
 from rune import json, msgpack
+from rune.convert import to_builtins
 from rune.meta import Meta
 from rune.rune import DecodeError, Raw, ValidationError
 from rune.struct import NODEFAULT, Struct, StructMeta, defstruct, field
@@ -20,4 +21,5 @@ __all__ = [
     "field",
     "json",
     "msgpack",
+    "to_builtins",
 ]

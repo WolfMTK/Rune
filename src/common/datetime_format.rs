@@ -47,16 +47,45 @@ pub(crate) struct DateTime {
 }
 
 pub(crate) fn parse_datetime(text: &str) -> Option<DateTime> {
-    if !matches!(text.as_bytes().get(10), Some(b'T' | b't')) {
+    if !matches!(text.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
         return None;
     }
-    Some(DateTime {
-        date: parse_date(text.get(..10)?)?,
-        time: parse_time(text.get(11..)?)?,
-    })
+    let date = parse_date(text.get(..10)?)?;
+    let (time, next_day) = parse_clock(text.get(11..)?)?;
+    let date = if next_day { next_date(date)? } else { date };
+    Some(DateTime { date, time })
 }
 
 pub(crate) fn parse_time(text: &str) -> Option<Time> {
+    parse_clock(text).map(|(time, _)| time)
+}
+
+fn next_date(date: Date) -> Option<Date> {
+    let Date { year, month, day } = date;
+    if day < days_in_month(year, month) {
+        Some(Date {
+            year,
+            month,
+            day: day + 1,
+        })
+    } else if month < 12 {
+        Some(Date {
+            year,
+            month: month + 1,
+            day: 1,
+        })
+    } else if year < 9999 {
+        Some(Date {
+            year: year + 1,
+            month: 1,
+            day: 1,
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_clock(text: &str) -> Option<(Time, bool)> {
     let bytes = text.as_bytes();
     if bytes.len() < 8 || bytes[2] != b':' || bytes[5] != b':' {
         return None;
@@ -72,14 +101,17 @@ pub(crate) fn parse_time(text: &str) -> Option<Time> {
     let micros_of_day = ((u64::from(hour) * 60 + u64::from(minute)) * 60 + u64::from(second))
         * 1_000_000
         + u64::from(fraction_micros(fraction));
-    let micros_of_day = micros_of_day % (24 * 3_600 * 1_000_000);
-    Some(Time {
+    let day_micros = 24 * 3_600 * 1_000_000;
+    let next_day = micros_of_day >= day_micros;
+    let micros_of_day = micros_of_day % day_micros;
+    let time = Time {
         hour: (micros_of_day / 3_600_000_000) as u8,
         minute: ((micros_of_day / 60_000_000) % 60) as u8,
         second: ((micros_of_day / 1_000_000) % 60) as u8,
         microsecond: (micros_of_day % 1_000_000) as u32,
         offset_minutes,
-    })
+    };
+    Some((time, next_day))
 }
 
 pub(crate) fn parse_duration(text: &str) -> Result<i128, DurationError> {

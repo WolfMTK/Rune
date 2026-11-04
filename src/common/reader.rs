@@ -20,7 +20,7 @@ pub(crate) mod kind {
 
     pub(crate) fn name(kind: u16) -> &'static str {
         match kind {
-            NULL => "NoneType",
+            NULL => "null",
             BOOL => "bool",
             INT => "int",
             BYTES => "bytes",
@@ -58,6 +58,10 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
 
     fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         Ok(None)
+    }
+
+    fn error(&self, message: &str) -> ParseError {
+        std::ops::Deref::deref(self).error(message)
     }
 
     fn skip_leading_whitespace(&mut self) {}

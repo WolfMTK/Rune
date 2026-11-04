@@ -1,4 +1,6 @@
 use crate::common::enums::{Primitive, Scalar};
+use crate::exceptions::ValidationError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{PyBool, PyFloat, PyInt};
 use pyo3::{Bound, PyAny, PyResult, Python};
@@ -52,13 +54,32 @@ pub(crate) fn numeric<'py>(
 pub(crate) fn integer<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     match text.parse::<i64>() {
         Ok(value) => Ok(PyInt::new(py, value).into_any()),
-        Err(_) => py.get_type::<PyInt>().call1((text,)),
+        Err(_) => big_integer(py, text),
     }
+}
+
+pub(crate) fn big_integer<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
+    py.get_type::<PyInt>().call1((text,)).map_err(|err| {
+        if err.is_instance_of::<PyValueError>(py) {
+            ValidationError::new_err("Integer value out of range")
+        } else {
+            err
+        }
+    })
 }
 
 pub(crate) fn is_integer_text(text: &str) -> bool {
     let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn is_json_integer_text(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    match digits.as_bytes() {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    }
 }
 
 fn bool_text(text: &str) -> Option<bool> {

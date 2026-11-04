@@ -18,7 +18,10 @@ use pyo3::exceptions::{PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyTypeMethods};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyListMethods;
-use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{
+    PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyList, PySet, PySlice, PyString, PyTuple,
+    PyType,
+};
 use pyo3::{Bound, PyAny, PyErr, PyResult, intern};
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
@@ -130,9 +133,13 @@ pub(crate) fn is_named_tuple_class(candidate: &Bound<'_, PyAny>) -> PyResult<boo
     let Ok(class) = candidate.cast::<PyType>() else {
         return Ok(false);
     };
-    Ok(!class.is(py.get_type::<PyTuple>())
-        && class.is_subclass_of::<PyTuple>()?
-        && candidate.hasattr(intern!(py, "_fields"))?)
+    if class.is(py.get_type::<PyTuple>()) || !class.is_subclass_of::<PyTuple>()? {
+        return Ok(false);
+    }
+    let Some(fields) = candidate.getattr_opt(intern!(py, "_fields"))? else {
+        return Ok(false);
+    };
+    Ok(fields.is_instance_of::<PyTuple>() && candidate.hasattr(intern!(py, "_field_defaults"))?)
 }
 
 pub(crate) fn struct_class<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -234,9 +241,44 @@ pub(crate) fn encode_object<'py, W: Writer>(
     order: Order,
     uuid_format: UuidFormat,
 ) -> PyResult<Bound<'py, PyBytes>> {
+    let (result, encoded) = encode_partial::<W>(py, obj, hook, decimal_format, order, uuid_format);
+    result?;
+    Ok(PyBytes::new(py, &encoded))
+}
+
+pub(crate) fn write_into_buffer<'py>(
+    py: Python<'py>,
+    buffer: &Bound<'py, PyByteArray>,
+    offset: isize,
+    encoded: &[u8],
+) -> PyResult<()> {
+    let len = buffer.len();
+    let start = usize::try_from(offset).unwrap_or(len);
+    if start > len {
+        let padding = PyBytes::new(py, &vec![0; start - len]);
+        buffer.call_method1(intern!(py, "extend"), (padding,))?;
+    }
+    buffer.set_item(
+        PySlice::new(py, start as isize, isize::MAX, 1),
+        PyBytes::new(py, encoded),
+    )
+}
+
+pub(crate) fn encode_partial<'py, W: Writer>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    hook: &Hook,
+    decimal_format: &DecimalFormat,
+    order: Order,
+    uuid_format: UuidFormat,
+) -> (PyResult<()>, Vec<u8>) {
+    let depth_left = match recursion_limit(py) {
+        Ok(limit) => limit,
+        Err(err) => return (Err(err), Vec::new()),
+    };
     let mut encoder = Encoder {
         writer: W::default(),
-        depth_left: recursion_limit(py)?,
+        depth_left,
         hook: hook.bind(py),
         decimal_format,
         order,
@@ -246,8 +288,8 @@ pub(crate) fn encode_object<'py, W: Writer>(
         enum_values: RuneMap::default(),
         pending_fields: Vec::new(),
     };
-    encoder.encode(obj)?;
-    Ok(PyBytes::new(py, &encoder.writer.finish()))
+    let result = encoder.encode(obj);
+    (result, encoder.writer.finish())
 }
 
 pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<Token<'static>> {
@@ -261,15 +303,15 @@ pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<Token<'static>> {
 
 pub(crate) fn unsupported_key_error(key: &Bound<'_, PyAny>) -> PyErr {
     PyTypeError::new_err(format!(
-        "Only str, int, float, bool or None keys are supported, got {}",
-        type_qualname(key)
+        "Only dicts with str-like or number-like keys are supported, got {}",
+        type_name_of(key)
     ))
 }
 
 pub(crate) fn unsupported_type_error(obj: &Bound<'_, PyAny>) -> PyErr {
     PyTypeError::new_err(format!(
         "Encoding objects of type {} is unsupported",
-        type_qualname(obj)
+        type_name_of(obj)
     ))
 }
 
@@ -387,8 +429,8 @@ fn union_member_name(ty: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 }
 
-fn type_qualname(obj: &Bound<'_, PyAny>) -> String {
+fn type_name_of(obj: &Bound<'_, PyAny>) -> String {
     obj.get_type()
-        .qualname()
+        .name()
         .map_or_else(|_| "?".to_owned(), |name| name.to_string())
 }

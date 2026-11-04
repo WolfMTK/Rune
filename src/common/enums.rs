@@ -80,15 +80,6 @@ pub(crate) fn extension<'py>(
     Ext::create(py, code, data)
 }
 
-#[cold]
-pub(crate) fn extension<'py>(
-    py: Python<'py>,
-    code: i8,
-    data: &[u8],
-) -> PyResult<Bound<'py, PyAny>> {
-    Ext::create(py, code, data)
-}
-
 pub(crate) enum Value<'a> {
     Array(Option<usize>),
     Map(Option<usize>),

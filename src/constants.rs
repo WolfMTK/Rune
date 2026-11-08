@@ -12,3 +12,4 @@ pub(crate) const SCIENTIFIC_NOTATION_START: f64 = 1e16;
 pub(crate) const EXPONENT_MINUS_FIVE: Range<f64> = 1e-5..1e-4;
 pub(crate) const EXPONENT_MINUS_FIVE_PREFIX: &[u8] = b"0.0000";
 pub(crate) const PATH_PREFIX: &str = " - at `$";
+pub(crate) const KEY_PATH_PREFIX: &str = " - at `key` in `$";

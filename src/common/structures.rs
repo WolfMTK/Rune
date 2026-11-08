@@ -382,7 +382,7 @@ impl Plan {
         &self.nodes[id]
     }
 
-    fn constraint_set(&self, id: ConstraintSetId) -> &ConstraintSet {
+    pub(crate) fn constraint_set(&self, id: ConstraintSetId) -> &ConstraintSet {
         &self.constraint_sets[id]
     }
 
@@ -504,15 +504,16 @@ impl<'py> Compiler<'py> {
             let item = self.compile(&type_arg_or_any(ty, 0)?)?;
             Shape::Array(ArrayPlan::new(vec![item], true, base))
         } else if frozendict(self.py).is_some_and(|class| base.is(class)) {
-            let (keys, values) = self.dict_entries(ty)?;
+            let (keys, key, values) = self.dict_entries(ty)?;
             Shape::Frozendict {
                 class: base.clone().unbind(),
                 keys,
+                key,
                 values,
             }
         } else if is_type::<PyDict>(&base) {
-            let (keys, values) = self.dict_entries(ty)?;
-            Shape::Dict { keys, values }
+            let (keys, key, values) = self.dict_entries(ty)?;
+            Shape::Dict { keys, key, values }
         } else if is_type::<PyTuple>(&base) {
             self.tuple(ty, base)?
         } else if is_named_tuple_class(&base)? {
@@ -553,25 +554,26 @@ impl<'py> Compiler<'py> {
         })
     }
 
-    fn dict_entries(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<(Option<NodeId>, NodeId)> {
+    fn dict_entries(
+        &mut self,
+        ty: &Bound<'py, PyAny>,
+    ) -> PyResult<(Option<NodeId>, NodeId, NodeId)> {
         let mut args = type_args(ty)?.into_iter();
         let key = args.next();
         let values = match args.next() {
             Some(values) => self.compile(&values)?,
             None => self.compile(any(self.py)?)?,
         };
-        let keys = match key {
-            Some(key) => {
-                let key_id = self.compile(&key)?;
-                (!matches!(
-                    self.nodes[key_id].shape,
-                    Shape::Any | Shape::Primitive(Primitive::Str)
-                ))
-                .then_some(key_id)
-            }
-            None => None,
+        let key_id = match key {
+            Some(key) => self.compile(&key)?,
+            None => self.compile(any(self.py)?)?,
         };
-        Ok((keys, values))
+        let keys = (!matches!(
+            self.nodes[key_id].shape,
+            Shape::Any | Shape::Primitive(Primitive::Str)
+        ))
+        .then_some(key_id);
+        Ok((keys, key_id, values))
     }
 
     fn constraint_subject(&self, id: NodeId) -> ConstraintSubject {
@@ -985,7 +987,7 @@ pub(crate) struct EnumPlan {
 }
 
 impl EnumPlan {
-    fn is_int_valued(&self) -> bool {
+    pub(crate) fn is_int_valued(&self) -> bool {
         self.members.has_ints() && !self.members.has_strings()
     }
 
@@ -1113,7 +1115,7 @@ impl StructPlan {
         }
     }
 
-    fn check_unknown_key(&self, key: &str) -> Outcome<()> {
+    pub(crate) fn check_unknown_key(&self, key: &str) -> Outcome<()> {
         let is_tag_key = self.tag.is_some() && key == self.tag_field;
         if self.forbid_unknown_fields && !is_tag_key {
             return Err(Fail::invalid(format!(
@@ -1133,7 +1135,11 @@ impl StructPlan {
         Ok(())
     }
 
-    fn instantiate<'py>(&self, py: Python<'py>, values: FieldValues<'py>) -> Decoded<'py> {
+    pub(crate) fn instantiate<'py>(
+        &self,
+        py: Python<'py>,
+        values: FieldValues<'py>,
+    ) -> Decoded<'py> {
         let target = self.target.bind(py);
         let Constructor::Direct {
             object_new,
@@ -1221,7 +1227,7 @@ pub(crate) struct ConstraintSet {
 }
 
 impl ConstraintSet {
-    fn check(&self, value: &Bound<'_, PyAny>) -> Outcome<()> {
+    pub(crate) fn check(&self, value: &Bound<'_, PyAny>) -> Outcome<()> {
         for constraint in &self.constraints {
             if !constraint.is_satisfied(value)? {
                 return Err(Fail::invalid(
@@ -1266,6 +1272,8 @@ fn plain_field_pairs<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>
 pub(crate) struct Validator {
     visited_records: RuneSet<String>,
     expanding_aliases: Vec<usize>,
+    pending_records: Vec<String>,
+    recursive_references: usize,
 }
 
 impl Validator {
@@ -1304,12 +1312,37 @@ impl Validator {
         ty: &Bound<'py, PyAny>,
         field_pairs: impl FnOnce() -> PyResult<Bound<'py, PyAny>>,
     ) -> PyResult<()> {
-        if !self
-            .visited_records
-            .insert(parametrized_identity(class, ty)?)
-        {
+        let identity = parametrized_identity(class, ty)?;
+        if !self.visited_records.insert(identity.clone()) {
+            if self.pending_records.contains(&identity) {
+                self.recursive_references += 1;
+            }
             return Ok(());
         }
+        let is_nested = !self.pending_records.is_empty();
+        let references_before = self.recursive_references;
+        self.pending_records.push(identity);
+        let visited = self.visit_fields(field_pairs);
+        self.pending_records.pop();
+        match visited {
+            Err(_)
+                if is_nested
+                    && self.recursive_references > references_before
+                    && is_typeddict_class(class)? =>
+            {
+                Err(PyTypeError::new_err(
+                    "TypedDict type is incomplete: a recursively referenced type failed to \
+                     initialize",
+                ))
+            }
+            visited => visited,
+        }
+    }
+
+    fn visit_fields<'py>(
+        &mut self,
+        field_pairs: impl FnOnce() -> PyResult<Bound<'py, PyAny>>,
+    ) -> PyResult<()> {
         for pair in field_pairs()?.try_iter()? {
             self.visit(&pair?.get_item(1)?)?;
         }
@@ -1898,11 +1931,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Union(union) => self.decode_union(union),
             Shape::Array(array) => self.decode_array(array, user_code_inside),
             Shape::AbstractArray(inner) => self.decode_abstract(*inner, kind::ARRAY, "array"),
-            Shape::Dict { keys, values } => self.decode_dict(*keys, *values),
+            Shape::Dict { keys, values, .. } => self.decode_dict(*keys, *values),
             Shape::Frozendict {
                 class,
                 keys,
                 values,
+                ..
             } => self.decode_frozendict(class.bind(self.py), *keys, *values),
             Shape::AbstractDict(inner) => self.decode_abstract(*inner, kind::MAP, "object"),
             Shape::Struct(_) => self.decode_struct(id),
@@ -1959,21 +1993,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         if self.plan.lax
             && let Some(seconds) = lax::numeric(py, &scalar)?
         {
-            return self
-                .timedelta_from_seconds(&seconds)
-                .map_err(|err| overflow_failure(py, err, "Duration is out of range"));
+            return duration_from_seconds(py, &seconds);
         }
         let Scalar::Str(text) = scalar else {
             unreachable!("kind is checked as str above")
         };
         timedelta_from_text(py, &text)
-    }
-
-    fn timedelta_from_seconds(&self, seconds: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let py = self.py;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item(intern!(py, "seconds"), seconds)?;
-        timedelta(py)?.call((), Some(&kwargs))
     }
 
     fn decode_datetime(&mut self, accepted: u16) -> Decoded<'py> {
@@ -1983,27 +2008,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         if self.plan.lax
             && let Some(seconds) = lax::numeric(py, &scalar)?
         {
-            return self.datetime_from_epoch(&seconds);
+            return datetime_from_epoch(py, &seconds);
         }
         let Scalar::Str(text) = scalar else {
             unreachable!("kind is checked as str above")
         };
         datetime_from_text(py, &text)
-    }
-
-    fn datetime_from_epoch(&self, seconds: &Bound<'py, PyAny>) -> Decoded<'py> {
-        let py = self.py;
-        if seconds
-            .cast::<PyFloat>()
-            .is_ok_and(|value| !value.value().is_finite())
-        {
-            return Err(Fail::invalid("Invalid epoch timestamp".to_owned()));
-        }
-        let utc = PyTzInfo::utc(py)?;
-        let epoch = PyDateTime::new(py, 1970, 1, 1, 0, 0, 0, 0, Some(&utc))?;
-        self.timedelta_from_seconds(seconds)
-            .and_then(|offset| epoch.add(offset))
-            .map_err(|err| overflow_failure(py, err, "Epoch timestamp is out of range"))
     }
 
     fn decode_uuid(&mut self) -> Decoded<'py> {
@@ -2660,19 +2670,61 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         base: &Bound<'py, PyAny>,
         raw: Bound<'py, PyAny>,
     ) -> Decoded<'py> {
-        let py = self.py;
-        let value = match &self.hook {
-            Some(hook) => hook
-                .call1((ty, raw))
-                .map_err(|err| Fail::from_hook(py, err))?,
-            None => raw,
-        };
-        if !value.is_instance(base)? {
-            let got = type_name(value.get_type().as_any())?;
-            return Err(Fail::mismatch(&type_name(base)?, &got));
-        }
-        Ok(value)
+        custom_value(self.hook.as_ref(), ty, base, raw)
     }
+}
+
+pub(crate) fn custom_value<'py>(
+    hook: Option<&Bound<'py, PyAny>>,
+    ty: &Bound<'py, PyAny>,
+    base: &Bound<'py, PyAny>,
+    raw: Bound<'py, PyAny>,
+) -> Decoded<'py> {
+    let value = match hook {
+        Some(hook) => hook
+            .call1((ty, raw))
+            .map_err(|err| Fail::from_hook(ty.py(), err))?,
+        None => raw,
+    };
+    if !value.is_instance(base)? {
+        let got = type_name(value.get_type().as_any())?;
+        return Err(Fail::mismatch(&type_name(base)?, &got));
+    }
+    Ok(value)
+}
+
+fn timedelta_from_seconds<'py>(
+    py: Python<'py>,
+    seconds: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(intern!(py, "seconds"), seconds)?;
+    timedelta(py)?.call((), Some(&kwargs))
+}
+
+pub(crate) fn duration_from_seconds<'py>(
+    py: Python<'py>,
+    seconds: &Bound<'py, PyAny>,
+) -> Decoded<'py> {
+    timedelta_from_seconds(py, seconds)
+        .map_err(|err| overflow_failure(py, err, "Duration is out of range"))
+}
+
+pub(crate) fn datetime_from_epoch<'py>(
+    py: Python<'py>,
+    seconds: &Bound<'py, PyAny>,
+) -> Decoded<'py> {
+    if seconds
+        .cast::<PyFloat>()
+        .is_ok_and(|value| !value.value().is_finite())
+    {
+        return Err(Fail::invalid("Invalid epoch timestamp".to_owned()));
+    }
+    let utc = PyTzInfo::utc(py)?;
+    let epoch = PyDateTime::new(py, 1970, 1, 1, 0, 0, 0, 0, Some(&utc))?;
+    timedelta_from_seconds(py, seconds)
+        .and_then(|offset| epoch.add(offset))
+        .map_err(|err| overflow_failure(py, err, "Epoch timestamp is out of range"))
 }
 
 #[cold]
@@ -2684,11 +2736,11 @@ fn big_integer_as_float<'py>(py: Python<'py>, digits: &str) -> Bound<'py, PyAny>
 }
 
 #[cold]
-fn number_out_of_range() -> Fail {
+pub(crate) fn number_out_of_range() -> Fail {
     Fail::invalid("Number out of range".to_owned())
 }
 
-fn overflow_failure(py: Python<'_>, err: PyErr, message: &str) -> Fail {
+pub(crate) fn overflow_failure(py: Python<'_>, err: PyErr, message: &str) -> Fail {
     if err.is_instance_of::<PyOverflowError>(py) || err.is_instance_of::<PyValueError>(py) {
         Fail::invalid(message.to_owned())
     } else {
@@ -2706,7 +2758,7 @@ fn duration_failure(error: datetime_format::DurationError) -> Fail {
     })
 }
 
-fn date_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn date_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     let parsed = datetime_format::parse_date(text)
         .ok_or_else(|| Fail::invalid("Invalid RFC3339 date".to_owned()))?;
     Ok(PyDate::new(py, parsed.year, parsed.month, parsed.day)?.into_any())
@@ -2723,7 +2775,7 @@ fn fixed_timezone<'py>(py: Python<'py>, minutes: i32) -> PyResult<Bound<'py, PyT
     Ok(tzinfo)
 }
 
-fn time_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn time_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     let parsed = datetime_format::parse_time(text)
         .ok_or_else(|| Fail::invalid("Invalid RFC3339 time".to_owned()))?;
     let tzinfo = match parsed.offset_minutes {
@@ -2741,7 +2793,7 @@ fn time_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>
     Ok(value.into_any())
 }
 
-fn datetime_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn datetime_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     let parsed = datetime_format::parse_datetime(text)
         .ok_or_else(|| Fail::invalid("Invalid RFC3339 datetime".to_owned()))?;
     let time = parsed.time;
@@ -2763,13 +2815,13 @@ fn datetime_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, Py
     Ok(value.into_any())
 }
 
-fn timedelta_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn timedelta_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     let total_micros = datetime_format::parse_duration(text).map_err(duration_failure)?;
     let (days, seconds, microseconds) = datetime_format::timedelta_components(total_micros);
     Ok(PyDelta::new(py, days, seconds, microseconds, false)?.into_any())
 }
 
-fn decimal_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn decimal_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     decimal_type(py)?.call1((text,)).map_err(|err| {
         if err.is_instance_of::<PyArithmeticError>(py) {
             Fail::invalid("Invalid decimal string".to_owned())
@@ -2779,18 +2831,21 @@ fn decimal_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyA
     })
 }
 
-fn uuid_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
+pub(crate) fn uuid_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
     let bytes = uuid_format::parse(text).ok_or_else(|| Fail::invalid("Invalid UUID".to_owned()))?;
     Ok(uuid_from_bytes(py, &bytes)?)
 }
 
-fn uuid_from_bytes<'py>(py: Python<'py>, bytes: &[u8; 16]) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn uuid_from_bytes<'py>(
+    py: Python<'py>,
+    bytes: &[u8; 16],
+) -> PyResult<Bound<'py, PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item(intern!(py, "bytes"), PyBytes::new(py, bytes))?;
     uuid(py)?.call((), Some(&kwargs))
 }
 
-fn base64_text(text: &str) -> Outcome<Cow<'static, [u8]>> {
+pub(crate) fn base64_text(text: &str) -> Outcome<Cow<'static, [u8]>> {
     base64::decode(text.as_bytes())
         .map(Cow::Owned)
         .ok_or_else(|| Fail::invalid("Invalid base64 encoded string".to_owned()))

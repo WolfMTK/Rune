@@ -215,11 +215,28 @@ def resolve_namedtuple_fields(tp: Any) -> Fields:
     return tuple((name, _substitute(hint, mapping)) for name, hint in hints.items())
 
 
-def defstruct(name: str, fields: Iterable[str]) -> type[Struct]:
-    names = tuple(fields)
-    if len(set(names)) != len(names):
-        raise TypeError("defstruct() field names must be unique")
-    return StructMeta(name, (Struct,), {"__annotations__": dict.fromkeys(names, Any)})
+FieldSpec = str | tuple[str, Any] | tuple[str, Any, Any]
+
+
+def defstruct(name: str, fields: Iterable[FieldSpec]) -> type[Struct]:
+    annotations: dict[str, Any] = {}
+    namespace: dict[str, Any] = {"__annotations__": annotations}
+    for spec in fields:
+        if isinstance(spec, str):
+            field_name, tp, default = spec, Any, _MISSING
+        elif isinstance(spec, tuple) and len(spec) in (2, 3):
+            field_name, tp, default = (*spec, _MISSING)[:3]
+        else:
+            raise TypeError(
+                "defstruct() fields must be a name, a (name, type) "
+                f"or a (name, type, default) tuple, got {spec!r}"
+            )
+        if field_name in annotations:
+            raise TypeError("defstruct() field names must be unique")
+        annotations[field_name] = tp
+        if default is not _MISSING:
+            namespace[field_name] = default
+    return StructMeta(name, (Struct,), namespace)
 
 
 def _resolve_fields(cls: type) -> Fields:

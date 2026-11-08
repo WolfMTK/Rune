@@ -90,6 +90,8 @@ pub(crate) enum PathSegment {
     Key(String),
     Entry(String),
     Index(usize),
+    DictKey,
+    Ellipsis,
 }
 
 pub(crate) enum Failure {
@@ -112,12 +114,14 @@ pub(crate) enum Shape {
     AbstractArray(NodeId),
     Dict {
         keys: Option<NodeId>,
+        key: NodeId,
         values: NodeId,
     },
     AbstractDict(NodeId),
     Frozendict {
         class: Py<PyAny>,
         keys: Option<NodeId>,
+        key: NodeId,
         values: NodeId,
     },
     Struct(Box<StructPlan>),

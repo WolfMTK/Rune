@@ -11,5 +11,8 @@ format_bindings!(
     "rune.msgpack",
     Msgpack,
     structures::MsgpackWriter,
-    structures::Parser
+    structures::Parser,
+    decode_hooks: [ext_hook],
+    decode_signature: "(buf, *, type=..., dec_hook=None, strict=True, ext_hook=None)",
+    decoder_hooks: [ext_hook],
 );

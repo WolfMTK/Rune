@@ -1,14 +1,14 @@
-use crate::common::raw::buffer_bytes;
-use pyo3::exceptions::PyValueError;
+use pyo3::buffer::PyUntypedBuffer;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBytes, PyType};
+use pyo3::types::{PyBytes, PyDict, PyInt, PyTuple, PyType};
 use pyo3::{Py, PyAny, PyResult, Python};
 
 #[pyclass(module = "rune.msgpack", frozen)]
 pub(crate) struct Ext {
     pub(crate) code: i8,
-    pub(crate) data: Py<PyBytes>,
+    data: Py<PyAny>,
 }
 
 pub(crate) fn ext_type(py: Python<'_>) -> &Bound<'_, PyType> {
@@ -27,23 +27,58 @@ impl Ext {
             py,
             Self {
                 code,
-                data: PyBytes::new(py, data).unbind(),
+                data: PyBytes::new(py, data).into_any().unbind(),
             },
         )?
-        .into_any())
+            .into_any())
     }
+
+    pub(crate) fn bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let data = self.data.bind(py);
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            return Ok(bytes.clone());
+        }
+        Ok(py
+            .get_type::<PyBytes>()
+            .call1((data,))?
+            .cast_into::<PyBytes>()?)
+    }
+}
+
+fn ext_code(code: &Bound<'_, PyAny>) -> PyResult<i8> {
+    if !code.is_instance_of::<PyInt>() {
+        return Err(PyTypeError::new_err("code must be an int"));
+    }
+    code.extract::<i64>()
+        .ok()
+        .and_then(|code| i8::try_from(code).ok())
+        .ok_or_else(|| PyValueError::new_err("code must be an int between -128 and 127"))
 }
 
 #[pymethods]
 impl Ext {
     #[new]
-    fn py_new(py: Python<'_>, code: i64, data: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let code = i8::try_from(code).map_err(|_| {
-            PyValueError::new_err(format!("`code` must be in range -128..=127, got {code}"))
-        })?;
+    #[pyo3(signature = (*args, **kwargs))]
+    fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        if kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
+            return Err(PyTypeError::new_err("Ext takes no keyword arguments"));
+        }
+        if args.len() != 2 {
+            return Err(PyTypeError::new_err(format!(
+                "Ext expected 2 arguments, got {}",
+                args.len()
+            )));
+        }
+        let code = ext_code(&args.get_item(0)?)?;
+        let data = args.get_item(1)?;
+        if !data.is_instance_of::<PyBytes>() {
+            PyUntypedBuffer::get(&data).map_err(|_| {
+                PyTypeError::new_err("data must be a bytes, bytearray, or buffer-like object")
+            })?;
+        }
         Ok(Self {
             code,
-            data: buffer_bytes(py, data)?.unbind(),
+            data: data.unbind(),
         })
     }
 
@@ -53,20 +88,32 @@ impl Ext {
     }
 
     #[getter]
-    fn data(&self, py: Python<'_>) -> Py<PyBytes> {
+    fn data(&self, py: Python<'_>) -> Py<PyAny> {
         self.data.clone_ref(py)
     }
 
-    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> bool {
-        other.cast::<Self>().is_ok_and(|other| {
-            let other = other.get();
-            other.code == self.code
-                && other.data.bind(py).as_bytes() == self.data.bind(py).as_bytes()
-        })
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let ext = slf.get();
+        let arguments = PyTuple::new(
+            py,
+            [
+                ext.code.into_pyobject(py)?.into_any(),
+                ext.data.bind(py).clone(),
+            ],
+        )?;
+        PyTuple::new(py, [slf.get_type().into_any(), arguments.into_any()])
     }
 
-    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
-        (self.code, self.data.bind(py)).into_pyobject(py)?.hash()
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        match other.cast::<Self>() {
+            Ok(other) => {
+                let other = other.get();
+                Ok(other.code == self.code
+                    && other.bytes(py)?.as_bytes() == self.bytes(py)?.as_bytes())
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {

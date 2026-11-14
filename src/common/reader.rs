@@ -2,7 +2,7 @@ use crate::common::enums::{Scalar, Value};
 use crate::common::structures::Cursor;
 use crate::exceptions::ParseError;
 use std::borrow::Cow;
-use std::ops::DerefMut;
+use std::ops::{DerefMut, Range};
 pub(crate) mod kind {
     pub(crate) const NULL: u16 = 1 << 0;
     pub(crate) const BOOL: u16 = 1 << 1;
@@ -27,7 +27,7 @@ pub(crate) mod kind {
             FLOAT => "float",
             STR => "str",
             ARRAY => "list",
-            EXT => "Ext",
+            EXT => "ext",
             _ => "dict",
         }
     }
@@ -41,6 +41,11 @@ pub(crate) mod kind {
     }
 }
 
+pub(crate) enum Key<'a> {
+    Text(Cow<'a, str>),
+    Value(u16),
+}
+
 pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
     const BINARY: bool;
 
@@ -50,11 +55,8 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
     fn open_array(&mut self) -> Result<Option<usize>, ParseError>;
     fn open_map(&mut self) -> Result<Option<usize>, ParseError>;
     fn has_next_item(&mut self, len: Option<usize>, index: usize) -> Result<bool, ParseError>;
-    fn next_key(
-        &mut self,
-        len: Option<usize>,
-        index: usize,
-    ) -> Result<Option<Cow<'a, str>>, ParseError>;
+    fn next_key(&mut self, len: Option<usize>, index: usize)
+                -> Result<Option<Key<'a>>, ParseError>;
 
     fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         Ok(None)
@@ -80,12 +82,11 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
         Ok(len)
     }
 
-    fn read_raw(&mut self) -> Result<&'a [u8], ParseError> {
+    fn read_raw(&mut self) -> Result<Range<usize>, ParseError> {
         self.skip_leading_whitespace();
-        let bytes = self.bytes;
         let start = self.position;
         self.skip_value()?;
-        Ok(&bytes[start..self.position])
+        Ok(start..self.position)
     }
 
     fn skip_value(&mut self) -> Result<(), ParseError> {
@@ -101,7 +102,10 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
             }
             Value::Map(len) => {
                 self.enter()?;
-                while self.next_key(len, index)?.is_some() {
+                while let Some(key) = self.next_key(len, index)? {
+                    if let Key::Value(_) = key {
+                        self.skip_value()?;
+                    }
                     self.skip_value()?;
                     index += 1;
                 }

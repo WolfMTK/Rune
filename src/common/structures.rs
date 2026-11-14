@@ -2,19 +2,22 @@ use crate::common::base64;
 use crate::common::cache::{
     cached_fields, cached_tag_lookup, enum_cache, literal_cache, plain_field_cache, plain_fields,
 };
-use crate::common::datetime_format;
+use crate::common::datetime_format::{
+    self, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND,
+};
 use crate::common::enums::{
     AbstractContainer, ArrayOutput, BytesType, Constraint, ConstraintSubject, Constructor,
     DecimalFormat, Failure, Insertion, Kind, Order, PathSegment, Primitive, Scalar, Shape, Token,
     UuidFormat, Value,
 };
 use crate::common::failure::{LengthRule, with_path};
+use crate::common::helpers::struct_info;
 use crate::common::helpers::{
-    ExpectedName, class_default, class_tag, default_value, enter_type_alias, expand_type_alias,
-    has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_default_factory,
-    is_named_tuple_class, is_single_primitive, is_struct_class, named_tuple_field_pairs,
-    parametrized_identity, plain_default, struct_class, struct_field_pairs, type_arg_or_any,
-    typevar_bound, union_members, union_mismatch, untyped_plan,
+    ExpectedName, class_default, class_tag, enter_type_alias, expand_type_alias,
+    has_custom_missing, has_generated_new, insert_new, invalid_enum_value, is_named_tuple_class,
+    is_single_primitive, is_struct_class, named_tuple_field_pairs, parametrized_identity,
+    plain_default, struct_class, struct_field_pairs, type_arg_or_any, typevar_bound,
+    union_contains_any, union_members, union_mismatch, untyped_plan,
 };
 use crate::common::helpers::{int_token, unsupported_key_error, unsupported_type_error};
 use crate::common::lax;
@@ -26,7 +29,8 @@ use crate::common::py_typing::{
     resolve_namedtuple_fields, time, timedelta, type_args, type_name, type_origin, unset, uuid,
 };
 use crate::common::raw::{Raw, buffer_bytes, raw_type};
-use crate::common::reader::{Reader, kind};
+use crate::common::reader::{Key, Reader, kind};
+use crate::common::r#struct::{self, FieldDefault, StructInfo};
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, RuneSet, TagIndex,
 };
@@ -34,13 +38,12 @@ use crate::common::uuid_format;
 use crate::common::validate::{container_kind, ensure_union_is_unambiguous, validate_type};
 use crate::common::writer::Writer;
 use crate::common::{Format, recursion_limit};
-use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS};
+use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, TIMESTAMP_EXT_CODE};
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
 use crate::msgpack::ext::{Ext, ext_type};
 use pyo3::exceptions::{
     PyArithmeticError, PyKeyError, PyOverflowError, PyRecursionError, PyTypeError, PyValueError,
 };
-use pyo3::ffi;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyFloatMethods;
@@ -58,7 +61,7 @@ use pyo3::types::{
     PyTimeAccess, PyTzInfo,
 };
 use pyo3::types::{PyDictMethods, PyType, PyTypeMethods};
-use pyo3::types::{PyFloat, PyStringMethods};
+use pyo3::types::{PyFloat, PyMemoryView, PySlice, PyStringMethods};
 use pyo3::{Borrowed, Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python, intern};
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -206,46 +209,67 @@ impl<'a, 'py> FromPyObject<'a, 'py> for RequiredArgument<'py> {
 }
 
 impl<'py> RequiredArgument<'py> {
-    pub(crate) fn only(
-        self,
-        name: &str,
-        extra: &Bound<'py, PyTuple>,
-        extra_keywords: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        if !extra.is_empty() {
-            return Err(PyTypeError::new_err("Extra positional arguments provided"));
-        }
-        if extra_keywords.is_some() {
-            return Err(PyTypeError::new_err("Extra keyword arguments provided"));
-        }
+    #[inline]
+    pub(crate) fn require(self, name: &str) -> PyResult<Bound<'py, PyAny>> {
         match self {
             Self::Given(value) => Ok(value),
-            Self::Missing => Err(PyTypeError::new_err(format!(
-                "Missing 1 required argument: '{name}'"
-            ))),
+            Self::Missing => Err(missing_argument(name)),
         }
     }
+}
+
+#[cold]
+fn missing_argument(name: &str) -> PyErr {
+    PyTypeError::new_err(format!("Missing 1 required arguments: '{name}'"))
+}
+
+#[cold]
+fn extra_arguments(positional: bool) -> PyErr {
+    PyTypeError::new_err(if positional {
+        "Extra positional arguments provided"
+    } else {
+        "Extra keyword arguments provided"
+    })
+}
+
+#[inline]
+pub(crate) fn reject_extra_arguments(
+    extra: &Bound<'_, PyTuple>,
+    extra_keywords: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if !extra.is_empty() {
+        return Err(extra_arguments(true));
+    }
+    if extra_keywords.is_some() {
+        return Err(extra_arguments(false));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+pub(crate) struct ExtraHooks {
+    pub(crate) float_hook: Hook,
+    pub(crate) ext_hook: Hook,
 }
 
 pub(crate) struct DecoderCore {
     pub(crate) typed_plan: Option<Plan>,
     pub(crate) hook: Hook,
-    pub(crate) float_hook: Hook,
+    pub(crate) hooks: ExtraHooks,
     pub(crate) strict: bool,
-    ty: Py<PyAny>,
-    element: Option<Py<PyAny>>,
+    ty: Option<Py<PyAny>>,
 }
 impl DecoderCore {
     pub(crate) fn new(
         py: Python<'_>,
         ty: TypeArgument<'_>,
         hook: Option<Bound<'_, PyAny>>,
-        float_hook: Option<Bound<'_, PyAny>>,
+        hooks: ExtraHooks,
         strict: bool,
     ) -> PyResult<Self> {
         let has_hook = hook.as_ref().is_some_and(|hook| !hook.is_none());
-        let (typed_plan, element, ty) = match ty {
-            TypeArgument::Untyped => (None, None, any(py)?.clone().unbind()),
+        let (typed_plan, ty) = match ty {
+            TypeArgument::Untyped => (None, None),
             TypeArgument::Typed(ty) => {
                 let ty = if ty.is_none() {
                     py.get_type::<PyNone>().into_any()
@@ -254,16 +278,15 @@ impl DecoderCore {
                 };
                 validate_type(&ty)?;
                 let plan = Plan::compile(&ty, has_hook, !strict)?;
-                (Some(plan), Some(ty.clone().unbind()), ty.unbind())
+                (Some(plan), Some(ty.unbind()))
             }
         };
         Ok(Self {
             typed_plan,
             hook: Hook::from_argument(hook, "dec_hook")?,
-            float_hook: Hook::from_argument(float_hook, "float_hook")?,
+            hooks,
             strict,
             ty,
-            element,
         })
     }
 
@@ -271,12 +294,15 @@ impl DecoderCore {
         &self.hook
     }
 
-    pub(crate) fn float_hook(&self) -> &Hook {
-        &self.float_hook
+    pub(crate) fn hooks(&self) -> &ExtraHooks {
+        &self.hooks
     }
 
-    pub(crate) fn ty(&self) -> &Py<PyAny> {
-        &self.ty
+    pub(crate) fn ty<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.ty {
+            Some(ty) => Ok(ty.bind(py).clone()),
+            None => Ok(any(py)?.clone()),
+        }
     }
 
     pub(crate) fn strict(&self) -> bool {
@@ -286,28 +312,28 @@ impl DecoderCore {
     pub(crate) fn decode<'py, F: Format>(
         &self,
         py: Python<'py>,
-        input: &[u8],
+        input: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let plan = match &self.typed_plan {
             Some(plan) => plan,
             None => untyped_plan(py)?,
         };
-        decode_with_plan::<F>(py, plan, self, input)
+        decode_with_plan::<F>(py, plan, self, input.as_bytes(), Some(input))
     }
 
     pub(crate) fn decode_lines<'py, F: Format>(
         &self,
         py: Python<'py>,
-        input: &[u8],
+        input: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let joined = join_lines::<F>(input, recursion_limit(py)?)?;
-        match &self.element {
+        let joined = join_lines::<F>(input.as_bytes(), recursion_limit(py)?)?;
+        match &self.ty {
             Some(element) => {
                 let list_type = py.get_type::<PyList>().get_item(element.bind(py))?;
                 let plan = Plan::compile(&list_type, self.hook.get(py).is_some(), !self.strict)?;
-                decode_with_plan::<F>(py, &plan, self, &joined)
+                decode_with_plan::<F>(py, &plan, self, &joined, None)
             }
-            None => decode_with_plan::<F>(py, untyped_plan(py)?, self, &joined),
+            None => decode_with_plan::<F>(py, untyped_plan(py)?, self, &joined, None),
         }
     }
 }
@@ -317,28 +343,23 @@ fn decode_with_plan<'py, F: Format>(
     plan: &Plan,
     core: &DecoderCore,
     input: &[u8],
+    owner: Option<&Bound<'py, PyBytes>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let max_depth = recursion_limit(py)?;
     let ensure_well_formed = || F::reader(input, max_depth)?.skip_value();
-    let prescanned = plan.root_calls_user_code();
+    let prescanned = plan.root_calls_user_code() || core.hooks.ext_hook.is_set();
     if prescanned {
         ensure_well_formed()?;
     }
     let reader = F::reader(input, max_depth)?;
-    Converter::new(
-        py,
-        plan,
-        core.hook.bind(py),
-        core.float_hook.bind(py),
-        reader,
-    )
-    .decode_document()
-    .or_else(|fail| {
-        if !prescanned && !fail.is_syntax() {
-            ensure_well_formed()?;
-        }
-        Err(fail.into_pyerr(py))
-    })
+    Converter::new(py, plan, core, owner, reader)
+        .decode_document()
+        .or_else(|fail| {
+            if !prescanned && !fail.is_syntax() {
+                ensure_well_formed()?;
+            }
+            Err(fail.into_pyerr(py))
+        })
 }
 
 fn join_lines<F: Format>(input: &[u8], max_depth: usize) -> PyResult<Vec<u8>> {
@@ -374,6 +395,15 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
+    fn is_float(&self, mut id: NodeId) -> bool {
+        loop {
+            match &self.node(id).shape {
+                Shape::Constrained { inner, .. } => id = *inner,
+                shape => return matches!(shape, Shape::Primitive(Primitive::Float)),
+            }
+        }
+    }
+
     pub(crate) fn root(&self) -> NodeId {
         self.root
     }
@@ -425,8 +455,8 @@ impl Plan {
                 let node = &self.nodes[id];
                 if !node.children_call_user_code
                     && node
-                        .shape
-                        .any_child(|child| self.nodes[child].calls_user_code)
+                    .shape
+                    .any_child(|child| self.nodes[child].calls_user_code)
                 {
                     let node = &mut self.nodes[id];
                     node.children_call_user_code = true;
@@ -488,6 +518,9 @@ impl<'py> Compiler<'py> {
         let origin = type_origin(ty)?;
         if let Some(origin) = &origin {
             if is_union_origin(origin)? {
+                if union_contains_any(ty)? {
+                    return Ok(Shape::Any);
+                }
                 return Ok(Shape::Union(self.union(ty)?));
             }
             if is_literal_origin(origin)? {
@@ -572,7 +605,7 @@ impl<'py> Compiler<'py> {
             self.nodes[key_id].shape,
             Shape::Any | Shape::Primitive(Primitive::Str)
         ))
-        .then_some(key_id);
+            .then_some(key_id);
         Ok((keys, key_id, values))
     }
 
@@ -662,7 +695,7 @@ impl<'py> Compiler<'py> {
     fn tuple(&mut self, ty: &Bound<'py, PyAny>, base: Bound<'py, PyAny>) -> PyResult<Shape> {
         let mut args = type_args(ty)?;
         let is_variadic = match args.as_slice() {
-            [] if is_type::<PyTuple>(ty) => {
+            [] if is_type::<PyTuple>(ty) || !ty.hasattr(intern!(self.py, "__args__"))? => {
                 args.push(any(self.py)?.clone());
                 true
             }
@@ -694,17 +727,12 @@ impl<'py> Compiler<'py> {
     fn structure(&mut self, member: &TaggedMember<'py>) -> PyResult<StructPlan> {
         let ty = &member.ty;
         let layout = StructLayout::load(ty, &member.class)?;
+        let info = struct_info(&member.class)?;
         let mut fields = Vec::with_capacity(layout.fields.len());
-        for field in layout.fields {
-            let class_value = ty.getattr_opt(field.key.bind(self.py))?;
-            let has_default_factory = match &class_value {
-                Some(value) => is_default_factory(value)?,
-                None => false,
-            };
+        for (field, default) in layout.fields.into_iter().zip(&info.get().field_defaults) {
             fields.push(FieldPlan {
                 node: self.compile(field.ty.bind(self.py))?,
-                is_required: class_value.is_none(),
-                has_default_factory,
+                is_required: default.is_none(),
                 default: None,
                 name: field.name,
                 key: field.key,
@@ -735,19 +763,6 @@ impl<'py> Compiler<'py> {
             None => None,
         };
         let constructor = Constructor::detect(ty, &member.class)?;
-        let untrack = if settings.gc_disabled {
-            Untrack::Always
-        } else if matches!(
-            constructor,
-            Constructor::Direct {
-                post_init: None,
-                ..
-            }
-        ) {
-            Untrack::IfLeaves
-        } else {
-            Untrack::Never
-        };
         Ok(StructPlan {
             target: ty.clone().unbind(),
             slot_by_name,
@@ -759,7 +774,6 @@ impl<'py> Compiler<'py> {
             array_like: settings.array_like,
             forbid_unknown_fields: settings.forbid_unknown_fields,
             constructor,
-            untrack,
             tag_index,
         })
     }
@@ -780,7 +794,6 @@ impl<'py> Compiler<'py> {
                 name: key.to_str()?.into(),
                 key: key.unbind(),
                 is_required,
-                has_default_factory: false,
                 default: (!is_required).then(|| default.unbind()),
             });
         }
@@ -809,7 +822,6 @@ impl<'py> Compiler<'py> {
             array_like: false,
             forbid_unknown_fields: false,
             constructor,
-            untrack: Untrack::Never,
             tag_index: None,
         })
     }
@@ -1032,6 +1044,7 @@ pub(crate) struct ArrayPlan {
     pub(crate) is_variadic: bool,
     pub(crate) container: Py<PyAny>,
     pub(crate) output: ArrayOutput,
+    pub(crate) hashable_items: bool,
 }
 
 impl ArrayPlan {
@@ -1043,11 +1056,13 @@ impl ArrayPlan {
         } else {
             ArrayOutput::Converted
         };
+        let hashable_items = is_type::<PySet>(&container) || is_type::<PyFrozenSet>(&container);
         Self {
             items,
             is_variadic,
             container: container.unbind(),
             output,
+            hashable_items,
         }
     }
 }
@@ -1057,7 +1072,6 @@ pub(crate) struct FieldPlan {
     pub(crate) key: Py<PyString>,
     pub(crate) node: NodeId,
     pub(crate) is_required: bool,
-    pub(crate) has_default_factory: bool,
     pub(crate) default: Option<Py<PyAny>>,
 }
 
@@ -1072,39 +1086,7 @@ pub(crate) struct StructPlan {
     pub(crate) array_like: bool,
     pub(crate) forbid_unknown_fields: bool,
     pub(crate) constructor: Constructor,
-    pub(crate) untrack: Untrack,
     pub(crate) tag_index: Option<TagIndex>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Untrack {
-    Never,
-    IfLeaves,
-    Always,
-}
-
-fn is_gc_leaf(value: &Bound<'_, PyAny>) -> bool {
-    value.is_exact_instance_of::<PyString>()
-        || value.is_exact_instance_of::<PyInt>()
-        || value.is_none()
-        || value.is_exact_instance_of::<PyFloat>()
-        || value.is_exact_instance_of::<PyBool>()
-        || value.is_exact_instance_of::<PyBytes>()
-        || value
-            .cast_exact::<PyTuple>()
-            .is_ok_and(|tuple| tuple.is_empty())
-}
-
-fn untrack_from_gc(object: &Bound<'_, PyAny>) {
-    let pointer = object.as_ptr();
-    // SAFETY: `pointer` belongs to a live `Bound` and the GIL is held for the whole block;
-    // `PyObject_GC_IsTracked` accepts any object and `PyObject_GC_UnTrack` is only reached
-    // for objects the interpreter reports as GC-tracked.
-    unsafe {
-        if ffi::PyObject_GC_IsTracked(pointer) != 0 {
-            ffi::PyObject_GC_UnTrack(pointer.cast());
-        }
-    }
 }
 
 impl StructPlan {
@@ -1140,43 +1122,36 @@ impl StructPlan {
         py: Python<'py>,
         values: FieldValues<'py>,
     ) -> Decoded<'py> {
-        let target = self.target.bind(py);
         let Constructor::Direct {
-            object_new,
+            info,
             class,
             alias,
             post_init,
         } = &self.constructor
         else {
-            let instance = self.instantiate_by_call(py, values)?;
-            if self.untrack == Untrack::Always {
-                untrack_from_gc(&instance);
-            }
-            return Ok(instance);
+            return self.instantiate_by_call(py, values);
         };
-        let instance = object_new.bind(py).call1((class,))?;
-        let mut untrack = self.untrack;
-        for (field, value) in self.fields.iter().zip(values) {
+        let info = info.get();
+        let instance =
+            r#struct::allocate(class.bind(py).cast::<PyType>().map_err(PyErr::from)?)?;
+        for (index, (field, value)) in self.fields.iter().zip(values).enumerate() {
             let value = match value {
                 Some(value) => value,
-                None => default_value(target, field)?,
+                None => info.produce_default(py, index)?.ok_or_else(|| {
+                    PyTypeError::new_err(format!("Missing required field `{}`", field.name))
+                })?,
             };
-            if untrack == Untrack::IfLeaves && !is_gc_leaf(&value) {
-                untrack = Untrack::Never;
-            }
-            instance.setattr(field.key.bind(py), value)?;
+            r#struct::write_slot(&instance, info.offsets[index], value);
         }
         if let Some(alias) = alias {
             let _ = instance.setattr(intern!(py, "__orig_class__"), alias);
         }
+        let instance = r#struct::finish(instance, info, false)?;
         if let Some(post_init) = post_init {
             post_init
                 .bind(py)
                 .call1((&instance,))
                 .map_err(|err| Fail::from_hook(py, err))?;
-        }
-        if untrack != Untrack::Never {
-            untrack_from_gc(&instance);
         }
         Ok(instance)
     }
@@ -1326,15 +1301,15 @@ impl Validator {
         self.pending_records.pop();
         match visited {
             Err(_)
-                if is_nested
-                    && self.recursive_references > references_before
-                    && is_typeddict_class(class)? =>
-            {
-                Err(PyTypeError::new_err(
-                    "TypedDict type is incomplete: a recursively referenced type failed to \
+            if is_nested
+                && self.recursive_references > references_before
+                && is_typeddict_class(class)? =>
+                {
+                    Err(PyTypeError::new_err(
+                        "TypedDict type is incomplete: a recursively referenced type failed to \
                      initialize",
-                ))
-            }
+                    ))
+                }
             visited => visited,
         }
     }
@@ -1463,12 +1438,6 @@ fn accepts_unset(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     }
 }
 
-const ARRAY_LIKE_FLAG: u8 = 1;
-const OMIT_DEFAULTS_FLAG: u8 = 2;
-const FORBID_UNKNOWN_FIELDS_FLAG: u8 = 4;
-const RENAMED_FLAG: u8 = 16;
-const NO_GC_FLAG: u8 = 32;
-
 #[derive(Default)]
 pub(crate) struct StructSettings {
     pub(crate) tag: Option<Py<PyAny>>,
@@ -1476,29 +1445,24 @@ pub(crate) struct StructSettings {
     pub(crate) array_like: bool,
     pub(crate) omit_defaults: bool,
     pub(crate) forbid_unknown_fields: bool,
-    pub(crate) gc_disabled: bool,
-    pub(crate) rename: Option<Py<PyAny>>,
+    pub(crate) info: Option<Py<StructInfo>>,
 }
 
 impl StructSettings {
     pub(crate) fn of_class(class: &Bound<'_, PyAny>) -> PyResult<Self> {
         let py = class.py();
-        let flags: u8 = class.getattr(intern!(py, "__struct_flags__"))?.extract()?;
-        let rename = if flags & RENAMED_FLAG != 0 {
-            Some(class.getattr(intern!(py, "__struct_rename__"))?.unbind())
-        } else {
-            None
-        };
+        let info = struct_info(class)?;
+        let state = info.get();
         Ok(Self {
-            tag: class_tag(class)?.map(Bound::unbind),
-            tag_field: class
-                .getattr(intern!(py, "__struct_tag_field__"))?
-                .extract()?,
-            array_like: flags & ARRAY_LIKE_FLAG != 0,
-            omit_defaults: flags & OMIT_DEFAULTS_FLAG != 0,
-            forbid_unknown_fields: flags & FORBID_UNKNOWN_FIELDS_FLAG != 0,
-            gc_disabled: flags & NO_GC_FLAG != 0,
-            rename,
+            tag: state.tag.as_ref().map(|tag| tag.clone_ref(py)),
+            tag_field: match &state.tag_field {
+                Some(tag_field) => tag_field.bind(py).to_str()?.to_owned(),
+                None => String::new(),
+            },
+            array_like: state.array_like,
+            omit_defaults: state.omit_defaults,
+            forbid_unknown_fields: state.forbid_unknown_fields,
+            info: Some(info.unbind()),
         })
     }
 }
@@ -1534,13 +1498,9 @@ impl StructLayout {
             cached_fields(ty, resolve_generic_fields(ty.py())?, "Struct")?
         };
         let settings = StructSettings::of_class(class)?;
-        if let Some(rename) = &settings.rename {
-            for field in &mut fields {
-                field.name = rename
-                    .bind(ty.py())
-                    .call1((field.key.bind(ty.py()),))?
-                    .extract::<String>()?
-                    .into_boxed_str();
+        if let Some(info) = &settings.info {
+            for (field, name) in fields.iter_mut().zip(&info.get().encode_names) {
+                field.name = name.bind(ty.py()).to_str()?.into();
             }
         }
         Ok(Self::new(fields, settings))
@@ -1610,13 +1570,24 @@ impl Hook {
     pub(crate) fn bind<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyAny>> {
         self.0.as_ref().map(|hook| hook.bind(py).clone())
     }
+
+    pub(crate) fn borrow<'a, 'py>(&'a self, py: Python<'py>) -> Option<&'a Bound<'py, PyAny>> {
+        self.0.as_ref().map(|hook| hook.bind(py))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 pub(crate) struct Converter<'p, 'py, W> {
     py: Python<'py>,
     plan: &'p Plan,
-    hook: Option<Bound<'py, PyAny>>,
-    float_hook: Option<Bound<'py, PyAny>>,
+    hook: Option<&'p Bound<'py, PyAny>>,
+    float_hook: Option<&'p Bound<'py, PyAny>>,
+    ext_hook: Option<&'p Bound<'py, PyAny>>,
+    owner: Option<&'p Bound<'py, PyBytes>>,
+    in_key: bool,
     wire: W,
     keys: KeyCache<'py>,
     items: Vec<Bound<'py, PyAny>>,
@@ -1835,8 +1806,9 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
     ) -> Outcome<Option<(NodeId, FieldValues<'py>)>> {
         let len = self.wire.enter_map()?;
         let tag_field = &self.plan.struct_plan(group.members[0]).tag_field;
-        if self.wire.next_key(len, 0)?.as_deref() != Some(tag_field.as_str()) {
-            return Ok(None);
+        match self.wire.next_key(len, 0)? {
+            Some(Key::Text(key)) if key == tag_field.as_str() => {}
+            _ => return Ok(None),
         }
         let id = self.resolve_tag(group, || PathSegment::Key(tag_field.clone()))?;
         if self.fields_call_user_code(id) {
@@ -1886,15 +1858,18 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     pub(crate) fn new(
         py: Python<'py>,
         plan: &'p Plan,
-        hook: Option<Bound<'py, PyAny>>,
-        float_hook: Option<Bound<'py, PyAny>>,
+        core: &'p DecoderCore,
+        owner: Option<&'p Bound<'py, PyBytes>>,
         wire: W,
     ) -> Self {
         Self {
             py,
             plan,
-            hook,
-            float_hook,
+            hook: core.hook.borrow(py),
+            float_hook: core.hooks.float_hook.borrow(py),
+            ext_hook: core.hooks.ext_hook.borrow(py),
+            owner,
+            in_key: false,
             wire,
             keys: KeyCache::default(),
             items: Vec::new(),
@@ -1931,13 +1906,13 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Union(union) => self.decode_union(union),
             Shape::Array(array) => self.decode_array(array, user_code_inside),
             Shape::AbstractArray(inner) => self.decode_abstract(*inner, kind::ARRAY, "array"),
-            Shape::Dict { keys, values, .. } => self.decode_dict(*keys, *values),
+            Shape::Dict { keys, key, values } => self.decode_dict(*keys, *key, *values),
             Shape::Frozendict {
                 class,
                 keys,
+                key,
                 values,
-                ..
-            } => self.decode_frozendict(class.bind(self.py), *keys, *values),
+            } => self.decode_frozendict(class.bind(self.py), *keys, *key, *values),
             Shape::AbstractDict(inner) => self.decode_abstract(*inner, kind::MAP, "object"),
             Shape::Struct(_) => self.decode_struct(id),
             Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
@@ -2005,6 +1980,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let py = self.py;
         self.expect_kind(accepted, "datetime", kind::name)?;
         let scalar = self.wire.read_scalar()?;
+        if let Scalar::Ext { code, data } = scalar {
+            if code != TIMESTAMP_EXT_CODE {
+                return Err(Fail::mismatch("datetime", kind::name(kind::EXT)));
+            }
+            return datetime_from_timestamp(py, data);
+        }
         if self.plan.lax
             && let Some(seconds) = lax::numeric(py, &scalar)?
         {
@@ -2046,8 +2027,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     }
 
     fn decode_bytes(&mut self, output: BytesType) -> Decoded<'py> {
-        let wire_kind = if W::BINARY { kind::BYTES } else { kind::STR };
-        self.expect_kind(wire_kind, output.name(), kind::name)?;
+        let (wire_kind, expected) = if W::BINARY {
+            (kind::BYTES, "bytes")
+        } else {
+            (kind::STR, output.name())
+        };
+        self.expect_kind(wire_kind, expected, kind::name)?;
         let data = match self.wire.read_scalar()? {
             Scalar::Bytes(data) => data,
             Scalar::Str(text) => base64_text(&text)?,
@@ -2057,12 +2042,15 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     }
 
     fn decode_raw(&mut self) -> Decoded<'py> {
-        let data = self.wire.read_raw()?;
-        Ok(Raw::create(self.py, data)?)
+        let span = self.wire.read_raw()?;
+        Ok(match &self.owner {
+            Some(owner) => Raw::slice(owner, span)?,
+            None => Raw::create(self.py, &self.wire.bytes[span])?,
+        })
     }
 
     fn decode_ext(&mut self) -> Decoded<'py> {
-        self.expect_kind(kind::EXT, "Ext", kind::name)?;
+        self.expect_kind(kind::EXT, "ext", kind::name)?;
         let Scalar::Ext { code, data } = self.wire.read_scalar()? else {
             unreachable!("kind is checked as ext above")
         };
@@ -2114,10 +2102,63 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     ) -> Outcome<usize> {
         let mut index = first_index;
         while let Some(key) = self.wire.next_key(len, index)? {
+            let key = match key {
+                Key::Text(key) => key,
+                Key::Value(found) => return Err(non_text_key(found)),
+            };
             visit(self, key, index)?;
             index += 1;
         }
         Ok(index)
+    }
+
+    fn each_key(
+        &mut self,
+        len: Option<usize>,
+        mut visit: impl FnMut(&mut Self, Key<'a>) -> Outcome<()>,
+    ) -> Outcome<()> {
+        let mut index = 0;
+        while let Some(key) = self.wire.next_key(len, index)? {
+            visit(self, key)?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn decode_member(&mut self, id: Option<NodeId>) -> Decoded<'py> {
+        match id {
+            Some(id) => self.decode_node(id),
+            None => self.decode_any(),
+        }
+    }
+
+    fn decode_as_key(&mut self, id: Option<NodeId>) -> Decoded<'py> {
+        let outer = std::mem::replace(&mut self.in_key, true);
+        let key = self.decode_member(id);
+        self.in_key = outer;
+        key.map_err(|fail| fail.at(PathSegment::DictKey))
+    }
+
+    fn decode_as_value(&mut self, id: Option<NodeId>) -> Decoded<'py> {
+        let outer = std::mem::replace(&mut self.in_key, false);
+        let value = self.decode_member(id);
+        self.in_key = outer;
+        value.map_err(|fail| fail.at(PathSegment::Ellipsis))
+    }
+
+    fn insert_entry(
+        &self,
+        dict: &Bound<'py, PyDict>,
+        key: Bound<'py, PyAny>,
+        value: Bound<'py, PyAny>,
+    ) -> Outcome<()> {
+        match dict.set_item(key, value) {
+            Err(err) if err.is_instance_of::<PyTypeError>(self.py) => Err(self
+                .wire
+                .error("MessagePack data is malformed: map keys must be hashable")
+                .into()),
+            inserted => Ok(inserted?),
+        }
     }
 
     #[inline(always)]
@@ -2125,14 +2166,39 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         if self.float_hook.is_some() && self.wire.peek_kind()? == kind::FLOAT {
             return self.decode_hooked_float();
         }
-        match self.wire.read_value()? {
-            Value::Scalar(Scalar::Float(value)) if value.is_infinite() && !W::BINARY => {
+        let py = self.py;
+        match self.wire.read_value() {
+            Ok(Value::Scalar(Scalar::Int(value))) => Ok(PyInt::new(py, value).into_any()),
+            Ok(Value::Scalar(Scalar::Str(value))) => Ok(PyString::new(py, &value).into_any()),
+            Ok(Value::Scalar(Scalar::Float(value))) if value.is_infinite() && !W::BINARY => {
                 Err(number_out_of_range())
             }
-            Value::Scalar(scalar) => Ok(scalar.to_py_checked(self.py)?),
-            Value::Array(len) => self.decode_untyped_array(len),
-            Value::Map(len) => self.decode_untyped_map(len),
+            Ok(Value::Scalar(Scalar::Ext { code, data })) => self.decode_untyped_ext(code, data),
+            Ok(Value::Scalar(scalar)) => Ok(scalar.to_py_checked(py)?),
+            Ok(Value::Array(len)) => self.decode_untyped_array(len),
+            Ok(Value::Map(len)) => self.decode_untyped_map(len),
+            Err(err) => Err(err.into()),
         }
+    }
+
+    #[inline(never)]
+    fn decode_untyped_ext(&mut self, code: i8, data: &[u8]) -> Decoded<'py> {
+        let py = self.py;
+        if code == TIMESTAMP_EXT_CODE {
+            return datetime_from_timestamp(py, data);
+        }
+        let Some(hook) = &self.ext_hook else {
+            return Ok(Ext::create(py, code, data)?);
+        };
+        let view = match &self.owner {
+            Some(owner) => {
+                let start = data.as_ptr() as usize - owner.as_bytes().as_ptr() as usize;
+                let slice = PySlice::new(py, start as isize, (start + data.len()) as isize, 1);
+                PyMemoryView::from(owner.as_any())?.get_item(slice)?
+            }
+            None => PyMemoryView::from(PyBytes::new(py, data).as_any())?.into_any(),
+        };
+        Ok(hook.call1((code, view))?)
     }
 
     #[inline(never)]
@@ -2156,24 +2222,42 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Ok(())
         })?;
         self.wire.leave();
-        Ok(PyList::new(self.py, self.items.drain(start..))?.into_any())
+        let items = self.items.drain(start..);
+        Ok(if self.in_key {
+            PyTuple::new(self.py, items)?.into_any()
+        } else {
+            PyList::new(self.py, items)?.into_any()
+        })
     }
 
     fn decode_untyped_map(&mut self, len: Option<usize>) -> Decoded<'py> {
         self.wire.enter()?;
-        self.decode_entries(len, |this, _| this.decode_any())
+        self.decode_entries(len, None, None)
     }
 
     fn decode_entries(
         &mut self,
         len: Option<usize>,
-        mut decode_value: impl FnMut(&mut Self, &str) -> Decoded<'py>,
+        key: Option<NodeId>,
+        values: Option<NodeId>,
     ) -> Decoded<'py> {
-        let dict = PyDict::new(self.py);
-        self.each_entry(len, 0, |this, key, _| {
-            let value = decode_value(this, &key)?;
-            Ok(dict.set_item(this.keys.get(this.py, &key), value)?)
-        })?;
+        let py = self.py;
+        let dict = PyDict::new(py);
+        let outer = std::mem::replace(&mut self.in_key, false);
+        let filled = self.each_key(len, |this, entry| {
+            let key = match entry {
+                Key::Text(text) => this.keys.get(py, &text).into_any(),
+                Key::Value(_) => this.decode_as_key(key)?,
+            };
+            let value = match values {
+                Some(id) => this.decode_node(id),
+                None => this.decode_any(),
+            }
+                .map_err(|fail| fail.at(PathSegment::Ellipsis))?;
+            this.insert_entry(&dict, key, value)
+        });
+        self.in_key = outer;
+        filled?;
         self.wire.leave();
         Ok(dict.into_any())
     }
@@ -2419,6 +2503,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let plan = self.plan;
         let defer_decimal = found & (kind::INT | kind::FLOAT) != 0;
         let mut deferred_decimal = None;
+        let mut deferred_float = None;
         for member in &union.plain {
             self.wire.restore(start);
             let node = plan.node(member.node);
@@ -2434,6 +2519,10 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             }
             if defer_decimal && matches!(node.shape, Shape::Decimal) {
                 deferred_decimal.get_or_insert(member.node);
+                continue;
+            }
+            if found == kind::INT && plan.is_float(member.node) {
+                deferred_float.get_or_insert(member.node);
                 continue;
             }
             if let Shape::Constrained {
@@ -2453,9 +2542,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 decoded => return decoded,
             }
         }
-        if let Some(decimal) = deferred_decimal {
+        for deferred in [deferred_float, deferred_decimal].into_iter().flatten() {
             self.wire.restore(start);
-            match self.decode_node(decimal) {
+            match self.decode_node(deferred) {
                 Err(fail) if fail.is_validation(py) => {}
                 decoded => return decoded,
             }
@@ -2484,12 +2573,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Length::exactly(array.items.len())
         };
         let start = self.items.len();
+        let items_in_key = match array.output {
+            ArrayOutput::List => false,
+            ArrayOutput::Tuple => self.in_key,
+            ArrayOutput::Converted => W::BINARY && array.hashable_items,
+        };
+        let outer = std::mem::replace(&mut self.in_key, items_in_key);
         let decoded = self.decode_sequence(&length, calls_user_code, |this, index| {
             let item_node = array.items[if array.is_variadic { 0 } else { index }];
             let item = this.decode_node(item_node)?;
             this.items.push(item);
             Ok(())
         });
+        self.in_key = outer;
         if let Err(fail) = decoded {
             self.items.truncate(start);
             return Err(fail);
@@ -2502,29 +2598,47 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         })
     }
 
-    fn decode_dict(&mut self, keys: Option<NodeId>, values: NodeId) -> Decoded<'py> {
-        if let Some(keys) = keys {
-            return self.decode_dict_with_typed_keys(keys, values);
-        }
-        self.expect_kind(kind::MAP, "dict", kind::name)?;
+    fn decode_dict(&mut self, keys: Option<NodeId>, key: NodeId, values: NodeId) -> Decoded<'py> {
+        self.expect_kind(kind::MAP, "object", kind::container_name)?;
         let len = self.wire.enter_map()?;
-        self.decode_entries(len, |this, key| {
-            this.decode_node(values)
-                .map_err(|fail| fail.at(PathSegment::Entry(key.to_owned())))
-        })
+        match keys {
+            None => self.decode_entries(len, Some(key), Some(values)),
+            Some(keys) if W::BINARY => self.decode_binary_entries(len, keys, values),
+            Some(keys) => self.decode_text_entries(len, keys, values),
+        }
     }
 
     #[inline(never)]
-    fn decode_dict_with_typed_keys(&mut self, keys: NodeId, values: NodeId) -> Decoded<'py> {
-        self.expect_kind(kind::MAP, "dict", kind::name)?;
-        let len = self.wire.enter_map()?;
+    fn decode_text_entries(
+        &mut self,
+        len: Option<usize>,
+        keys: NodeId,
+        values: NodeId,
+    ) -> Decoded<'py> {
         let dict = PyDict::new(self.py);
         self.each_entry(len, 0, |this, key, _| {
-            let key_object = this.decode_key(keys, &key)?;
-            let value = this
-                .decode_node(values)
-                .map_err(|fail| fail.at(PathSegment::Entry(key.to_string())))?;
+            let key_object = this
+                .decode_key(keys, &key)
+                .map_err(|fail| fail.at(PathSegment::DictKey))?;
+            let value = this.decode_as_value(Some(values))?;
             Ok(dict.set_item(key_object, value)?)
+        })?;
+        self.wire.leave();
+        Ok(dict.into_any())
+    }
+
+    #[inline(never)]
+    fn decode_binary_entries(
+        &mut self,
+        len: Option<usize>,
+        keys: NodeId,
+        values: NodeId,
+    ) -> Decoded<'py> {
+        let dict = PyDict::new(self.py);
+        self.each_item(len, 0, |this, _| {
+            let key = this.decode_as_key(Some(keys))?;
+            let value = this.decode_as_value(Some(values))?;
+            this.insert_entry(&dict, key, value)
         })?;
         self.wire.leave();
         Ok(dict.into_any())
@@ -2641,10 +2755,10 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         &mut self,
         class: &Bound<'py, PyAny>,
         keys: Option<NodeId>,
+        key: NodeId,
         values: NodeId,
     ) -> Decoded<'py> {
-        self.expect_kind(kind::MAP, "object", kind::container_name)?;
-        let dict = self.decode_dict(keys, values)?;
+        let dict = self.decode_dict(keys, key, values)?;
         Ok(class.call1((dict,))?)
     }
 
@@ -2670,7 +2784,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         base: &Bound<'py, PyAny>,
         raw: Bound<'py, PyAny>,
     ) -> Decoded<'py> {
-        custom_value(self.hook.as_ref(), ty, base, raw)
+        custom_value(self.hook, ty, base, raw)
     }
 }
 
@@ -2733,6 +2847,11 @@ fn big_integer_as_float<'py>(py: Python<'py>, digits: &str) -> Bound<'py, PyAny>
         .parse()
         .expect("integer literals are valid float literals");
     PyFloat::new(py, value).into_any()
+}
+
+#[cold]
+fn non_text_key(found: u16) -> Fail {
+    Fail::mismatch("str", kind::container_name(found)).at(PathSegment::DictKey)
 }
 
 #[cold]
@@ -2894,6 +3013,74 @@ fn temporal_text(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 }
 
+fn epoch_micros(obj: &Bound<'_, PyAny>) -> PyResult<Option<i128>> {
+    let Ok(value) = obj.cast_exact::<PyDateTime>() else {
+        return Ok(None);
+    };
+    let offset = obj.call_method0(intern!(obj.py(), "utcoffset"))?;
+    if offset.is_none() {
+        return Ok(None);
+    }
+    let delta = offset.cast::<PyDelta>()?;
+    let offset_micros = datetime_format::total_micros(
+        delta.get_days(),
+        delta.get_seconds(),
+        delta.get_microseconds(),
+    );
+    let days =
+        datetime_format::days_from_civil(value.get_year(), value.get_month(), value.get_day());
+    Ok(Some(
+        i128::from(days) * MICROS_PER_DAY
+            + i128::from(value.get_hour()) * MICROS_PER_HOUR
+            + i128::from(value.get_minute()) * MICROS_PER_MINUTE
+            + i128::from(value.get_second()) * MICROS_PER_SECOND
+            + i128::from(value.get_microsecond())
+            - offset_micros,
+    ))
+}
+
+fn timestamp_payload(seconds: i64, nanos: u32) -> Vec<u8> {
+    if seconds >> 34 == 0 {
+        let packed = (u64::from(nanos) << 34) | seconds.cast_unsigned();
+        if packed >> 32 == 0 {
+            return (packed as u32).to_be_bytes().to_vec();
+        }
+        return packed.to_be_bytes().to_vec();
+    }
+    let mut payload = nanos.to_be_bytes().to_vec();
+    payload.extend_from_slice(&seconds.to_be_bytes());
+    payload
+}
+
+pub(crate) fn datetime_from_timestamp<'py>(py: Python<'py>, data: &[u8]) -> Decoded<'py> {
+    let invalid = || Fail::invalid("Invalid MessagePack timestamp".to_owned());
+    let (seconds, nanos) = match data.len() {
+        4 => (
+            i64::from(u32::from_be_bytes(data.try_into().map_err(|_| invalid())?)),
+            0,
+        ),
+        8 => {
+            let packed = u64::from_be_bytes(data.try_into().map_err(|_| invalid())?);
+            ((packed & 0x3_ffff_ffff) as i64, (packed >> 34) as u32)
+        }
+        12 => (
+            i64::from_be_bytes(data[4..].try_into().map_err(|_| invalid())?),
+            u32::from_be_bytes(data[..4].try_into().map_err(|_| invalid())?),
+        ),
+        _ => return Err(invalid()),
+    };
+    if nanos > 999_999_999 {
+        return Err(invalid());
+    }
+    let micros = i128::from(seconds) * MICROS_PER_SECOND + i128::from((nanos + 500) / 1000);
+    let (days, seconds, microseconds) = datetime_format::timedelta_components(micros);
+    let utc = PyTzInfo::utc(py)?;
+    let epoch = PyDateTime::new(py, 1970, 1, 1, 0, 0, 0, 0, Some(&utc))?;
+    PyDelta::new(py, days, seconds, microseconds, false)
+        .and_then(|offset| epoch.add(offset))
+        .map_err(|err| overflow_failure(py, err, "Timestamp is out of range"))
+}
+
 fn utcoffset_minutes(obj: &Bound<'_, PyAny>) -> PyResult<Option<i32>> {
     let offset = obj.call_method0(intern!(obj.py(), "utcoffset"))?;
     if offset.is_none() {
@@ -2918,13 +3105,13 @@ struct KeyCache<'py>(RuneMap<Box<str>, Bound<'py, PyString>>);
 
 impl<'py> KeyCache<'py> {
     fn get(&mut self, py: Python<'py>, key: &str) -> Bound<'py, PyString> {
-        if key.len() < 2 || !key.is_ascii() {
+        if key.len() < 2 {
             return PyString::new(py, key);
         } else if let Some(found) = self.0.get(key) {
             return found.clone();
         }
         let created = PyString::new(py, key);
-        if key.len() <= MAX_CACHED_KEY_LEN && self.0.len() < MAX_CACHED_KEYS {
+        if key.len() <= MAX_CACHED_KEY_LEN && self.0.len() < MAX_CACHED_KEYS && key.is_ascii() {
             self.0.insert(key.into(), created.clone());
         }
         created
@@ -3007,6 +3194,9 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         obj: &Bound<'py, PyAny>,
         kind: Kind,
     ) -> PyResult<()> {
+        if AS_KEY && W::BINARY {
+            return self.encode_as::<false>(obj, kind);
+        }
         let token = match kind {
             Kind::Null => Token::Null,
             Kind::Bool => Token::Bool(obj.extract()?),
@@ -3142,8 +3332,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
 
     fn encode_raw(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
         let raw = obj.cast::<Raw>()?;
-        let data = raw.get().data.bind(obj.py());
-        self.writer.write_raw(data.as_bytes());
+        self.writer.write_raw(raw.get().as_bytes(obj.py())?);
         Ok(())
     }
 
@@ -3154,8 +3343,8 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         }
         let ext = obj.cast::<Ext>()?;
         let ext = ext.get();
-        let data = ext.data.bind(obj.py());
-        self.writer.write_ext(ext.code, data.as_bytes());
+        self.writer
+            .write_ext(ext.code, ext.bytes(obj.py())?.as_bytes());
         Ok(())
     }
 
@@ -3171,6 +3360,15 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
     }
 
     fn encode_temporal(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        if W::EXTENSIONS
+            && let Some(micros) = epoch_micros(obj)?
+        {
+            let seconds = micros.div_euclid(MICROS_PER_SECOND) as i64;
+            let nanos = (micros.rem_euclid(MICROS_PER_SECOND) * 1000) as u32;
+            self.writer
+                .write_ext(TIMESTAMP_EXT_CODE, &timestamp_payload(seconds, nanos));
+            return Ok(());
+        }
         let text = temporal_text(obj)?;
         self.writer.write(Token::Str(&text));
         Ok(())
@@ -3433,11 +3631,22 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         if let Some(tag) = &settings.tag {
             entries.push((settings.tag_field.as_str(), tag.bind(py).clone()));
         }
-        for field in fields {
+        for (index, field) in fields.iter().enumerate() {
             let Some(value) = read_attribute(obj, field.key.bind(py))? else {
                 continue;
             };
-            if !is_omitted_field(&class, field, &value, settings.omit_defaults)? {
+            let info = layout
+                .settings
+                .info
+                .as_ref()
+                .filter(|_| own_fields.is_none());
+            if !is_omitted_field(
+                &class,
+                field,
+                info.map(|info| (info, index)),
+                &value,
+                settings,
+            )? {
                 entries.push((&*field.name, value));
             }
         }
@@ -3515,24 +3724,41 @@ fn read_attribute<'py>(
 fn is_omitted_field(
     class: &Bound<'_, PyAny>,
     field: &Field,
+    struct_default: Option<(&Py<StructInfo>, usize)>,
     value: &Bound<'_, PyAny>,
-    omit_defaults: bool,
+    settings: &StructSettings,
 ) -> PyResult<bool> {
     if field.accepts_unset && value.is(unset(value.py())?) {
         return Ok(true);
     }
-    Ok(omit_defaults && is_field_default(class, field, value)?)
-}
-
-fn is_field_default(
-    class: &Bound<'_, PyAny>,
-    field: &Field,
-    value: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
-    let Some(default) = class_default(class, field.key.bind(class.py()))? else {
+    if !settings.omit_defaults {
         return Ok(false);
+    }
+    let default = match struct_default {
+        Some((info, index)) => match &info.get().field_defaults[index] {
+            None => return Ok(false),
+            Some(FieldDefault::Factory(factory)) => {
+                let factory = factory.bind(value.py());
+                if is_empty_container_type(factory) {
+                    return Ok(value.get_type().is(factory) && value.len()? == 0);
+                }
+                factory.call0()?
+            }
+            Some(FieldDefault::Value(default)) => default.bind(value.py()).clone(),
+        },
+        None => match class_default(class, field.key.bind(class.py()))? {
+            Some(default) => default,
+            None => return Ok(false),
+        },
     };
     Ok(value.get_type().is(default.get_type()) && value.eq(&default)?)
+}
+
+fn is_empty_container_type(factory: &Bound<'_, PyAny>) -> bool {
+    is_type::<PyList>(factory)
+        || is_type::<PyDict>(factory)
+        || is_type::<PySet>(factory)
+        || is_type::<PyByteArray>(factory)
 }
 
 pub(crate) struct Fail(Box<Failure>);
@@ -3544,7 +3770,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: None,
         }
-        .into()
+            .into()
     }
 
     pub(crate) fn mismatch(expected: &str, got: &str) -> Self {
@@ -3566,7 +3792,7 @@ impl Fail {
             reversed_path: Vec::new(),
             cause: Some(err),
         }
-        .into()
+            .into()
     }
 
     pub(crate) fn at(mut self, segment: PathSegment) -> Self {

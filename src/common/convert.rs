@@ -2,7 +2,7 @@ use crate::common::enums::{
     ArrayOutput, BytesType, Constructor, PathSegment, Primitive, Scalar, Shape,
 };
 use crate::common::failure::LengthRule;
-use crate::common::helpers::invalid_enum_value;
+use crate::common::helpers::{invalid_enum_value, type_name_of};
 use crate::common::lax;
 use crate::common::py_typing::{
     date, datetime, decimal_type, enum_meta, frozendict, is_type, time, timedelta, type_name,
@@ -338,12 +338,12 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
     fn accepts_none(&self, id: NodeId) -> bool {
         self.union_of(id).is_some_and(|union| union.accepts_none)
             || self
-                .find(id, |shape| match shape {
-                    Shape::Primitive(Primitive::None) => true,
-                    Shape::Literal(literal) => literal.accepted_kinds() & kind::NULL != 0,
-                    _ => false,
-                })
-                .is_some()
+            .find(id, |shape| match shape {
+                Shape::Primitive(Primitive::None) => true,
+                Shape::Literal(literal) => literal.accepted_kinds() & kind::NULL != 0,
+                _ => false,
+            })
+            .is_some()
     }
 
     fn constrain(&self, id: NodeId, value: Bound<'py, PyAny>) -> Decoded<'py> {
@@ -367,7 +367,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             return Err(PyRecursionError::new_err(
                 "maximum recursion depth exceeded while deserializing an object",
             )
-            .into());
+                .into());
         }
         self.depth_left -= 1;
         let result = body(self);
@@ -406,7 +406,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             } else {
                 "str"
             }
-            .to_owned(),
+                .to_owned(),
             Shape::Array(_) | Shape::NamedTuple(_) => "array".to_owned(),
             Shape::Dict { .. } | Shape::Frozendict { .. } => "object".to_owned(),
             Shape::Struct(plan) => container_name(plan).to_owned(),
@@ -613,7 +613,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             });
         match same_class {
             Some(member) => self.constrain(member, obj.clone()),
-            None => Err(self.mismatch(id, &input_type_name(obj)?)?),
+            None => Err(self.mismatch(id, &type_name_of(obj))?),
         }
     }
 
@@ -1068,7 +1068,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             |shape: &Shape| matches!(shape, Shape::Dict { .. } | Shape::Frozendict { .. });
         if is_mapping && self.find(id, is_dict).is_some() {
             if !obj.hasattr(intern!(py, "keys"))? {
-                return Err(self.mismatch(id, &input_type_name(obj)?)?);
+                return Err(self.mismatch(id, &type_name_of(obj))?);
             }
             return self.convert_dict(as_dict(obj)?.as_any(), id);
         }
@@ -1102,7 +1102,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
                 return self.mapping_to_typed_dict(obj, member);
             }
         }
-        Err(self.mismatch(id, &input_type_name(obj)?)?)
+        Err(self.mismatch(id, &type_name_of(obj))?)
     }
 
     fn is_own_instance(&self, id: NodeId, class: &Bound<'py, PyType>) -> PyResult<bool> {
@@ -1267,7 +1267,7 @@ fn check_tag_type(tag: &Bound<'_, PyAny>, has_str_tag: bool) -> Outcome<()> {
         return Ok(());
     }
     let expected = if has_str_tag { "str" } else { "int" };
-    Err(Fail::mismatch(expected, &input_type_name(tag)?))
+    Err(Fail::mismatch(expected, &type_name_of(tag)))
 }
 
 fn read_field<'py>(
@@ -1308,10 +1308,6 @@ fn as_dict<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
     }
 }
 
-fn input_type_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
-    Ok(obj.get_type().name()?.to_string())
-}
-
 fn container_name(plan: &StructPlan) -> &'static str {
     if plan.array_like { "array" } else { "object" }
 }
@@ -1324,11 +1320,11 @@ fn literal_name(literal: &LiteralPlan) -> String {
         (kind::BOOL, "bool"),
         (kind::NULL, "null"),
     ]
-    .into_iter()
-    .filter(|(flag, _)| kinds & flag != 0)
-    .map(|(_, name)| name)
-    .collect::<Vec<_>>()
-    .join(" | ")
+        .into_iter()
+        .filter(|(flag, _)| kinds & flag != 0)
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn push_unique(names: &mut Vec<String>, name: String) {
@@ -1377,6 +1373,6 @@ fn integral(value: f64) -> Option<i64> {
 fn is_number_text(text: &str) -> bool {
     !text.is_empty()
         && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
 }

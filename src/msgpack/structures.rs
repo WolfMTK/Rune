@@ -1,11 +1,11 @@
 use crate::common::enums::{Scalar, Value};
 use crate::common::macros::big_endian_readers;
-use crate::common::reader::{Reader, kind};
+use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::Cursor;
 use crate::constants::INITIAL_CAPACITY;
 use crate::exceptions::ParseError;
 use crate::msgpack::enums::Container;
-use crate::msgpack::helpers::unsupported_type;
+use crate::msgpack::helpers::{invalid_opcode, truncated};
 use crate::msgpack::writer::STRING;
 use std::borrow::Cow;
 
@@ -24,7 +24,7 @@ impl<'a> Parser<'a> {
         start
             .checked_add(len)
             .and_then(|end| self.bytes.get(start..end))
-            .ok_or_else(|| self.error("Unexpected end of input"))
+            .ok_or_else(|| truncated(self.position))
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ParseError> {
@@ -93,7 +93,7 @@ impl<'a> Parser<'a> {
             0xd2 => Ok(Scalar::Int(self.read_i32()?.into())),
             0xd3 => Ok(Scalar::Int(self.read_i64()?)),
             0xe0..=0xff => Ok(Scalar::Int(tag.cast_signed().into())),
-            other => Err(unsupported_type(other, self.position - 1)),
+            other => Err(invalid_opcode(other, self.position - 1)),
         }
     }
 
@@ -153,7 +153,7 @@ impl<'a> Reader<'a> for Parser<'a> {
             0xa0..=0xbf | 0xd9..=0xdb => kind::STR,
             0x90..=0x9f | 0xdc | 0xdd => kind::ARRAY,
             0x80..=0x8f | 0xde | 0xdf => kind::MAP,
-            other => return Err(unsupported_type(other, self.position)),
+            other => return Err(invalid_opcode(other, self.position)),
         })
     }
 
@@ -195,16 +195,19 @@ impl<'a> Reader<'a> for Parser<'a> {
         &mut self,
         len: Option<usize>,
         index: usize,
-    ) -> Result<Option<Cow<'a, str>>, ParseError> {
+    ) -> Result<Option<Key<'a>>, ParseError> {
         if len.is_none_or(|len| index >= len) {
             return Ok(None);
         }
-        let start = self.position;
-        let tag = self.read_u8()?;
-        match self.read_string(tag)? {
-            Some(key) => Ok(Some(Cow::Borrowed(key))),
-            None => Err(ParseError::syntax("Only str keys are supported", start)),
+        let tag = self.peek_bytes(0, 1)?[0];
+        if !matches!(tag, 0xa0..=0xbf | 0xd9..=0xdb) {
+            return Ok(Some(Key::Value(self.peek_kind()?)));
         }
+        self.position += 1;
+        let Some(key) = self.read_string(tag)? else {
+            unreachable!("tag is checked as a string above")
+        };
+        Ok(Some(Key::Text(Cow::Borrowed(key))))
     }
 }
 

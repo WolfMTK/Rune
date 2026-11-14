@@ -19,9 +19,6 @@ pub(crate) fn with_path(mut message: String, reversed_path: &[PathSegment]) -> S
                 message.push('.');
                 message.push_str(key);
             }
-            PathSegment::Entry(key) => {
-                let _ = write!(message, "[{key:?}]");
-            }
             PathSegment::Index(index) => {
                 let _ = write!(message, "[{index}]");
             }
@@ -36,7 +33,6 @@ pub(crate) fn with_path(mut message: String, reversed_path: &[PathSegment]) -> S
 fn rendered_len(segment: &PathSegment) -> usize {
     match segment {
         PathSegment::Key(key) => 1 + key.len(),
-        PathSegment::Entry(key) => 4 + key.len(),
         PathSegment::Index(index) => 2 + index.checked_ilog10().map_or(1, |d| d as usize + 1),
         PathSegment::Ellipsis => 5,
         PathSegment::DictKey => 0,

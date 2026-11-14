@@ -17,5 +17,8 @@ class UnsetType:
     def __repr__(self) -> str:
         return "UNSET"
 
+    def __reduce__(self) -> str:
+        return "UNSET"
+
 
 UNSET = UnsetType()

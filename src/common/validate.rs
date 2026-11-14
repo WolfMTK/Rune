@@ -1,6 +1,7 @@
 use crate::common::enums::{AbstractContainer, UnionKind};
 use crate::common::helpers::{
-    is_named_tuple_class, resolve_type_aliases, struct_class, type_arg_or_any, union_members,
+    is_named_tuple_class, resolve_type_aliases, struct_class, type_arg_or_any, union_contains_any,
+    union_members,
 };
 use crate::common::macros::reject_union_if;
 use crate::common::py_typing::{
@@ -73,6 +74,9 @@ pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind
 }
 pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     use UnionKind::*;
+    if union_contains_any(ty)? {
+        return Ok(());
+    }
     let mut members = Vec::new();
     for member in union_members(ty)? {
         if !is_type::<PyNone>(&member) && !is_unset_type(&member)? {
@@ -201,6 +205,7 @@ fn ensure_union_structs_are_valid(
     let [first, _, ..] = structs.as_slice() else {
         return Ok(());
     };
+    let first_tagged = structs.iter().find(|settings| settings.tag.is_some());
     for settings in &structs {
         reject_union_if!(
             ty,
@@ -209,7 +214,8 @@ fn ensure_union_structs_are_valid(
         );
         reject_union_if!(
             ty,
-            settings.tag_field != first.tag_field,
+            settings.tag.is_some()
+                && first_tagged.is_some_and(|tagged| settings.tag_field != tagged.tag_field),
             "structs in a union must all use the same `tag_field`"
         );
     }

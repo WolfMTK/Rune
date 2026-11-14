@@ -1,7 +1,7 @@
-const MICROS_PER_SECOND: i128 = 1_000_000;
-const MICROS_PER_MINUTE: i128 = 60 * MICROS_PER_SECOND;
-const MICROS_PER_HOUR: i128 = 60 * MICROS_PER_MINUTE;
-const MICROS_PER_DAY: i128 = 24 * MICROS_PER_HOUR;
+pub(crate) const MICROS_PER_SECOND: i128 = 1_000_000;
+pub(crate) const MICROS_PER_MINUTE: i128 = 60 * MICROS_PER_SECOND;
+pub(crate) const MICROS_PER_HOUR: i128 = 60 * MICROS_PER_MINUTE;
+pub(crate) const MICROS_PER_DAY: i128 = 24 * MICROS_PER_HOUR;
 const MINUTES_PER_DAY: i128 = 24 * 60;
 const MAX_DURATION_DAYS: i128 = 999_999_999;
 const MAX_DURATION_MICROS: i128 = MAX_DURATION_DAYS * MICROS_PER_DAY;
@@ -258,6 +258,16 @@ pub(crate) fn utc_offset_minutes(offset_micros: i128) -> i32 {
         whole_minutes
     };
     (rounded % MINUTES_PER_DAY) as i32
+}
+
+pub(crate) fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub(crate) fn total_micros(days: i32, seconds: i32, microseconds: i32) -> i128 {

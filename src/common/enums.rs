@@ -1,11 +1,12 @@
-use crate::common::helpers::{check_default_construction, check_instantiable_alias};
+use crate::common::helpers::{check_instantiable_alias, has_default_call, struct_info};
 use crate::common::macros::first_matching_kind;
 use crate::common::py_typing::{
     abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence, abc_mutable_set,
-    abc_sequence, abc_set, compile_regex, is_type, meta_type, object_type,
+    abc_sequence, abc_set, compile_regex, is_type, meta_type,
 };
 use crate::common::raw::Raw;
 use crate::common::reader::kind;
+use crate::common::r#struct::StructInfo;
 use crate::common::structures::{
     ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
 };
@@ -88,7 +89,6 @@ pub(crate) enum Value<'a> {
 
 pub(crate) enum PathSegment {
     Key(String),
-    Entry(String),
     Index(usize),
     DictKey,
     Ellipsis,
@@ -181,8 +181,10 @@ impl Shape {
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
             Self::Date | Self::Time => kind::STR,
             Self::Uuid | Self::Bytes(_) => kind::STR | kind::BYTES,
-            Self::DateTime | Self::TimeDelta if lax => kind::NUMBER_OR_STR,
-            Self::DateTime | Self::TimeDelta => kind::STR,
+            Self::DateTime if lax => kind::NUMBER_OR_STR | kind::EXT,
+            Self::DateTime => kind::STR | kind::EXT,
+            Self::TimeDelta if lax => kind::NUMBER_OR_STR,
+            Self::TimeDelta => kind::STR,
             Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
             Self::Dict { .. }
@@ -292,7 +294,7 @@ impl Primitive {
 
 pub(crate) enum Constructor {
     Direct {
-        object_new: Py<PyAny>,
+        info: Py<StructInfo>,
         class: Py<PyAny>,
         alias: Option<Py<PyAny>>,
         post_init: Option<Py<PyAny>>,
@@ -313,12 +315,11 @@ impl Constructor {
             return Ok(Self::Init);
         };
         let py = ty.py();
-        let object_new = object_type(py)?.getattr(intern!(py, "__new__"))?;
-        if !check_default_construction(class, &object_new)? {
+        if !has_default_call(class)? {
             return Ok(Self::Init);
         }
         Ok(Self::Direct {
-            object_new: object_new.unbind(),
+            info: struct_info(class)?.unbind(),
             class: class.clone().unbind(),
             alias,
             post_init: class

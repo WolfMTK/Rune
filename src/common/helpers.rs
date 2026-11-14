@@ -4,24 +4,21 @@ use crate::common::py_typing::{
     type_alias_of, type_args, type_name, type_origin,
 };
 use crate::common::py_typing::{
-    is_typevar, origin_or_self, resolve_generic_fields, resolve_namedtuple_fields, struct_base,
-    struct_meta, typing_generic_alias,
+    is_typevar, origin_or_self, resolve_generic_fields, resolve_namedtuple_fields,
+    struct_field_types, struct_meta, typing_generic_alias,
 };
 use crate::common::reader::kind;
 use crate::common::recursion_limit;
-use crate::common::structures::{Encoder, Fail, FieldPlan, Hook, Plan, UnionPlan};
+use crate::common::r#struct::{StructInfo, own_info};
+use crate::common::structures::{Encoder, Fail, Hook, Plan, UnionPlan};
 use crate::common::types::RuneMap;
 use crate::common::writer::Writer;
 use crate::constants::GENERATED_NAMEDTUPLE_PREFIX;
 use pyo3::Python;
-use pyo3::exceptions::{PyRecursionError, PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyTypeMethods};
+use pyo3::exceptions::{PyOverflowError, PyRecursionError, PyTypeError, PyValueError};
+use pyo3::prelude::{PyAnyMethods, PyTypeMethods};
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyListMethods;
-use pyo3::types::{
-    PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyList, PySet, PySlice, PyString, PyTuple,
-    PyType,
-};
+use pyo3::types::{PyByteArray, PyByteArrayMethods, PyBytes, PySlice, PyString, PyTuple, PyType};
 use pyo3::{Bound, PyAny, PyErr, PyResult, intern};
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
@@ -51,6 +48,11 @@ pub(crate) fn resolve_type_aliases<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Boun
         resolved = expand_type_alias(&resolved)?;
     }
     Ok(resolved)
+}
+
+pub(crate) fn union_contains_any(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let any = any(ty.py())?;
+    Ok(union_members(ty)?.iter().any(|member| member.is(any)))
 }
 
 pub(crate) fn union_members<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
@@ -148,8 +150,23 @@ pub(crate) fn struct_class<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Option<Bound
 }
 
 pub(crate) fn class_tag<'py>(class: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let tag = class.getattr(intern!(class.py(), "__struct_tag__"))?;
-    Ok((!tag.is_none()).then_some(tag))
+    let info = struct_info(class)?;
+    Ok(info
+        .get()
+        .tag
+        .as_ref()
+        .map(|tag| tag.bind(class.py()).clone()))
+}
+
+pub(crate) fn struct_info<'py>(class: &Bound<'py, PyAny>) -> PyResult<Bound<'py, StructInfo>> {
+    let info = match class.cast::<PyType>() {
+        Ok(ty) => own_info(ty)?,
+        Err(_) => None,
+    };
+    info.ok_or_else(|| match class.repr() {
+        Ok(repr) => PyValueError::new_err(format!("Type '{repr}' isn't fully defined")),
+        Err(err) => err,
+    })
 }
 
 pub(crate) fn struct_field_pairs<'py>(
@@ -157,8 +174,11 @@ pub(crate) fn struct_field_pairs<'py>(
     class: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let py = ty.py();
+    let info = struct_info(class)?;
     if class.is(ty) {
-        return class.getattr(intern!(py, "__struct_fields__"));
+        return info
+            .get()
+            .field_types(py, || struct_field_types(py)?.call1((class,)));
     }
     resolve_generic_fields(py)?.call1((ty,))
 }
@@ -182,30 +202,21 @@ pub(crate) fn parametrized_identity(
     Ok(identity)
 }
 
-pub(crate) fn check_default_construction(
-    class: &Bound<'_, PyAny>,
-    object_new: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
+pub(crate) fn has_default_call(class: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = class.py();
-    let (init, new, call) = (
-        intern!(py, "__init__"),
-        intern!(py, "__new__"),
-        intern!(py, "__call__"),
-    );
-    Ok(class.getattr(init)?.is(&struct_base(py)?.getattr(init)?)
-        && class.getattr(new)?.is(object_new)
-        && class
-            .get_type()
-            .getattr(call)?
-            .is(&py.get_type::<PyType>().getattr(call)?))
+    let call = intern!(py, "__call__");
+    Ok(class
+        .get_type()
+        .getattr(call)?
+        .is(&py.get_type::<PyType>().getattr(call)?))
 }
 
 pub(crate) fn check_instantiable_alias(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = ty.py();
     Ok(ty.get_type().is(typing_generic_alias(py)?)
         && ty
-            .getattr(intern!(py, "_inst"))
-            .is_ok_and(|inst| inst.is_truthy().unwrap_or(false)))
+        .getattr(intern!(py, "_inst"))
+        .is_ok_and(|inst| inst.is_truthy().unwrap_or(false)))
 }
 
 pub(crate) fn has_generated_new(class: &Bound<'_, PyAny>) -> bool {
@@ -297,7 +308,7 @@ pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<Token<'static>> {
         .map(Token::Int)
         .or_else(|_| obj.extract::<u64>().map(Token::UInt))
         .map_err(|_| {
-            PyValueError::new_err("Integer is out of range for this encoder (64-bit only)")
+            PyOverflowError::new_err("Integer is out of range for this encoder (64-bit only)")
         })
 }
 
@@ -313,23 +324,6 @@ pub(crate) fn unsupported_type_error(obj: &Bound<'_, PyAny>) -> PyErr {
         "Encoding objects of type {} is unsupported",
         type_name_of(obj)
     ))
-}
-
-pub(crate) fn default_value<'py>(
-    target: &Bound<'py, PyAny>,
-    field: &FieldPlan,
-) -> PyResult<Bound<'py, PyAny>> {
-    let py = target.py();
-    let Some(value) = target.getattr_opt(field.key.bind(py))? else {
-        return Err(PyTypeError::new_err(format!(
-            "Missing required field `{}`",
-            field.name
-        )));
-    };
-    if field.has_default_factory {
-        return call_default_factory(&value);
-    }
-    copy_if_mutable(value)
 }
 
 pub(crate) fn class_default<'py>(
@@ -408,19 +402,6 @@ impl ExpectedName for &Bound<'_, PyAny> {
     }
 }
 
-fn copy_if_mutable(value: Bound<PyAny>) -> PyResult<Bound<PyAny>> {
-    if let Ok(list) = value.cast_exact::<PyList>() {
-        return Ok(list.get_slice(0, list.len()).into_any());
-    }
-    if let Ok(dict) = value.cast_exact::<PyDict>() {
-        return Ok(dict.copy()?.into_any());
-    }
-    if value.is_exact_instance_of::<PySet>() {
-        return value.call_method0(intern!(value.py(), "copy"));
-    }
-    Ok(value)
-}
-
 fn union_member_name(ty: &Bound<'_, PyAny>) -> PyResult<String> {
     if ty.is_instance_of::<PyType>() && type_origin(ty)?.is_none() {
         type_name(ty)
@@ -429,7 +410,7 @@ fn union_member_name(ty: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 }
 
-fn type_name_of(obj: &Bound<'_, PyAny>) -> String {
+pub(crate) fn type_name_of(obj: &Bound<'_, PyAny>) -> String {
     obj.get_type()
         .name()
         .map_or_else(|_| "?".to_owned(), |name| name.to_string())

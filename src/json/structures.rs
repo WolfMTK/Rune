@@ -1,6 +1,6 @@
 use crate::common::base64;
 use crate::common::enums::{Scalar, Token, Value};
-use crate::common::reader::{Reader, kind};
+use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::Cursor;
 use crate::common::writer::Writer;
 use crate::constants::INITIAL_CAPACITY;
@@ -133,6 +133,8 @@ impl<'a> Parser<'a> {
         })
     }
 
+    #[cold]
+    #[inline(never)]
     pub(super) fn error(&self, message: &str) -> ParseError {
         ParseError::syntax(&format!("JSON is malformed: {message}"), self.position)
     }
@@ -159,6 +161,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[inline(always)]
     pub(super) fn next_element(
         &mut self,
         index: usize,
@@ -180,8 +183,8 @@ impl<'a> Parser<'a> {
                 }
                 Ok(true)
             }
-            None if index > 0 => Err(self.error("truncated")),
             _ if index == 0 => Ok(true),
+            None => Err(self.error("truncated")),
             _ => Err(self.error(message)),
         }
     }
@@ -458,6 +461,7 @@ impl<'a> Reader<'a> for Parser<'a> {
         self.expect(b'{', "Expected `{`").map(|()| None)
     }
 
+    #[inline(always)]
     fn has_next_item(&mut self, _len: Option<usize>, index: usize) -> Result<bool, ParseError> {
         self.next_element(
             index,
@@ -467,18 +471,19 @@ impl<'a> Reader<'a> for Parser<'a> {
         )
     }
 
+    #[inline]
     fn next_key(
         &mut self,
         _len: Option<usize>,
         index: usize,
-    ) -> Result<Option<Cow<'a, str>>, ParseError> {
+    ) -> Result<Option<Key<'a>>, ParseError> {
         if self.next_element(
             index,
             b'}',
             "expected ',' or '}'",
             "trailing comma in object",
         )? {
-            self.parse_key().map(Some)
+            self.parse_key().map(|key| Some(Key::Text(key)))
         } else {
             Ok(None)
         }

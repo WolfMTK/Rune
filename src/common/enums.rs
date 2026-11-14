@@ -819,7 +819,7 @@ impl Constraint {
     }
 
     pub(crate) fn applies_to(&self, subject: ConstraintSubject) -> bool {
-        use ConstraintSubject::*;
+        use ConstraintSubject::{Array, Bytes, DateTime, Float, Int, Object, Str, Time};
         match self {
             Self::Bound(..) | Self::MultipleOf(_) => matches!(subject, Int | Float),
             Self::Pattern { .. } => subject == Str,

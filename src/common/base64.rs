@@ -1,17 +1,7 @@
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const PADDING: u8 = b'=';
-const INVALID: u8 = u8::MAX;
-const DECODE_TABLE: [u8; 256] = decode_table();
-
-const fn decode_table() -> [u8; 256] {
-    let mut table = [INVALID; 256];
-    let mut index = 0;
-    while index < ALPHABET.len() {
-        table[ALPHABET[index] as usize] = index as u8;
-        index += 1;
-    }
-    table
-}
+use crate::constants::{
+    BASE64_ALPHABET as ALPHABET, BASE64_DECODE_TABLE as DECODE_TABLE, BASE64_INVALID as INVALID,
+    BASE64_PADDING as PADDING,
+};
 
 fn sextet(group: u32, shift: u32) -> u8 {
     ALPHABET[((group >> shift) & 0x3f) as usize]

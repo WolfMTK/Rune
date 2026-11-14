@@ -4,19 +4,9 @@ use crate::exceptions::ParseError;
 use std::borrow::Cow;
 use std::ops::{DerefMut, Range};
 pub(crate) mod kind {
-    pub(crate) const NULL: u16 = 1 << 0;
-    pub(crate) const BOOL: u16 = 1 << 1;
-    pub(crate) const INT: u16 = 1 << 2;
-    pub(crate) const BYTES: u16 = 1 << 3;
-    pub(crate) const FLOAT: u16 = 1 << 4;
-    pub(crate) const STR: u16 = 1 << 5;
-    pub(crate) const ARRAY: u16 = 1 << 6;
-    pub(crate) const MAP: u16 = 1 << 7;
-    pub(crate) const EXT: u16 = 1 << 8;
-    pub(crate) const ANY: u16 = u16::MAX;
-    pub(crate) const INTEGER: u16 = INT;
-    pub(crate) const NUMBER_OR_STR: u16 = INTEGER | FLOAT | STR;
-    pub(crate) const LITERAL: u16 = NULL | BOOL | INT | STR;
+    pub(crate) use crate::constants::kind::{
+        ANY, ARRAY, BOOL, BYTES, EXT, FLOAT, INT, INTEGER, LITERAL, MAP, NULL, NUMBER_OR_STR, STR,
+    };
 
     pub(crate) fn name(kind: u16) -> &'static str {
         match kind {

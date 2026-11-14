@@ -1,30 +1,7 @@
 use crate::common::enums::Token;
 use crate::common::writer::Writer;
-use crate::msgpack::structures::{LengthMarkers, MsgpackWriter};
-
-pub(crate) const STRING: LengthMarkers = LengthMarkers {
-    fixed: 0xa0,
-    fixed_max: 31,
-    wide8: Some(0xd9),
-    wide16: 0xda,
-    wide32: 0xdb,
-};
-
-const ARRAY: LengthMarkers = LengthMarkers {
-    fixed: 0x90,
-    fixed_max: 15,
-    wide8: None,
-    wide16: 0xdc,
-    wide32: 0xdd,
-};
-
-const MAP: LengthMarkers = LengthMarkers {
-    fixed: 0x80,
-    fixed_max: 15,
-    wide8: None,
-    wide16: 0xde,
-    wide32: 0xdf,
-};
+use crate::constants::{MSGPACK_ARRAY as ARRAY, MSGPACK_MAP as MAP};
+use crate::msgpack::structures::MsgpackWriter;
 
 impl Writer for MsgpackWriter {
     const BINARY: bool = true;

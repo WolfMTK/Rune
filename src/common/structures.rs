@@ -2,9 +2,7 @@ use crate::common::base64;
 use crate::common::cache::{
     cached_fields, cached_tag_lookup, enum_cache, literal_cache, plain_field_cache, plain_fields,
 };
-use crate::common::datetime_format::{
-    self, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND,
-};
+use crate::common::datetime_format;
 use crate::common::enums::{
     AbstractContainer, ArrayOutput, BytesType, Constraint, ConstraintSubject, Constructor,
     DecimalFormat, Failure, Insertion, Kind, Order, PathSegment, Primitive, Scalar, Shape, Token,
@@ -38,7 +36,10 @@ use crate::common::uuid_format;
 use crate::common::validate::{container_kind, ensure_union_is_unambiguous, validate_type};
 use crate::common::writer::Writer;
 use crate::common::{Format, recursion_limit};
-use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, TIMESTAMP_EXT_CODE};
+use crate::constants::{
+    MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE,
+    MICROS_PER_SECOND, TIMESTAMP_EXT_CODE,
+};
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
 use crate::msgpack::ext::{Ext, ext_type};
 use pyo3::exceptions::{

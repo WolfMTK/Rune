@@ -7,6 +7,8 @@ mod reader;
 mod structures;
 mod writer;
 
+pub(crate) use structures::LengthMarkers;
+
 format_bindings!(
     "rune.msgpack",
     Msgpack,

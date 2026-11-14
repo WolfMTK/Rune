@@ -73,7 +73,9 @@ pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind
     })
 }
 pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()> {
-    use UnionKind::*;
+    use UnionKind::{
+        Array, Custom, Deque, Dict, IntEnum, IntPlain, NamedTuple, StrEnum, StrPlain, StrStrict,
+    };
     if union_contains_any(ty)? {
         return Ok(());
     }
@@ -272,7 +274,9 @@ fn has_dict_like_option(options: &[UnionOption<'_>], kinds: &[UnionKind]) -> PyR
 }
 
 fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
-    use UnionKind::*;
+    use UnionKind::{
+        Array, Custom, Dict, IntEnum, IntPlain, NamedTuple, Other, StrEnum, StrPlain, StrStrict,
+    };
     if is_typevar(ty)? {
         let bound = ty.getattr(intern!(ty.py(), "__bound__"))?;
         return if bound.is_none() {

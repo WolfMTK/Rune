@@ -1,6 +1,6 @@
-const ONES: u64 = 0x0101_0101_0101_0101;
-const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
-const WORD: usize = 8;
+use crate::constants::{
+    JSON_WORD_HIGH_BITS as HIGH_BITS, JSON_WORD_ONES as ONES, JSON_WORD_SIZE as WORD,
+};
 
 fn special_byte_mask(word: u64) -> u64 {
     let zero_bytes = |v: u64| v.wrapping_sub(ONES) & !v & HIGH_BITS;

@@ -1,14 +1,15 @@
 use crate::common::py_typing::{default_factory_type, nodefault};
+use crate::constants::STRUCT_INFO_ATTRIBUTE as INFO_ATTRIBUTE;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
-use pyo3::prelude::*;
+use pyo3::prelude::{
+    PyAnyMethods, PyDictMethods, PyTupleMethods, PyTypeMethods, pyclass, pyfunction, pymethods,
+};
 use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 use pyo3::{Borrowed, Bound, Py, PyAny, PyErr, PyResult, PyTraverseError, PyVisit, Python, intern};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::ptr;
 use std::sync::OnceLock;
-
-const INFO_ATTRIBUTE: &str = "__rune_struct__";
 
 pub(crate) enum FieldDefault {
     Value(Py<PyAny>),

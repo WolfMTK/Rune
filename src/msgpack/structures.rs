@@ -2,11 +2,10 @@ use crate::common::enums::{Scalar, Value};
 use crate::common::macros::big_endian_readers;
 use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::Cursor;
-use crate::constants::INITIAL_CAPACITY;
+use crate::constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING};
 use crate::exceptions::ParseError;
 use crate::msgpack::enums::Container;
 use crate::msgpack::helpers::{invalid_opcode, truncated};
-use crate::msgpack::writer::STRING;
 use std::borrow::Cow;
 
 pub(crate) struct Parser<'a> {

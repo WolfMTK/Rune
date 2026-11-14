@@ -19,6 +19,11 @@ use crate::common::structures::{
 };
 use crate::common::types::{Decoded, Length, NodeId, Outcome};
 use crate::common::validate::validate_type;
+use crate::constants::{
+    BUILTIN_BYTEARRAY, BUILTIN_BYTES, BUILTIN_DATE, BUILTIN_DATETIME, BUILTIN_DECIMAL,
+    BUILTIN_MEMORYVIEW, BUILTIN_TIME, BUILTIN_TIMEDELTA, BUILTIN_UUID, INVALID_BUILTIN_TYPES,
+    MAX_SAFE_INTEGER,
+};
 use crate::msgpack::ext::Ext;
 use pyo3::exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::PyAnyMethods;
@@ -30,18 +35,6 @@ use pyo3::types::{
 };
 use pyo3::{Bound, PyAny, PyErr, PyResult, Python, intern, pyfunction};
 use std::borrow::Cow;
-
-const BUILTIN_BYTES: u16 = 1 << 0;
-const BUILTIN_BYTEARRAY: u16 = 1 << 1;
-const BUILTIN_MEMORYVIEW: u16 = 1 << 2;
-const BUILTIN_DATETIME: u16 = 1 << 3;
-const BUILTIN_DATE: u16 = 1 << 4;
-const BUILTIN_TIME: u16 = 1 << 5;
-const BUILTIN_TIMEDELTA: u16 = 1 << 6;
-const BUILTIN_UUID: u16 = 1 << 7;
-const BUILTIN_DECIMAL: u16 = 1 << 8;
-const INVALID_BUILTIN_TYPES: &str = "builtin_types must be an iterable of types";
-const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_992.0;
 
 type ShapeTest = fn(&Shape) -> bool;
 type TextParser = for<'a> fn(Python<'a>, &str) -> Outcome<Bound<'a, PyAny>>;

@@ -1,4 +1,4 @@
-const HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+use crate::constants::UUID_HYPHEN_POSITIONS as HYPHEN_POSITIONS;
 
 pub(crate) fn parse(text: &str) -> Option<[u8; 16]> {
     let bytes = text.as_bytes();

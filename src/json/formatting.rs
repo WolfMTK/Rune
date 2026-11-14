@@ -2,7 +2,9 @@ use crate::common::raw::input_bytes;
 use crate::constants::MAX_DEPTH;
 use crate::exceptions::ParseError;
 use crate::json::structures::Parser;
-use pyo3::prelude::*;
+use pyo3::prelude::{
+    Bound, PyAny, PyAnyMethods, PyBytesMethods, PyResult, Python, pyfunction,
+};
 use pyo3::types::{PyBytes, PyString};
 
 #[derive(Clone, Copy)]

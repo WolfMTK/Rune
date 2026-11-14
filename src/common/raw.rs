@@ -1,7 +1,9 @@
 use crate::common::py_typing::type_name;
 use pyo3::buffer::PyUntypedBuffer;
 use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::*;
+use pyo3::prelude::{
+    Bound, PyAnyMethods, PyBytesMethods, PyStringMethods, PyTypeMethods, pyclass, pymethods,
+};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyMemoryView, PyString, PyTuple, PyType};
 use pyo3::{Py, PyAny, PyResult, Python};

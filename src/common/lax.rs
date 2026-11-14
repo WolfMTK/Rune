@@ -1,11 +1,10 @@
 use crate::common::enums::{Primitive, Scalar};
+use crate::constants::MAX_SAFE_INTEGER;
 use crate::exceptions::ValidationError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{PyBool, PyFloat, PyInt};
 use pyo3::{Bound, PyAny, PyResult, Python};
-
-const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_992.0;
 
 pub(crate) fn primitive<'py>(
     py: Python<'py>,

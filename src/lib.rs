@@ -6,12 +6,14 @@ mod msgpack;
 
 #[pyo3::pymodule]
 mod rune {
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
+    use pyo3::prelude::{PyAnyMethods, PyModuleMethods};
+    use pyo3::types::{PyDict, PyModule};
+    use pyo3::{Bound, PyResult, pymodule};
 
     #[pymodule]
     mod json {
-        use pyo3::prelude::*;
+        use pyo3::types::PyModule;
+        use pyo3::{Bound, PyResult};
 
         #[pymodule_export]
         use crate::json::{Decoder, Encoder, format};
@@ -24,7 +26,8 @@ mod rune {
 
     #[pymodule]
     mod msgpack {
-        use pyo3::prelude::*;
+        use pyo3::types::PyModule;
+        use pyo3::{Bound, PyResult};
 
         #[pymodule_export]
         use crate::msgpack::ext::Ext;

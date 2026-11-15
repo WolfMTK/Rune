@@ -61,8 +61,8 @@ pub(crate) fn frozendict(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
             .ok()
             .map(Bound::unbind)
     })
-        .as_ref()
-        .map(|frozendict| frozendict.bind(py))
+    .as_ref()
+    .map(|frozendict| frozendict.bind(py))
 }
 
 fn type_alias_type(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
@@ -73,8 +73,8 @@ fn type_alias_type(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
             .ok()
             .map(Bound::unbind)
     })
-        .as_ref()
-        .map(|alias_type| alias_type.bind(py))
+    .as_ref()
+    .map(|alias_type| alias_type.bind(py))
 }
 
 pub(crate) fn is_type_alias(ty: &Bound<'_, PyAny>) -> bool {

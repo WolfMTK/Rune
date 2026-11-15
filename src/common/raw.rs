@@ -52,11 +52,9 @@ impl Raw {
             Source::Text(text) => text.bind(py).to_str()?.as_bytes(),
             Source::Slice { owner, range } => &owner.bind(py).as_bytes()[range.clone()],
             Source::Buffer(buffer) if buffer.len_bytes() == 0 => &[],
-            Source::Buffer(buffer) => {
-                unsafe {
-                    std::slice::from_raw_parts(buffer.buf_ptr().cast::<u8>(), buffer.len_bytes())
-                }
-            }
+            Source::Buffer(buffer) => unsafe {
+                std::slice::from_raw_parts(buffer.buf_ptr().cast::<u8>(), buffer.len_bytes())
+            },
         })
     }
 }

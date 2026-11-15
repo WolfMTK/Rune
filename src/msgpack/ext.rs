@@ -33,7 +33,7 @@ impl Ext {
                 data: PyBytes::new(py, data).into_any().unbind(),
             },
         )?
-            .into_any())
+        .into_any())
     }
 
     pub(crate) fn bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {

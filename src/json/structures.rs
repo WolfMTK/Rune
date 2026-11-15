@@ -1,7 +1,7 @@
 use crate::common::base64;
 use crate::common::enums::{Scalar, Token, Value};
 use crate::common::reader::{Key, Reader, kind};
-use crate::common::structures::Cursor;
+use crate::common::structures::cursor::Cursor;
 use crate::common::writer::Writer;
 use crate::constants::INITIAL_CAPACITY;
 use crate::exceptions::ParseError;

@@ -8,11 +8,11 @@ use pyo3::{PyResult, Python};
 
 pub(crate) mod base64;
 pub(crate) mod cache;
+pub(crate) mod callable;
 pub(crate) mod convert;
 pub(crate) mod datetime_format;
 pub(crate) mod enums;
 pub(crate) mod failure;
-pub(crate) mod callable;
 pub(crate) mod helpers;
 pub(crate) mod lax;
 pub(crate) mod macros;

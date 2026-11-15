@@ -11,7 +11,8 @@ use crate::common::py_typing::{
     type_origin, uuid,
 };
 use crate::common::raw::raw_type;
-use crate::common::structures::{StructSettings, Validator};
+use crate::common::structures::layout::StructSettings;
+use crate::common::structures::validator::Validator;
 use crate::common::types::UnionOption;
 use crate::msgpack::ext::ext_type;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError};

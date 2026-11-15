@@ -1,8 +1,10 @@
 use crate::common::enums::{Scalar, Value};
-use crate::common::structures::Cursor;
+
+use crate::common::structures::cursor::Cursor;
 use crate::exceptions::ParseError;
 use std::borrow::Cow;
 use std::ops::{DerefMut, Range};
+
 pub(crate) mod kind {
     pub(crate) use crate::constants::kind::{
         ANY, ARRAY, BOOL, BYTES, EXT, FLOAT, INT, INTEGER, LITERAL, MAP, NULL, NUMBER_OR_STR, STR,
@@ -46,7 +48,7 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
     fn open_map(&mut self) -> Result<Option<usize>, ParseError>;
     fn has_next_item(&mut self, len: Option<usize>, index: usize) -> Result<bool, ParseError>;
     fn next_key(&mut self, len: Option<usize>, index: usize)
-                -> Result<Option<Key<'a>>, ParseError>;
+    -> Result<Option<Key<'a>>, ParseError>;
 
     fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         Ok(None)

@@ -11,9 +11,12 @@ use crate::common::py_typing::{
 use crate::common::raw::{Raw, buffer_bytes};
 use crate::common::reader::kind;
 use crate::common::recursion_limit;
+use crate::common::structures::errors::Fail;
+use crate::common::structures::options::Hook;
+use crate::common::structures::plan::{LiteralPlan, Plan, StructPlan, UnionPlan};
+use crate::common::structures::values::custom_value;
 use crate::common::structures::{
-    Fail, Hook, LiteralPlan, Plan, StructPlan, UnionPlan, base64_text, custom_value,
-    date_from_text, datetime_from_epoch, datetime_from_text, decimal_from_text,
+    base64_text, date_from_text, datetime_from_epoch, datetime_from_text, decimal_from_text,
     duration_from_seconds, number_out_of_range, time_from_text, timedelta_from_text,
     uuid_from_bytes, uuid_from_text,
 };
@@ -331,12 +334,12 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
     fn accepts_none(&self, id: NodeId) -> bool {
         self.union_of(id).is_some_and(|union| union.accepts_none)
             || self
-            .find(id, |shape| match shape {
-                Shape::Primitive(Primitive::None) => true,
-                Shape::Literal(literal) => literal.accepted_kinds() & kind::NULL != 0,
-                _ => false,
-            })
-            .is_some()
+                .find(id, |shape| match shape {
+                    Shape::Primitive(Primitive::None) => true,
+                    Shape::Literal(literal) => literal.accepted_kinds() & kind::NULL != 0,
+                    _ => false,
+                })
+                .is_some()
     }
 
     fn constrain(&self, id: NodeId, value: Bound<'py, PyAny>) -> Decoded<'py> {
@@ -360,7 +363,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             return Err(PyRecursionError::new_err(
                 "maximum recursion depth exceeded while deserializing an object",
             )
-                .into());
+            .into());
         }
         self.depth_left -= 1;
         let result = body(self);
@@ -399,7 +402,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             } else {
                 "str"
             }
-                .to_owned(),
+            .to_owned(),
             Shape::Array(_) | Shape::NamedTuple(_) => "array".to_owned(),
             Shape::Dict { .. } | Shape::Frozendict { .. } => "object".to_owned(),
             Shape::Struct(plan) => container_name(plan).to_owned(),
@@ -1313,11 +1316,11 @@ fn literal_name(literal: &LiteralPlan) -> String {
         (kind::BOOL, "bool"),
         (kind::NULL, "null"),
     ]
-        .into_iter()
-        .filter(|(flag, _)| kinds & flag != 0)
-        .map(|(_, name)| name)
-        .collect::<Vec<_>>()
-        .join(" | ")
+    .into_iter()
+    .filter(|(flag, _)| kinds & flag != 0)
+    .map(|(_, name)| name)
+    .collect::<Vec<_>>()
+    .join(" | ")
 }
 
 fn push_unique(names: &mut Vec<String>, name: String) {
@@ -1366,6 +1369,6 @@ fn integral(value: f64) -> Option<i64> {
 fn is_number_text(text: &str) -> bool {
     !text.is_empty()
         && text
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
 }

@@ -7,8 +7,9 @@ use crate::common::py_typing::{
 use crate::common::raw::Raw;
 use crate::common::reader::kind;
 use crate::common::r#struct::StructInfo;
-use crate::common::structures::{
-    ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
+use crate::common::structures::layout::StructLayout;
+use crate::common::structures::plan::{
+    ArrayPlan, EnumPlan, LiteralPlan, StructPlan, TuplePlan, UnionPlan,
 };
 use crate::common::types::{ConstraintSetId, NodeId};
 use crate::exceptions::ParseError;

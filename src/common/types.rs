@@ -1,4 +1,6 @@
-use crate::common::structures::{Fail, ScalarIndex, StructSettings};
+use crate::common::structures::errors::Fail;
+use crate::common::structures::layout::StructSettings;
+use crate::common::structures::plan::ScalarIndex;
 use pyo3::{Bound, PyAny};
 use std::ops::RangeInclusive;
 

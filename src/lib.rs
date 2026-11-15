@@ -62,10 +62,7 @@ mod rune {
         modules.set_item("rune.json", m.getattr("json")?)?;
         modules.set_item("rune.msgpack", m.getattr("msgpack")?)?;
         m.add("_struct_lookup_cache", PyDict::new(m.py()))?;
-        m.add(
-            "_StructMixin",
-            crate::common::r#struct::mixin_type(m.py())?,
-        )?;
+        m.add("_StructMixin", crate::common::r#struct::mixin_type(m.py())?)?;
         Ok(())
     }
 }

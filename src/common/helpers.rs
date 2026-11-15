@@ -10,7 +10,10 @@ use crate::common::py_typing::{
 use crate::common::reader::kind;
 use crate::common::recursion_limit;
 use crate::common::r#struct::{StructInfo, own_info};
-use crate::common::structures::{Encoder, Fail, Hook, Plan, UnionPlan};
+use crate::common::structures::encoder::Encoder;
+use crate::common::structures::errors::Fail;
+use crate::common::structures::options::Hook;
+use crate::common::structures::plan::{Plan, UnionPlan};
 use crate::common::types::RuneMap;
 use crate::common::writer::Writer;
 use crate::constants::GENERATED_NAMEDTUPLE_PREFIX;
@@ -215,8 +218,8 @@ pub(crate) fn check_instantiable_alias(ty: &Bound<'_, PyAny>) -> PyResult<bool> 
     let py = ty.py();
     Ok(ty.get_type().is(typing_generic_alias(py)?)
         && ty
-        .getattr(intern!(py, "_inst"))
-        .is_ok_and(|inst| inst.is_truthy().unwrap_or(false)))
+            .getattr(intern!(py, "_inst"))
+            .is_ok_and(|inst| inst.is_truthy().unwrap_or(false)))
 }
 
 pub(crate) fn has_generated_new(class: &Bound<'_, PyAny>) -> bool {

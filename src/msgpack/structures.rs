@@ -1,7 +1,7 @@
 use crate::common::enums::{Scalar, Value};
 use crate::common::macros::big_endian_readers;
 use crate::common::reader::{Key, Reader, kind};
-use crate::common::structures::Cursor;
+use crate::common::structures::cursor::Cursor;
 use crate::constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING};
 use crate::exceptions::ParseError;
 use crate::msgpack::enums::Container;

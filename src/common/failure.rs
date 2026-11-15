@@ -1,5 +1,5 @@
 use crate::common::enums::PathSegment;
-use crate::common::structures::Fail;
+use crate::common::structures::errors::Fail;
 use crate::common::types::Length;
 use crate::constants::{KEY_PATH_PREFIX, PATH_PREFIX};
 use std::fmt::Write as _;

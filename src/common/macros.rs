@@ -23,7 +23,7 @@ pub(crate) fn unsupported_union(ty: &Bound<'_, PyAny>, reason: impl Display) -> 
 macro_rules! deref_to_cursor {
     ($parser:ident) => {
         impl<'a> ::core::ops::Deref for $parser<'a> {
-            type Target = $crate::common::structures::Cursor<'a>;
+            type Target = $crate::common::structures::cursor::Cursor<'a>;
 
             #[inline]
             fn deref(&self) -> &Self::Target {
@@ -88,8 +88,9 @@ macro_rules! format_bindings {
         use std::ffi::CStr;
         use $crate::common::callable::extract_keyword;
         use $crate::common::enums::{DecimalFormat, Order, UuidFormat};
-        use $crate::common::structures::{
-            DecoderCore, ExtraHooks, Hook, RequiredArgument, TypeArgument, reject_extra_arguments,
+        use $crate::common::structures::decoder::DecoderCore;
+        use $crate::common::structures::options::{
+            ExtraHooks, Hook, RequiredArgument, TypeArgument, reject_extra_arguments,
         };
         use $crate::common::helpers::{encode_object, encode_partial, type_name_of, write_into_buffer};
         use $crate::common::raw::input_bytes;

@@ -2,7 +2,7 @@ use crate::common::helpers::class_tag;
 use crate::common::py_typing::{
     builtin_generic_alias, plain_class_fields, struct_lookup_cache, type_args, typing_generic_alias,
 };
-use crate::common::structures::Field;
+use crate::common::structures::layout::Field;
 use crate::common::validate::{validate_i64_range, validate_literal_value};
 use crate::constants::{CACHE_ATTR, STRUCT_LOOKUP_CACHE_SIZE};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError};

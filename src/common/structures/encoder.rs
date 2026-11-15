@@ -9,7 +9,7 @@ use crate::common::py_typing::{
 use crate::common::raw::{Raw, buffer_bytes};
 use crate::common::r#struct::{FieldDefault, StructInfo};
 use crate::common::structures::layout::{Field, StructLayout, StructSettings};
-use crate::common::structures::{epoch_micros, temporal_text, timestamp_payload};
+use crate::common::structures::temporal::{epoch_micros, temporal_text, timestamp_payload};
 use crate::common::types::RuneMap;
 use crate::common::writer::Writer;
 use crate::common::{base64, uuid_format};

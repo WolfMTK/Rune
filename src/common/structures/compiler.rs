@@ -14,11 +14,10 @@ use crate::common::py_typing::{
     timedelta, type_args, type_name, type_origin, uuid,
 };
 use crate::common::raw::raw_type;
-use crate::common::structures::UnionMember;
 use crate::common::structures::layout::{StructLayout, TupleLayout};
 use crate::common::structures::plan::{
     ArrayPlan, ConstraintSet, EnumPlan, FieldPlan, LiteralPlan, Node, StructPlan, TuplePlan,
-    UnionPlan,
+    UnionMember, UnionPlan,
 };
 use crate::common::types::{NodeId, RuneMap, TagIndex};
 use crate::constants::kind;

@@ -6,7 +6,6 @@ use crate::common::helpers::{has_custom_missing, insert_new, plain_default};
 use crate::common::py_typing::is_type;
 use crate::common::reader::kind;
 use crate::common::r#struct;
-use crate::common::structures::UnionMember;
 use crate::common::structures::compiler::Compiler;
 use crate::common::structures::errors::Fail;
 use crate::common::types::{
@@ -467,4 +466,9 @@ fn raised_in(py: Python<'_>, err: &PyErr, function: &Bound<'_, PyAny>) -> PyResu
         traceback = (!next.is_none()).then_some(next);
     }
     Ok(false)
+}
+
+pub(crate) struct UnionMember {
+    pub(crate) ty: Py<PyAny>,
+    pub(crate) node: NodeId,
 }

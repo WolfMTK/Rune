@@ -1,7 +1,8 @@
 use crate::common::enums::{Failure, PathSegment};
 use crate::common::failure::with_path;
+use crate::common::reader::kind;
 use crate::exceptions::{DecodeError, ParseError, ValidationError};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::{PyErr, Python};
 
 pub(crate) struct Fail(Box<Failure>);
@@ -91,5 +92,23 @@ impl From<PyErr> for Fail {
 impl From<Failure> for Fail {
     fn from(failure: Failure) -> Self {
         Self(Box::new(failure))
+    }
+}
+
+#[cold]
+pub(crate) fn non_text_key(found: u16) -> Fail {
+    Fail::mismatch("str", kind::container_name(found)).at(PathSegment::DictKey)
+}
+
+#[cold]
+pub(crate) fn number_out_of_range() -> Fail {
+    Fail::invalid("Number out of range".to_owned())
+}
+
+pub(crate) fn overflow_failure(py: Python<'_>, err: PyErr, message: &str) -> Fail {
+    if err.is_instance_of::<PyOverflowError>(py) || err.is_instance_of::<PyValueError>(py) {
+        Fail::invalid(message.to_owned())
+    } else {
+        Fail::from(err)
     }
 }

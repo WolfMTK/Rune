@@ -9,15 +9,17 @@ use crate::common::raw::Raw;
 use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::cursor::Checkpoint;
 use crate::common::structures::decoder::DecoderCore;
-use crate::common::structures::errors::Fail;
+use crate::common::structures::errors::{Fail, non_text_key, number_out_of_range};
 use crate::common::structures::plan::{
     ArrayPlan, EnumPlan, LiteralPlan, Plan, StructPlan, TuplePlan, UnionPlan,
 };
-use crate::common::structures::values::custom_value;
-use crate::common::structures::{
-    base64_text, big_integer_as_float, date_from_text, datetime_from_epoch, datetime_from_text,
-    datetime_from_timestamp, decimal_from_text, duration_from_seconds, non_text_key,
-    number_out_of_range, time_from_text, timedelta_from_text, uuid_from_bytes, uuid_from_text,
+use crate::common::structures::temporal::{
+    date_from_text, datetime_from_epoch, datetime_from_text, datetime_from_timestamp,
+    duration_from_seconds, time_from_text, timedelta_from_text,
+};
+use crate::common::structures::values::{
+    base64_text, big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes,
+    uuid_from_text,
 };
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,

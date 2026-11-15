@@ -36,17 +36,19 @@ impl<'a, 'py> Arguments<'a, 'py> {
         py: Python<'py>,
         args: *const *mut ffi::PyObject,
         nargs: ffi::Py_ssize_t,
-        kwnames: *mut ffi::PyObject,
+        kwtuple: *mut ffi::PyObject,
     ) -> Self {
         let positional_count = nargs as usize;
-        let keyword_count = if kwnames.is_null() {
+        let keyword_count = if kwtuple.is_null() {
             0
         } else {
-            unsafe { ffi::PyTuple_GET_SIZE(kwnames) as usize }
+            // SAFETY: the interpreter passes kwtuple as a tuple.
+            unsafe { ffi::PyTuple_GET_SIZE(kwtuple) as usize }
         };
         let values: &'a [*mut ffi::PyObject] = if args.is_null() {
             &[]
         } else {
+            // SAFETY: args is a valid pointer array.
             unsafe { std::slice::from_raw_parts(args, positional_count + keyword_count) }
         };
         let (positional, keyword_values) = values.split_at(positional_count);
@@ -54,11 +56,12 @@ impl<'a, 'py> Arguments<'a, 'py> {
             py,
             positional,
             keyword_values,
-            keyword_names: kwnames,
+            keyword_names: kwtuple,
         }
     }
 
     fn borrow(&self, pointer: *mut ffi::PyObject) -> Borrowed<'a, 'py, PyAny> {
+        // SAFETY: the pointer is valid during the call.
         unsafe { Borrowed::from_ptr(self.py, pointer) }
     }
 
@@ -78,15 +81,18 @@ impl<'a, 'py> Arguments<'a, 'py> {
     ) -> PyResult<[Option<Borrowed<'a, 'py, PyAny>>; N]> {
         let mut found = [None; N];
         for (index, &value) in self.keyword_values.iter().enumerate() {
+            // SAFETY: index is in bounds.
             let keyword = self.borrow(unsafe {
                 ffi::PyTuple_GET_ITEM(self.keyword_names, index as ffi::Py_ssize_t)
             });
-            let slot = match names.iter().position(|name| name.is(keyword)) {
-                Some(slot) => Some(slot),
-                None => names
-                    .iter()
-                    .position(|name| name.as_any().eq(keyword).unwrap_or(false)),
-            };
+            let slot = names
+                .iter()
+                .position(|name| name.is(keyword))
+                .or_else(|| {
+                    names
+                        .iter()
+                        .position(|name| name.as_any().eq(keyword).unwrap_or(false))
+                });
             let Some(slot) = slot else {
                 return Err(extra_keyword());
             };
@@ -145,14 +151,15 @@ impl<F: Function> MethodDef<fastcall_cfunction_with_keywords::Func> for Definiti
     const METH: fastcall_cfunction_with_keywords::Func = call::<F>;
 }
 
-unsafe fn call<'py, F: Function>(
-    py: Python<'py>,
+unsafe fn call<F: Function>(
+    py: Python,
     _module: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
     nargs: ffi::Py_ssize_t,
-    kwnames: *mut ffi::PyObject,
+    kwtuple: *mut ffi::PyObject,
 ) -> PyResult<*mut ffi::PyObject> {
-    let arguments = unsafe { Arguments::new(py, args, nargs, kwnames) };
+    // SAFETY: the argument layout is guaranteed by the interpreter.
+    let arguments = unsafe { Arguments::new(py, args, nargs, kwtuple) };
     F::call(py, &arguments).map(Bound::into_ptr)
 }
 
@@ -162,19 +169,17 @@ impl<M: Method> MethodDef<fastcall_cfunction_with_keywords::Func> for MethodDefi
     const METH: fastcall_cfunction_with_keywords::Func = call_method::<M>;
 }
 
-unsafe fn call_method<'py, M: Method>(
-    py: Python<'py>,
+unsafe fn call_method<M: Method>(
+    py: Python,
     receiver: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
     nargs: ffi::Py_ssize_t,
-    kwnames: *mut ffi::PyObject,
+    kwtuple: *mut ffi::PyObject,
 ) -> PyResult<*mut ffi::PyObject> {
-    let (arguments, receiver) = unsafe {
-        (
-            Arguments::new(py, args, nargs, kwnames),
-            Borrowed::from_ptr(py, receiver),
-        )
-    };
+    // SAFETY: receiver and arguments are provided by the interpreter.
+    let arguments = unsafe { Arguments::new(py, args, nargs, kwtuple) };
+    // SAFETY: receiver is provided by the interpreter.
+    let receiver = unsafe { Borrowed::from_ptr(py, receiver) };
     M::call(py, receiver, &arguments).map(Bound::into_ptr)
 }
 
@@ -199,6 +204,7 @@ pub(crate) fn add_method<M: Method>(ty: &Bound<'_, PyType>) -> PyResult<()> {
         M::DOC,
         fastcall_cfunction_with_keywords::<MethodDefinition<M>>,
     );
+    // SAFETY: definition is static and outlives the descriptor.
     let descriptor = unsafe {
         Bound::from_owned_ptr_or_err(
             ty.py(),
@@ -216,6 +222,7 @@ pub(crate) fn add_function<F: Function>(module: &Bound<'_, PyModule>) -> PyResul
         fastcall_cfunction_with_keywords::<Definition<F>>,
     );
     let module_name = module.name()?;
+    // SAFETY: definition is static and outlives the function.
     let function = unsafe {
         Bound::from_owned_ptr_or_err(
             py,

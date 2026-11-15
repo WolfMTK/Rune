@@ -8,7 +8,6 @@ use pyo3::{PyResult, Python};
 
 pub(crate) mod cache;
 pub(crate) mod callable;
-pub(crate) mod convert;
 pub(crate) mod datetime_format;
 pub(crate) mod enums;
 pub(crate) mod failure;

@@ -42,7 +42,7 @@ mod rune {
     }
 
     #[pymodule_export]
-    use crate::common::convert::convert;
+    use crate::common::structures::convert::convert;
 
     #[pymodule_export]
     use crate::common::raw::Raw;

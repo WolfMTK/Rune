@@ -10,9 +10,11 @@ use pyo3::{
 
 use crate::{
     common::{
-        datetime_format,
         py_typing::{date, datetime, time, timedelta},
-        structures::errors::{Fail, overflow_failure},
+        structures::{
+            datetime_format,
+            errors::{Fail, overflow_failure},
+        },
         types::{Decoded, Outcome},
     },
     constants::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND},

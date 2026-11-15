@@ -4,9 +4,9 @@ use std::{
 };
 
 use crate::{
-    common::{
+    common::structures::{
+        cursor::Cursor,
         enums::{Scalar, Value},
-        structures::cursor::Cursor,
     },
     exceptions::ParseError,
 };

@@ -1,11 +1,11 @@
 use pyo3::{Bound, PyAny, PyResult};
 
 use crate::common::{
-    enums::{Primitive, Shape},
     py_typing::type_name,
     reader::kind,
     structures::{
         converter::convert::ObjectConverter,
+        enums::{Primitive, Shape},
         errors::Fail,
         plan::{LiteralPlan, StructPlan, UnionPlan},
     },

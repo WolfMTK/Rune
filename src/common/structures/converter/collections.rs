@@ -6,11 +6,11 @@ use pyo3::{
 };
 
 use crate::common::{
-    enums::{ArrayOutput, PathSegment},
     failure::LengthRule,
     reader::{Key, Reader, kind},
     structures::{
         converter::decode::Converter,
+        enums::{ArrayOutput, PathSegment},
         plan::{ArrayPlan, TuplePlan},
     },
     types::{Decoded, Length, NodeId, Outcome},

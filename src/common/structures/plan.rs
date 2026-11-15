@@ -1,26 +1,45 @@
+use std::collections::hash_map::Entry;
+
 use pyo3::{
     Bound, Py, PyAny, PyErr, PyResult, Python,
     exceptions::PyTypeError,
     intern,
     prelude::{PyAnyMethods, PyDictMethods},
     types::{
-        PyBool, PyBoolMethods, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString,
+        PyBool, PyBoolMethods, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString,
         PyStringMethods, PyTuple, PyType,
     },
 };
 
-use crate::common::{
-    cache::{enum_cache, literal_cache},
-    enums::{
-        ArrayOutput, Constraint, ConstraintSubject, Constructor, Insertion, Primitive, Scalar,
-        Shape,
+use crate::{
+    common::{
+        aliases::type_arg_or_any,
+        cache::{enum_cache, literal_cache},
+        classes::{is_named_tuple_class, struct_class},
+        defaults::plain_default,
+        py_typing::{
+            date, datetime, decimal_type, deque, enum_type, frozendict, is_annotated_origin,
+            is_enum_class, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
+            is_type, is_typeddict_class, is_typevar, new_type_supertype, origin_or_self, time,
+            timedelta, type_args, type_origin, uuid,
+        },
+        reader::kind,
+        r#struct,
+        structures::{
+            compiler::Compiler,
+            enums::{
+                AbstractContainer, ArrayOutput, Constraint, ConstraintSubject, Constructor,
+                Insertion, Primitive, Scalar, Shape, UnionKind,
+            },
+            errors::Fail,
+            layout::StructSettings,
+        },
+        types::{
+            ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,
+        },
+        validate::enum_values,
     },
-    helpers::{has_custom_missing, insert_new, plain_default},
-    py_typing::is_type,
-    reader::kind,
-    r#struct,
-    structures::{compiler::Compiler, errors::Fail},
-    types::{ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex},
+    msgpack::ext::ext_type,
 };
 
 pub(crate) struct Plan {
@@ -476,4 +495,132 @@ fn raised_in(py: Python<'_>, err: &PyErr, function: &Bound<'_, PyAny>) -> PyResu
 pub(crate) struct UnionMember {
     pub(crate) ty: Py<PyAny>,
     pub(crate) node: NodeId,
+}
+
+fn has_custom_missing(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = ty.py();
+    let (missing, func) = (intern!(py, "_missing_"), intern!(py, "__func__"));
+    let default = enum_type(py)?.getattr(missing)?.getattr(func)?;
+    let own = ty.getattr(missing)?.getattr_opt(func)?;
+    Ok(own.is_none_or(|own| !own.is(&default)))
+}
+
+fn insert_new<K, T>(entry: Entry<'_, K, T>, value: T) -> Insertion {
+    match entry {
+        Entry::Occupied(_) => Insertion::Duplicate,
+        Entry::Vacant(slot) => {
+            slot.insert(value);
+            Insertion::Added
+        }
+    }
+}
+
+pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind>> {
+    let is_frozendict = frozendict(ty.py()).is_some_and(|frozendict| ty.is(frozendict));
+    Ok(if is_type::<PyDict>(ty) || is_frozendict {
+        Some(UnionKind::Dict)
+    } else if is_type::<PyList>(ty)
+        || is_type::<PySet>(ty)
+        || is_type::<PyFrozenSet>(ty)
+        || is_type::<PyTuple>(ty)
+    {
+        Some(UnionKind::Array)
+    } else if ty.is(deque(ty.py())?) {
+        Some(UnionKind::Deque)
+    } else {
+        AbstractContainer::of(ty)?.map(|container| match container {
+            AbstractContainer::Mapping => UnionKind::Dict,
+            AbstractContainer::Sequence | AbstractContainer::Set => UnionKind::Array,
+        })
+    })
+}
+
+pub(crate) fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
+    use crate::common::structures::enums::UnionKind::{
+        Array, Custom, Dict, IntEnum, IntPlain, NamedTuple, Other, StrEnum, StrPlain, StrStrict,
+    };
+    if is_typevar(ty)? {
+        let bound = ty.getattr(intern!(ty.py(), "__bound__"))?;
+        return if bound.is_none() {
+            Ok(Other)
+        } else {
+            union_kind(&bound)
+        };
+    } else if is_new_type(ty)? {
+        return union_kind(&new_type_supertype(ty)?);
+    } else if let Some(class) = struct_class(ty)? {
+        return Ok(if StructSettings::of_class(&class)?.array_like {
+            Array
+        } else {
+            Dict
+        });
+    } else if is_named_tuple_class(&origin_or_self(ty)?)? {
+        return Ok(NamedTuple);
+    } else if let Some(origin) = type_origin(ty)? {
+        if is_annotated_origin(&origin)? {
+            return union_kind(&ty.getattr(intern!(ty.py(), "__origin__"))?);
+        }
+        if is_final_origin(&origin)? {
+            return union_kind(&type_arg_or_any(ty, 0)?);
+        }
+        if is_literal_origin(&origin)? {
+            return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));
+        }
+        if is_plain_or_typeddict(&origin)? {
+            return Ok(Dict);
+        }
+        return Ok(container_kind(&origin)?.unwrap_or(Other));
+    }
+    let is_bool_or_float = is_type::<PyBool>(ty) || is_type::<PyFloat>(ty);
+    Ok(if !ty.is_instance_of::<PyType>() || is_bool_or_float {
+        Other
+    } else if is_enum_class(ty)? {
+        value_kind(&enum_values(ty)?, IntEnum, StrEnum)
+    } else if is_type::<PyInt>(ty) {
+        IntPlain
+    } else if is_type::<PyString>(ty) {
+        StrPlain
+    } else if is_strict_str_type(ty)? {
+        StrStrict
+    } else if let Some(kind) = container_kind(ty)? {
+        kind
+    } else if is_plain_or_typeddict(ty)? {
+        Dict
+    } else if ty.is(ext_type(ty.py())) {
+        Other
+    } else {
+        Custom
+    })
+}
+
+fn value_kind(values: &[Bound<'_, PyAny>], int_kind: UnionKind, str_kind: UnionKind) -> UnionKind {
+    if values.is_empty() {
+        UnionKind::Other
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyInt>)
+    {
+        int_kind
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyString>)
+    {
+        str_kind
+    } else {
+        UnionKind::Other
+    }
+}
+
+fn is_strict_str_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = ty.py();
+    Ok(ty.is(datetime(py)?)
+        || ty.is(date(py)?)
+        || ty.is(time(py)?)
+        || ty.is(uuid(py)?)
+        || ty.is(decimal_type(py)?)
+        || ty.is(timedelta(py)?))
+}
+
+pub(crate) fn is_plain_or_typeddict(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(is_typeddict_class(ty)? || is_plain_class(ty)?)
 }

@@ -2,34 +2,37 @@ use std::rc::Rc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::{
-    Bound, Py, PyAny, PyResult,
-    exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError},
+    Bound, Py, PyAny, PyErr, PyResult, Python,
+    exceptions::{PyKeyError, PyOverflowError, PyRecursionError, PyTypeError, PyValueError},
     intern,
     prelude::{
         PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
     },
+    sync::PyOnceLock,
     types::{
         PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyFrozenSet, PyFrozenSetMethods, PyInt,
-        PyList, PySet, PySetMethods, PyString, PyTuple, PyTupleMethods, PyType,
+        PyList, PySet, PySetMethods, PySlice, PyString, PyTuple, PyTupleMethods, PyType,
     },
 };
 use uuid::Uuid;
 
 use crate::{
     common::{
-        enums::{BytesType, DecimalFormat, Kind, Order, Token, UuidFormat},
-        helpers::{
-            class_default, int_token, is_struct_class, unsupported_key_error,
-            unsupported_type_error,
-        },
+        classes::is_struct_class,
+        defaults::class_default,
+        naming::type_name_of,
         py_typing::{
-            decimal_type, is_decimal, is_enum_class, is_frozendict_type, is_plain_class,
+            any, decimal_type, is_decimal, is_enum_class, is_frozendict_type, is_plain_class,
             is_temporal_type, is_type, object_type, unset, uuid,
         },
         raw::{Raw, buffer_bytes},
+        recursion_limit,
         r#struct::{FieldDefault, StructInfo},
         structures::{
+            enums::{BytesType, DecimalFormat, Kind, Order, Token, UuidFormat},
             layout::{Field, StructLayout, StructSettings},
+            options::Hook,
+            plan::Plan,
             temporal::{epoch_micros, temporal_text, timestamp_payload},
         },
         types::RuneMap,
@@ -646,4 +649,91 @@ fn is_empty_container_type(factory: &Bound<'_, PyAny>) -> bool {
         || is_type::<PyDict>(factory)
         || is_type::<PySet>(factory)
         || is_type::<PyByteArray>(factory)
+}
+
+pub(crate) fn untyped_plan(py: Python<'_>) -> PyResult<&'static Plan> {
+    static PLAN: PyOnceLock<Plan> = PyOnceLock::new();
+    PLAN.get_or_try_init(py, || Plan::compile(any(py)?, false, false))
+}
+
+pub(crate) fn encode_object<'py, W: Writer>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    hook: &Hook,
+    decimal_format: &DecimalFormat,
+    order: Order,
+    uuid_format: UuidFormat,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (result, encoded) = encode_partial::<W>(py, obj, hook, decimal_format, order, uuid_format);
+    result?;
+    Ok(PyBytes::new(py, &encoded))
+}
+
+pub(crate) fn encode_partial<'py, W: Writer>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    hook: &Hook,
+    decimal_format: &DecimalFormat,
+    order: Order,
+    uuid_format: UuidFormat,
+) -> (PyResult<()>, Vec<u8>) {
+    let depth_left = match recursion_limit(py) {
+        Ok(limit) => limit,
+        Err(err) => return (Err(err), Vec::new()),
+    };
+    let mut encoder = Encoder {
+        writer: W::default(),
+        depth_left,
+        hook: hook.bind(py),
+        decimal_format,
+        order,
+        uuid_format,
+        encoding_decimal_replacement: false,
+        kinds: RuneMap::default(),
+        enum_values: RuneMap::default(),
+        pending_fields: Vec::new(),
+    };
+    let result = encoder.encode(obj);
+    (result, encoder.writer.finish())
+}
+
+pub(crate) fn write_into_buffer<'py>(
+    py: Python<'py>,
+    buffer: &Bound<'py, PyByteArray>,
+    offset: isize,
+    encoded: &[u8],
+) -> PyResult<()> {
+    let len = buffer.len();
+    let start = usize::try_from(offset).unwrap_or(len);
+    if start > len {
+        let padding = PyBytes::new(py, &vec![0; start - len]);
+        buffer.call_method1(intern!(py, "extend"), (padding,))?;
+    }
+    buffer.set_item(
+        PySlice::new(py, start as isize, isize::MAX, 1),
+        PyBytes::new(py, encoded),
+    )
+}
+
+pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<Token<'static>> {
+    obj.extract::<i64>()
+        .map(Token::Int)
+        .or_else(|_| obj.extract::<u64>().map(Token::UInt))
+        .map_err(|_| {
+            PyOverflowError::new_err("Integer is out of range for this encoder (64-bit only)")
+        })
+}
+
+pub(crate) fn unsupported_key_error(key: &Bound<'_, PyAny>) -> PyErr {
+    PyTypeError::new_err(format!(
+        "Only dicts with str-like or number-like keys are supported, got {}",
+        type_name_of(key)
+    ))
+}
+
+pub(crate) fn unsupported_type_error(obj: &Bound<'_, PyAny>) -> PyErr {
+    PyTypeError::new_err(format!(
+        "Encoding objects of type {} is unsupported",
+        type_name_of(obj)
+    ))
 }

@@ -5,10 +5,10 @@ use pyo3::{
 
 use crate::{
     common::{
-        enums::{Scalar, Value},
         reader::{Reader, kind},
         structures::{
             converter::decode::Converter,
+            enums::{Scalar, Value},
             errors::{Fail, number_out_of_range},
             temporal::datetime_from_timestamp,
         },

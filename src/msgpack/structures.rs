@@ -2,10 +2,12 @@ use std::borrow::Cow;
 
 use crate::{
     common::{
-        enums::{Scalar, Value},
         macros::big_endian_readers,
         reader::{Key, Reader, kind},
-        structures::cursor::Cursor,
+        structures::{
+            cursor::Cursor,
+            enums::{Scalar, Value},
+        },
     },
     constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING},
     exceptions::ParseError,

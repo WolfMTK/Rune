@@ -5,12 +5,12 @@ use pyo3::{
 };
 
 use crate::common::{
-    enums::PathSegment,
     failure::LengthRule,
-    helpers::type_name_of,
+    naming::type_name_of,
     reader::{Key, Reader, kind},
     structures::{
         converter::{convert::ObjectConverter, decode::Converter},
+        enums::PathSegment,
         errors::Fail,
         plan::{StructPlan, UnionPlan},
     },

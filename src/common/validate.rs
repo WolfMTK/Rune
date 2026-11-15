@@ -2,39 +2,41 @@ use pyo3::{
     Bound, PyAny, PyResult,
     exceptions::{PyNotImplementedError, PyTypeError},
     intern,
-    prelude::{PyAnyMethods, PySetMethods},
-    types::{PyBool, PyInt, PyNone, PySet, PyString},
+    prelude::PyAnyMethods,
+    types::{PyBool, PyInt, PyNone, PyString},
 };
 
-pub(crate) use crate::common::helpers::{
-    is_plain_or_typeddict, resolve_type_aliases, struct_class, union_contains_any, union_kind,
-    union_members,
-};
 use crate::common::{
-    enums::UnionKind,
+    aliases::{resolve_type_aliases, union_contains_any, union_members},
+    classes::struct_class,
     macros::reject_union_if,
     py_typing::{
         is_enum_class, is_plain_class, is_type, is_typeddict_class, is_unset_type, origin_or_self,
     },
     raw::raw_type,
-    structures::{layout::StructSettings, validator::Validator},
+    structures::{
+        enums::UnionKind,
+        layout::StructSettings,
+        plan::{is_plain_or_typeddict, union_kind},
+        validator::Validator,
+    },
     types::UnionOption,
 };
 
 pub(crate) fn validate_literal_value(value: &Bound<'_, PyAny>) -> PyResult<()> {
     if value.is_exact_instance_of::<PyInt>() {
-        validate_i64_range(value, "Literal")
-    } else if value.is_none()
-        || value.is_exact_instance_of::<PyBool>()
-        || value.is_exact_instance_of::<PyString>()
-    {
-        Ok(())
-    } else {
-        Err(PyTypeError::new_err(format!(
-            "Literal value {} is not supported, expected an int, str, bool or None",
-            value.repr()?
-        )))
+        return validate_i64_range(value, "Literal");
     }
+    let allowed = value.is_none()
+        || value.is_exact_instance_of::<PyBool>()
+        || value.is_exact_instance_of::<PyString>();
+    if allowed {
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!(
+        "Literal value {} is not supported, expected an int, str, bool or None",
+        value.repr()?
+    )))
 }
 
 pub(crate) fn validate_i64_range(value: &Bound<'_, PyAny>, label: &str) -> PyResult<()> {
@@ -73,24 +75,25 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
     if members.len() < 2 {
         return Ok(());
     }
-    let mut options: Vec<UnionOption<'_>> = Vec::with_capacity(members.len());
-    for option in members {
-        let settings = struct_class(&option)?
-            .map(|class| StructSettings::of_class(&class))
-            .transpose()?;
-        options.push((option, settings));
-    }
-    ensure_union_structs_are_valid(ty, &options)?;
-    let mut seen_tagged = false;
-    let options: Vec<_> = options
+    let mut options: Vec<UnionOption<'_>> = members
         .into_iter()
-        .filter(|(_, settings)| {
-            let is_tagged = settings.as_ref().is_some_and(|s| s.tag.is_some());
-            let repeats_tagged_group = is_tagged && seen_tagged;
-            seen_tagged |= is_tagged;
-            !repeats_tagged_group
+        .map(|option| {
+            struct_class(&option)?
+                .map(|class| StructSettings::of_class(&class))
+                .transpose()
+                .map(|settings| (option, settings))
         })
-        .collect();
+        .collect::<PyResult<_>>()?;
+    ensure_union_structs_are_valid(ty, &options)?;
+
+    let mut seen_tagged = false;
+    options.retain(|(_, settings)| {
+        let is_tagged = settings.as_ref().is_some_and(|s| s.tag.is_some());
+        let keep = !is_tagged || !seen_tagged;
+        seen_tagged |= is_tagged;
+        keep
+    });
+
     let kinds = options
         .iter()
         .map(|(option, settings)| match settings {
@@ -99,26 +102,39 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
             None => union_kind(option),
         })
         .collect::<PyResult<Vec<_>>>()?;
+
     let count = |wanted: &[UnionKind]| kinds.iter().filter(|kind| wanted.contains(kind)).count();
-    let has_many_dicts = count(&[Dict]) > 1;
+    let int_enums = count(&[IntEnum]);
+    let int_like = count(&[IntEnum, IntPlain]);
+    let str_enums = count(&[StrEnum]);
+    let str_enum_or_strict = count(&[StrEnum, StrStrict]);
+    let str_like = count(&[StrEnum, StrStrict, StrPlain]);
+    let dicts = count(&[Dict]);
+    let named_tuples = count(&[NamedTuple]);
+    let array_like = count(&[Array, NamedTuple]);
+    let custom_like = count(&[Custom, Deque]);
+    let deques = count(&[Deque]);
+    let customs = count(&[Custom]);
+    let has_many_dicts = dicts > 1;
     let has_dict_like = has_many_dicts && has_dict_like_option(&options, &kinds)?;
     let typed_dicts = count_options(&options, is_typeddict_class)?;
     let dataclasses = count_options(&options, is_plain_class)?;
+
     let rules = [
         (
-            count(&[IntEnum]) > 1,
+            int_enums > 1,
             "it may not contain more than one int enum type",
         ),
         (
-            count(&[StrEnum]) > 1,
+            str_enums > 1,
             "it may not contain more than one str enum type",
         ),
         (
-            count(&[IntEnum]) >= 1 && count(&[IntEnum, IntPlain]) > 1,
+            int_enums >= 1 && int_like > 1,
             "it may not contain more than one int-like type",
         ),
         (
-            count(&[StrEnum, StrStrict]) >= 1 && count(&[StrEnum, StrStrict, StrPlain]) > 1,
+            str_enum_or_strict >= 1 && str_like > 1,
             "it may not contain more than one str-like type",
         ),
         (
@@ -135,31 +151,32 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
         ),
         (has_many_dicts, "it may not contain more than one dict type"),
         (
-            count(&[NamedTuple]) > 1,
+            named_tuples > 1,
             "it may not contain more than one NamedTuple type",
         ),
         (
-            count(&[Array, NamedTuple]) > 1,
+            array_like > 1,
             "it may not contain more than one array-like type",
         ),
         (
-            count(&[Custom, Deque]) > 1,
+            custom_like > 1,
             "it may not contain more than one custom type",
         ),
         (
-            count(&[Deque]) > 0,
+            deques > 0,
             "contains a custom type (collections.deque), which can't be used in a union",
         ),
         (
-            count(&[Custom]) > 0,
+            customs > 0,
             "it may not combine a custom type with types other than None",
         ),
     ];
-    for (violated, reason) in rules {
-        reject_union_if!(ty, violated, reason);
+    if let Some((_, reason)) = rules.iter().find(|(violated, _)| *violated) {
+        reject_union_if!(ty, true, reason);
     }
     Ok(())
 }
+
 fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
     let values = enum_values(ty)?;
     if values.is_empty() {
@@ -167,8 +184,12 @@ fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
             "Enum types must have at least one item",
         ));
     }
-    let all_str = values.iter().all(PyAnyMethods::is_instance_of::<PyString>);
-    let all_int = values.iter().all(PyAnyMethods::is_instance_of::<PyInt>);
+    let (all_str, all_int) = values.iter().fold((true, true), |(s, i), value| {
+        (
+            s && value.is_instance_of::<PyString>(),
+            i && value.is_instance_of::<PyInt>(),
+        )
+    });
     if all_str || all_int {
         return Ok(());
     }
@@ -176,6 +197,12 @@ fn validate_enum(ty: &Bound<'_, PyAny>) -> PyResult<()> {
         "Enums must contain either all str or all int values, got {}",
         ty.repr()?
     )))
+}
+
+#[derive(PartialEq)]
+enum Tag<'a> {
+    Int(i64),
+    Str(&'a str),
 }
 
 fn ensure_union_structs_are_valid(
@@ -190,44 +217,46 @@ fn ensure_union_structs_are_valid(
         return Ok(());
     };
     let first_tagged = structs.iter().find(|settings| settings.tag.is_some());
-    for settings in &structs {
-        reject_union_if!(
-            ty,
-            settings.array_like != first.array_like,
-            "structs in a union must all have the same `array_like` setting"
-        );
-        reject_union_if!(
-            ty,
-            settings.tag.is_some()
-                && first_tagged.is_some_and(|tagged| settings.tag_field != tagged.tag_field),
-            "structs in a union must all use the same `tag_field`"
-        );
-    }
-    let py = ty.py();
-    let tags: Vec<_> = structs
-        .iter()
-        .filter_map(|settings| settings.tag.as_ref().map(|tag| tag.bind(py)))
-        .collect();
     reject_union_if!(
         ty,
-        tags.len() < structs.len(),
+        !structs.iter().all(|s| s.array_like == first.array_like),
+        "structs in a union must all have the same `array_like` setting"
+    );
+    reject_union_if!(
+        ty,
+        structs.iter().any(|s| {
+            s.tag.is_some() && first_tagged.is_some_and(|tagged| s.tag_field != tagged.tag_field)
+        }),
+        "structs in a union must all use the same `tag_field`"
+    );
+    let py = ty.py();
+    reject_union_if!(
+        ty,
+        structs.iter().any(|s| s.tag.is_none()),
         "structs in a union must be tagged (set `tag`) so they can be told apart"
     );
-    reject_union_if!(
-        ty,
-        tags.iter().any(|tag| tag.is_instance_of::<PyString>())
-            && tags.iter().any(|tag| tag.is_instance_of::<PyInt>()),
-        "a union can't mix both `int` and `str` tags"
-    );
-    let seen = PySet::empty(py)?;
-    for tag in tags {
+    let mut tags: Vec<Tag<'_>> = Vec::with_capacity(structs.len());
+    for settings in &structs {
+        let tag = settings.tag.as_ref().expect("checked above").bind(py);
+        let key = match tag.extract::<i64>() {
+            Ok(int) => Tag::Int(int),
+            Err(_) if tag.is_instance_of::<PyString>() => Tag::Str(tag.extract::<&str>()?),
+            Err(_) => return Err(PyTypeError::new_err("struct `tag` must be an int or a str")),
+        };
         reject_union_if!(
             ty,
-            seen.contains(tag)?,
+            tags.contains(&key),
             "struct tags must be a unique `tag` value for each struct"
         );
-        seen.add(tag)?;
+        tags.push(key);
     }
+    let has_str = tags.iter().any(|tag| matches!(tag, Tag::Str(_)));
+    let has_int = tags.iter().any(|tag| matches!(tag, Tag::Int(_)));
+    reject_union_if!(
+        ty,
+        has_str && has_int,
+        "a union can't mix both `int` and `str` tags"
+    );
     Ok(())
 }
 
@@ -235,20 +264,17 @@ fn count_options(
     options: &[UnionOption<'_>],
     is_wanted: fn(&Bound<'_, PyAny>) -> PyResult<bool>,
 ) -> PyResult<usize> {
-    let mut count = 0;
-    for (option, _) in options {
-        if is_wanted(&origin_or_self(option)?)? {
-            count += 1;
-        }
-    }
-    Ok(count)
+    options.iter().try_fold(0usize, |count, (option, _)| {
+        Ok(count + usize::from(is_wanted(&origin_or_self(option)?)?))
+    })
 }
 
 fn has_dict_like_option(options: &[UnionOption<'_>], kinds: &[UnionKind]) -> PyResult<bool> {
     for ((option, settings), kind) in options.iter().zip(kinds) {
-        if *kind == UnionKind::Dict
-            && (settings.is_some() || is_plain_or_typeddict(&origin_or_self(option)?)?)
-        {
+        if *kind != UnionKind::Dict {
+            continue;
+        }
+        if settings.is_some() || is_plain_or_typeddict(&origin_or_self(option)?)? {
             return Ok(true);
         }
     }
@@ -256,7 +282,8 @@ fn has_dict_like_option(options: &[UnionOption<'_>], kinds: &[UnionKind]) -> PyR
 }
 
 pub(crate) fn enum_values<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let value_attr = intern!(ty.py(), "value");
     ty.try_iter()?
-        .map(|member| member?.getattr(intern!(ty.py(), "value")))
+        .map(|member| member?.getattr(value_attr))
         .collect()
 }

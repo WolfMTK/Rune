@@ -1,12 +1,12 @@
 use pyo3::{Bound, PyAny, exceptions::PyValueError, prelude::PyAnyMethods, types::PyDictMethods};
 
 use crate::common::{
-    enums::Scalar,
-    helpers::invalid_enum_value,
     lax,
+    naming::invalid_enum_value,
     reader::{Reader, kind},
     structures::{
         converter::decode::Converter,
+        enums::Scalar,
         errors::Fail,
         plan::{EnumPlan, LiteralPlan},
     },

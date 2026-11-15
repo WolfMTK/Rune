@@ -86,12 +86,13 @@ macro_rules! format_bindings {
         use pyo3::{Bound, Py, PyAny, PyResult, Python, intern, pyclass, pymethods};
         use std::ffi::CStr;
         use $crate::common::callable::extract_keyword;
-        use $crate::common::enums::{DecimalFormat, Order, UuidFormat};
+        use $crate::common::structures::enums::{DecimalFormat, Order, UuidFormat};
         use $crate::common::structures::decoder::DecoderCore;
         use $crate::common::structures::options::{
             ExtraHooks, Hook, RequiredArgument, TypeArgument, reject_extra_arguments,
         };
-        use $crate::common::helpers::{encode_object, encode_partial, type_name_of, write_into_buffer};
+        use $crate::common::naming::type_name_of;
+        use $crate::common::structures::encoder::{encode_object, encode_partial, write_into_buffer};
         use $crate::common::raw::input_bytes;
         use $crate::common::{Format, writer::Writer};
         use $crate::exceptions::ParseError;

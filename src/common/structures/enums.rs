@@ -14,7 +14,7 @@ use pyo3::{
 
 use crate::{
     common::{
-        helpers::{check_instantiable_alias, has_default_call, struct_info},
+        classes::{check_instantiable_alias, has_default_call, struct_info},
         macros::first_matching_kind,
         py_typing::{
             abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence,

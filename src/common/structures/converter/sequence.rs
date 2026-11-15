@@ -5,9 +5,11 @@ use pyo3::{
 };
 
 use crate::common::{
-    enums::{ArrayOutput, PathSegment, Shape},
     failure::LengthRule,
-    structures::converter::convert::ObjectConverter,
+    structures::{
+        converter::convert::ObjectConverter,
+        enums::{ArrayOutput, PathSegment, Shape},
+    },
     types::{Decoded, Length, NodeId, Outcome},
 };
 

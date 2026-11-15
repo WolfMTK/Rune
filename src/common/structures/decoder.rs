@@ -6,12 +6,12 @@ use pyo3::{
 
 use crate::common::{
     Format,
-    helpers::untyped_plan,
     py_typing::any,
     reader::Reader,
     recursion_limit,
     structures::{
         converter::decode::Converter,
+        encoder::untyped_plan,
         options::{ExtraHooks, Hook, TypeArgument},
         plan::Plan,
     },

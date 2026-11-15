@@ -11,9 +11,8 @@ use pyo3::{
 
 use crate::{
     common::{
-        enums::{BytesType, Primitive, Scalar, Shape},
-        helpers::{invalid_enum_value, type_name_of},
         lax,
+        naming::{invalid_enum_value, type_name_of},
         py_typing::{decimal_type, uuid},
         raw::{Raw, buffer_bytes},
         reader::{Reader, kind},
@@ -24,6 +23,7 @@ use crate::{
                 input::Input,
                 predicates::{integral, is_bool_choice, is_int_choice},
             },
+            enums::{BytesType, Primitive, Scalar, Shape},
             errors::{Fail, number_out_of_range},
             temporal::{datetime_from_epoch, duration_from_seconds},
             values::{big_integer_as_float, custom_value, decimal_from_text},

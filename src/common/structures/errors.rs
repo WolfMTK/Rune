@@ -5,9 +5,9 @@ use pyo3::{
 
 use crate::{
     common::{
-        enums::{Failure, PathSegment},
         failure::with_path,
         reader::kind,
+        structures::enums::{Failure, PathSegment},
     },
     exceptions::{DecodeError, ParseError, ValidationError},
 };

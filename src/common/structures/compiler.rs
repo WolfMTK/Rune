@@ -8,15 +8,11 @@ use pyo3::{
 
 use crate::{
     common::{
+        aliases::{
+            expand_type_alias, type_arg_or_any, typevar_bound, union_contains_any, union_members,
+        },
         cache::{cached_tag_lookup, plain_field_cache, plain_fields},
-        enums::{
-            AbstractContainer, BytesType, Constraint, ConstraintSubject, Constructor, Insertion,
-            Primitive, Shape,
-        },
-        helpers::{
-            class_tag, expand_type_alias, is_named_tuple_class, is_struct_class, struct_class,
-            struct_info, type_arg_or_any, typevar_bound, union_contains_any, union_members,
-        },
+        classes::{class_tag, is_named_tuple_class, is_struct_class, struct_class, struct_info},
         py_typing::{
             any, date, datetime, decimal_type, deque, frozendict, is_annotated_origin,
             is_enum_class, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
@@ -25,6 +21,10 @@ use crate::{
         },
         raw::raw_type,
         structures::{
+            enums::{
+                AbstractContainer, BytesType, Constraint, ConstraintSubject, Constructor,
+                Insertion, Primitive, Shape,
+            },
             layout::{StructLayout, TupleLayout},
             plan::{
                 ArrayPlan, ConstraintSet, EnumPlan, FieldPlan, LiteralPlan, Node, StructPlan,

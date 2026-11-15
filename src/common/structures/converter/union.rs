@@ -1,10 +1,10 @@
 use crate::common::{
-    enums::{Primitive, Shape},
-    helpers::{is_single_primitive, union_mismatch},
     lax,
+    naming::{is_single_primitive, union_mismatch},
     reader::{Reader, kind},
     structures::{
         converter::{decode::Converter, tagged::TagGroup},
+        enums::{Primitive, Shape},
         errors::Fail,
         plan::UnionPlan,
     },

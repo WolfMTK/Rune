@@ -12,13 +12,13 @@ use uuid::Uuid;
 
 use crate::{
     common::{
-        enums::{Primitive, Scalar, Shape},
-        helpers::invalid_enum_value,
         lax,
+        naming::invalid_enum_value,
         py_typing::uuid,
         reader::{Reader, kind},
         structures::{
             converter::decode::Converter,
+            enums::{Primitive, Scalar, Shape},
             errors::Fail,
             plan::{EnumPlan, LiteralPlan, UnionPlan},
             temporal::{date_from_text, datetime_from_text, time_from_text, timedelta_from_text},

@@ -9,7 +9,7 @@ use pyo3::{
 
 use crate::{
     common::{
-        helpers::class_tag,
+        classes::class_tag,
         py_typing::{
             builtin_generic_alias, plain_class_fields, struct_lookup_cache, type_args,
             typing_generic_alias,

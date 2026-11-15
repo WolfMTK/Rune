@@ -1,7 +1,7 @@
 use crate::{
     common::{
-        enums::{BytesType, Constructor, Shape},
         reader::kind,
+        structures::enums::{BytesType, Constructor, Shape},
     },
     constants::{BUILTIN_BYTEARRAY, BUILTIN_BYTES, BUILTIN_MEMORYVIEW, MAX_SAFE_INTEGER},
 };

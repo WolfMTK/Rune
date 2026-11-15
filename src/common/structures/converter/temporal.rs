@@ -7,12 +7,12 @@ use uuid::Uuid;
 
 use crate::{
     common::{
-        enums::Scalar,
         lax,
         py_typing::uuid,
         reader::{Reader, kind},
         structures::{
             converter::decode::Converter,
+            enums::Scalar,
             errors::Fail,
             temporal::{
                 date_from_text, datetime_from_epoch, datetime_from_text, datetime_from_timestamp,

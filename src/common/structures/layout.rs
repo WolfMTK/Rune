@@ -6,7 +6,7 @@ use pyo3::{
 
 use crate::common::{
     cache::{cached_fields, plain_fields},
-    helpers::{has_generated_new, struct_field_pairs, struct_info},
+    classes::{has_generated_new, struct_field_pairs, struct_info},
     py_typing::{resolve_generic_fields, resolve_namedtuple_fields},
     r#struct::StructInfo,
     structures::compiler::accepts_unset,

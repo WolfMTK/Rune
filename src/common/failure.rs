@@ -1,7 +1,10 @@
 use std::fmt::Write as _;
 
 use crate::{
-    common::{enums::PathSegment, structures::errors::Fail, types::Length},
+    common::{
+        structures::{enums::PathSegment, errors::Fail},
+        types::Length,
+    },
     constants::{KEY_PATH_PREFIX, PATH_PREFIX},
 };
 

@@ -6,7 +6,7 @@ use pyo3::{
 };
 
 use crate::{
-    common::enums::{Primitive, Scalar},
+    common::structures::enums::{Primitive, Scalar},
     constants::MAX_SAFE_INTEGER,
     exceptions::ValidationError,
 };

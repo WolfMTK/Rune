@@ -5,9 +5,11 @@ use json::writer::{write_float, write_integer};
 
 use crate::{
     common::{
-        enums::{Scalar, Token, Value},
         reader::{Key, Reader, kind},
-        structures::cursor::Cursor,
+        structures::{
+            cursor::Cursor,
+            enums::{Scalar, Token, Value},
+        },
         writer::Writer,
     },
     constants::INITIAL_CAPACITY,

@@ -12,9 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     common::{
-        enums::{Primitive, Scalar, Shape},
-        helpers::invalid_enum_value,
         lax,
+        naming::invalid_enum_value,
         py_typing::uuid,
         structures::{
             converter::{
@@ -23,6 +22,7 @@ use crate::{
                     builtin_flag, integral, is_int_choice, is_number_text, is_str_choice,
                 },
             },
+            enums::{Primitive, Scalar, Shape},
             errors::Fail,
             temporal::{
                 date_from_text, datetime_from_epoch, datetime_from_text, duration_from_seconds,

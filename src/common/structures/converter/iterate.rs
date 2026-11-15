@@ -1,12 +1,12 @@
 use std::borrow::Cow;
 
 use crate::common::{
-    enums::PathSegment,
     failure::LengthRule,
     reader::{Key, Reader},
     structures::{
         converter::decode::Converter,
         cursor::Checkpoint,
+        enums::PathSegment,
         errors::{Fail, non_text_key},
     },
     types::{Length, Outcome},

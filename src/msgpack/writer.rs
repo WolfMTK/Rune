@@ -1,5 +1,5 @@
 use crate::{
-    common::{enums::Token, writer::Writer},
+    common::{structures::enums::Token, writer::Writer},
     constants::{MSGPACK_ARRAY as ARRAY, MSGPACK_MAP as MAP},
     msgpack::structures::MsgpackWriter,
 };

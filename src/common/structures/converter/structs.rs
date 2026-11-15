@@ -9,9 +9,8 @@ use pyo3::{
 };
 
 use crate::common::{
-    enums::{Constructor, PathSegment, Shape},
     failure::LengthRule,
-    helpers::type_name_of,
+    naming::type_name_of,
     py_typing::type_origin,
     reader::{Reader, kind},
     structures::{
@@ -20,6 +19,7 @@ use crate::common::{
             tagged::TagGroup,
         },
         cursor::Checkpoint,
+        enums::{Constructor, PathSegment, Shape},
         errors::Fail,
         plan::StructPlan,
     },

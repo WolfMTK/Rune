@@ -1,4 +1,4 @@
-use crate::common::enums::Token;
+use crate::common::structures::enums::Token;
 
 pub(crate) trait Writer: Default {
     const BINARY: bool;

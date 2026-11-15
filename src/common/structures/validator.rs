@@ -3,16 +3,17 @@ use pyo3::{
 };
 
 use crate::common::{
-    helpers::{
-        container_kind, enter_type_alias, expand_type_alias, is_named_tuple_class, is_struct_class,
-        named_tuple_field_pairs, parametrized_identity, struct_field_pairs, type_arg_or_any,
+    aliases::{enter_type_alias, expand_type_alias, type_arg_or_any},
+    classes::{
+        is_named_tuple_class, is_struct_class, named_tuple_field_pairs, parametrized_identity,
+        struct_field_pairs,
     },
     py_typing::{
         is_annotated_origin, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
         is_type_alias, is_typeddict_class, is_typevar, is_union_origin, new_type_supertype,
         type_args, type_origin,
     },
-    structures::compiler::plain_field_pairs,
+    structures::{compiler::plain_field_pairs, plan::container_kind},
     types::RuneSet,
     validate::ensure_union_is_unambiguous,
 };

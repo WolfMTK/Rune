@@ -1,10 +1,15 @@
 use pyo3::{Bound, PyAny, Python, types::PyBytes};
 
 use crate::common::{
-    enums::{PathSegment, Shape},
-    helpers::ExpectedName,
+    naming::ExpectedName,
     reader::{Reader, kind},
-    structures::{converter::keys::KeyCache, decoder::DecoderCore, errors::Fail, plan::Plan},
+    structures::{
+        converter::keys::KeyCache,
+        decoder::DecoderCore,
+        enums::{PathSegment, Shape},
+        errors::Fail,
+        plan::Plan,
+    },
     types::{ConstraintSetId, Decoded, NodeId, Outcome},
 };
 

@@ -8,11 +8,11 @@ use pyo3::{
 
 use crate::{
     common::{
-        enums::Shape,
         py_typing::{date, datetime, decimal_type, is_type, time, timedelta, uuid},
         recursion_limit,
         structures::{
             converter::{input::Input, sequence::sequence_items},
+            enums::Shape,
             options::Hook,
             plan::Plan,
         },

@@ -1,10 +1,10 @@
-use crate::common::py_typing::{decimal_type, type_name, uuid};
+use crate::common::py_typing::{decimal_type, type_name};
 use crate::common::structures::errors::Fail;
 use crate::common::types::{Decoded, Outcome};
 use pyo3::exceptions::PyArithmeticError;
 use pyo3::prelude::PyAnyMethods;
-use pyo3::types::{PyBytes, PyDict, PyFloat};
-use pyo3::{Bound, PyAny, PyResult, Python, intern};
+use pyo3::types::PyFloat;
+use pyo3::{Bound, PyAny, Python};
 
 pub(crate) fn custom_value<'py>(
     hook: Option<&Bound<'py, PyAny>>,
@@ -41,13 +41,4 @@ pub(crate) fn decimal_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bou
             Fail::from(err)
         }
     })
-}
-
-pub(crate) fn uuid_from_bytes<'py>(
-    py: Python<'py>,
-    bytes: &[u8; 16],
-) -> PyResult<Bound<'py, PyAny>> {
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(intern!(py, "bytes"), PyBytes::new(py, bytes))?;
-    uuid(py)?.call((), Some(&kwargs))
 }

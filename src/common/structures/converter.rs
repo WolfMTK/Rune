@@ -4,7 +4,7 @@ use crate::common::helpers::{
     ExpectedName, invalid_enum_value, is_single_primitive, union_mismatch,
 };
 use crate::common::lax;
-use crate::common::py_typing::decimal_type;
+use crate::common::py_typing::{decimal_type, uuid};
 use crate::common::raw::Raw;
 use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::cursor::Checkpoint;
@@ -18,7 +18,7 @@ use crate::common::structures::temporal::{
     duration_from_seconds, time_from_text, timedelta_from_text,
 };
 use crate::common::structures::values::{
-    big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes,
+    big_integer_as_float, custom_value, decimal_from_text,
 };
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,
@@ -33,7 +33,7 @@ use pyo3::types::{
     PyBytes, PyDict, PyDictMethods, PyFloat, PyInt, PyList, PyMemoryView, PySlice, PyString,
     PyTuple,
 };
-use pyo3::{Bound, PyAny, Python};
+use pyo3::{Bound, PyAny, Python, intern};
 use std::borrow::Cow;
 
 pub(crate) struct Converter<'p, 'py, W> {
@@ -460,19 +460,20 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             let Scalar::Str(text) = self.wire.read_scalar()? else {
                 unreachable!("kind is checked as str above")
             };
-            return Ok(uuid_from_bytes(
-                py,
-                Uuid::try_parse(&text)
-                    .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?
-                    .as_bytes(),
-            )?);
+            let value = Uuid::try_parse(&text)
+                .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item(intern!(py, "int"), value.as_u128())?;
+            return Ok(uuid(py)?.call((), Some(&kwargs))?);
         }
         let Scalar::Bytes(raw) = self.wire.read_scalar()? else {
             unreachable!("kind is checked as bytes above")
         };
         let bytes = <[u8; 16]>::try_from(raw.as_ref())
             .map_err(|_| Fail::invalid("Invalid UUID bytes".to_owned()))?;
-        Ok(uuid_from_bytes(py, &bytes)?)
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "int"), u128::from_be_bytes(bytes))?;
+        Ok(uuid(py)?.call((), Some(&kwargs))?)
     }
 
     fn read_temporal_text(
@@ -1135,12 +1136,13 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Literal(literal) => return self.decode_literal_key(literal, key),
             Shape::Enum(members) => return self.decode_enum_key(node.ty.bind(py), members, key),
             Shape::Union(union) => return self.decode_union_key(union, key),
-            Shape::Uuid => uuid_from_bytes(
-                py,
-                Uuid::try_parse(key)
-                    .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?
-                    .as_bytes(),
-            )?,
+            Shape::Uuid => {
+                let value = Uuid::try_parse(key)
+                    .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(intern!(py, "int"), value.as_u128())?;
+                uuid(py)?.call((), Some(&kwargs))?
+            }
             Shape::Date => date_from_text(py, key)?,
             Shape::Time => time_from_text(py, key)?,
             Shape::DateTime => datetime_from_text(py, key)?,

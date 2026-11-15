@@ -18,9 +18,7 @@ use crate::common::structures::temporal::{
     date_from_text, datetime_from_epoch, datetime_from_text, duration_from_seconds, time_from_text,
     timedelta_from_text,
 };
-use crate::common::structures::values::{
-    custom_value, decimal_from_text, uuid_from_bytes,
-};
+use crate::common::structures::values::{custom_value, decimal_from_text};
 use crate::common::types::{Decoded, Length, NodeId, Outcome};
 use crate::common::validate::validate_type;
 use crate::constants::{
@@ -663,9 +661,11 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
                 BUILTIN_UUID,
                 |shape| matches!(shape, Shape::Uuid),
                 |py: Python<'_>, text: &str| {
-                    let parsed = Uuid::try_parse(text)
+                    let value = Uuid::try_parse(text)
                         .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?;
-                    Ok(uuid_from_bytes(py, parsed.as_bytes())?)
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item(intern!(py, "int"), value.as_u128())?;
+                    Ok(uuid(py)?.call((), Some(&kwargs))?)
                 },
             ),
             (
@@ -833,7 +833,9 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             let data = buffer_bytes(py, obj)?;
             let bytes = <[u8; 16]>::try_from(data.as_bytes())
                 .map_err(|_| Fail::invalid("Invalid UUID bytes".to_owned()))?;
-            return self.constrain(member, uuid_from_bytes(py, &bytes)?);
+            let kwargs = PyDict::new(py);
+            kwargs.set_item(intern!(py, "int"), u128::from_be_bytes(bytes))?;
+            return self.constrain(member, uuid(py)?.call((), Some(&kwargs))?);
         }
         Err(self.mismatch(id, "bytes")?)
     }

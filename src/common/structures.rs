@@ -535,7 +535,12 @@ impl<'py> Compiler<'py> {
         Ok(if is_enum_class(&base)? {
             Shape::Enum(EnumPlan::load(ty)?)
         } else if self.is_array_type(&base)? {
-            let item = self.compile(&type_arg_or_any(ty, 0)?)?;
+            let args = type_args(ty)?;
+            let item = if args.len() > 1 {
+                self.union_item(ty, args)?
+            } else {
+                self.compile(&type_arg_or_any(ty, 0)?)?
+            };
             Shape::Array(ArrayPlan::new(vec![item], true, base))
         } else if frozendict(self.py).is_some_and(|class| base.is(class)) {
             let (keys, key, values) = self.dict_entries(ty)?;
@@ -828,11 +833,38 @@ impl<'py> Compiler<'py> {
     }
 
     fn union(&mut self, ty: &Bound<'py, PyAny>) -> PyResult<UnionPlan> {
+        self.union_plan(union_members(ty)?)
+    }
+
+    fn union_item(
+        &mut self,
+        ty: &Bound<'py, PyAny>,
+        args: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<NodeId> {
+        let any = any(self.py)?;
+        if args.iter().any(|arg| arg.is(any)) {
+            return self.compile(any);
+        }
+        let shape = Shape::Union(self.union_plan(args)?);
+        let accepted_kinds = shape.accepted_kinds(self.lax);
+        let calls_user_code = shape.calls_user_code(self.has_hook);
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            ty: ty.clone().unbind(),
+            shape,
+            accepted_kinds,
+            calls_user_code,
+            children_call_user_code: false,
+        });
+        Ok(id)
+    }
+
+    fn union_plan(&mut self, members: Vec<Bound<'py, PyAny>>) -> PyResult<UnionPlan> {
         let mut accepts_none = false;
         let (mut tagged, mut plain) = (Vec::new(), Vec::new());
         let mut args = Vec::new();
-        for arg in union_members(ty)? {
-            if is_type::<PyNone>(&arg) {
+        for arg in members {
+            if arg.is_none() || is_type::<PyNone>(&arg) {
                 accepts_none = true;
                 continue;
             }
@@ -1254,6 +1286,9 @@ pub(crate) struct Validator {
 
 impl Validator {
     pub(crate) fn visit(&mut self, ty: &Bound<'_, PyAny>) -> PyResult<()> {
+        if ty.is_none() {
+            return Ok(());
+        }
         if is_typevar(ty)? {
             return self.visit_typevar(ty);
         }

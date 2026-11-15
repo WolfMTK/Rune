@@ -1,12 +1,11 @@
 use crate::common::py_typing::{decimal_type, type_name, uuid};
 use crate::common::structures::errors::Fail;
 use crate::common::types::{Decoded, Outcome};
-use crate::common::{base64, uuid_format};
+use crate::common::uuid_format;
 use pyo3::exceptions::PyArithmeticError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{PyBytes, PyDict, PyFloat};
 use pyo3::{Bound, PyAny, PyResult, Python, intern};
-use std::borrow::Cow;
 
 pub(crate) fn custom_value<'py>(
     hook: Option<&Bound<'py, PyAny>>,
@@ -57,10 +56,4 @@ pub(crate) fn uuid_from_bytes<'py>(
     let kwargs = PyDict::new(py);
     kwargs.set_item(intern!(py, "bytes"), PyBytes::new(py, bytes))?;
     uuid(py)?.call((), Some(&kwargs))
-}
-
-pub(crate) fn base64_text(text: &str) -> Outcome<Cow<'static, [u8]>> {
-    base64::decode(text.as_bytes())
-        .map(Cow::Owned)
-        .ok_or_else(|| Fail::invalid("Invalid base64 encoded string".to_owned()))
 }

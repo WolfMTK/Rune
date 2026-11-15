@@ -1,5 +1,5 @@
 use crate::common::helpers::{
-    enter_type_alias, expand_type_alias, is_named_tuple_class, is_struct_class,
+    container_kind, enter_type_alias, expand_type_alias, is_named_tuple_class, is_struct_class,
     named_tuple_field_pairs, parametrized_identity, struct_field_pairs, type_arg_or_any,
 };
 use crate::common::py_typing::{
@@ -9,7 +9,7 @@ use crate::common::py_typing::{
 };
 use crate::common::structures::compiler::plain_field_pairs;
 use crate::common::types::RuneSet;
-use crate::common::validate::{container_kind, ensure_union_is_unambiguous};
+use crate::common::validate::ensure_union_is_unambiguous;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyType;

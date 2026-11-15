@@ -6,7 +6,6 @@ use crate::exceptions::ParseError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::{PyResult, Python};
 
-pub(crate) mod base64;
 pub(crate) mod cache;
 pub(crate) mod callable;
 pub(crate) mod convert;

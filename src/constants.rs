@@ -28,6 +28,7 @@ pub(crate) const BUILTIN_TIMEDELTA: u16 = 1 << 6;
 pub(crate) const BUILTIN_UUID: u16 = 1 << 7;
 pub(crate) const BUILTIN_DECIMAL: u16 = 1 << 8;
 pub(crate) const INVALID_BUILTIN_TYPES: &str = "builtin_types must be an iterable of types";
+pub(crate) const INVALID_BASE64: &str = "Invalid base64 encoded string";
 
 pub(crate) const MICROS_PER_SECOND: i128 = 1_000_000;
 pub(crate) const MICROS_PER_MINUTE: i128 = 60 * MICROS_PER_SECOND;
@@ -37,22 +38,6 @@ pub(crate) const MINUTES_PER_DAY: i128 = 24 * 60;
 pub(crate) const MAX_DURATION_DAYS: i128 = 999_999_999;
 pub(crate) const MAX_DURATION_MICROS: i128 = MAX_DURATION_DAYS * MICROS_PER_DAY;
 pub(crate) const MAX_DURATION_FRACTION_DIGITS: usize = 11;
-
-pub(crate) const BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-pub(crate) const BASE64_PADDING: u8 = b'=';
-pub(crate) const BASE64_INVALID: u8 = u8::MAX;
-pub(crate) const BASE64_DECODE_TABLE: [u8; 256] = base64_decode_table();
-
-const fn base64_decode_table() -> [u8; 256] {
-    let mut table = [BASE64_INVALID; 256];
-    let mut index = 0;
-    while index < BASE64_ALPHABET.len() {
-        table[BASE64_ALPHABET[index] as usize] = index as u8;
-        index += 1;
-    }
-    table
-}
 
 pub(crate) const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
 

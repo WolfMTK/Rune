@@ -1,4 +1,3 @@
-use crate::common::base64;
 use crate::common::enums::{Scalar, Token, Value};
 use crate::common::reader::{Key, Reader, kind};
 use crate::common::structures::cursor::Cursor;
@@ -8,6 +7,7 @@ use crate::exceptions::ParseError;
 use crate::json;
 use crate::json::helpers::plain_prefix_len;
 use crate::json::writer::write_escaped;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use json::writer::{write_float, write_integer};
 use std::borrow::Cow;
 
@@ -96,7 +96,7 @@ impl Writer for JsonWriter {
         }
         self.needs_separator = true;
         self.out.push(b'"');
-        base64::encode_into(&mut self.out, data);
+        self.out.extend_from_slice(STANDARD.encode(data).as_bytes());
         self.out.push(b'"');
     }
 

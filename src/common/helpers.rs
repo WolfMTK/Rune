@@ -1,7 +1,12 @@
-use crate::common::enums::{DecimalFormat, Insertion, Order, Primitive, Token, UuidFormat};
+use crate::common::enums::{
+    AbstractContainer, DecimalFormat, Insertion, Order, Primitive, Token, UnionKind, UuidFormat,
+};
 use crate::common::py_typing::{
-    any, default_factory_type, enum_type, is_type_alias, is_union_origin, resolve_type_alias,
-    type_alias_of, type_args, type_name, type_origin,
+    any, date, datetime, decimal_type, default_factory_type, deque, enum_type, frozendict,
+    is_annotated_origin, is_enum_class, is_final_origin, is_literal_origin, is_new_type,
+    is_plain_class, is_type, is_type_alias, is_typeddict_class, is_union_origin,
+    new_type_supertype, resolve_type_alias, time, timedelta, type_alias_of, type_args, type_name,
+    type_origin, uuid,
 };
 use crate::common::py_typing::{
     is_typevar, origin_or_self, resolve_generic_fields, resolve_namedtuple_fields,
@@ -12,16 +17,22 @@ use crate::common::recursion_limit;
 use crate::common::r#struct::{StructInfo, own_info};
 use crate::common::structures::encoder::Encoder;
 use crate::common::structures::errors::Fail;
+use crate::common::structures::layout::StructSettings;
 use crate::common::structures::options::Hook;
 use crate::common::structures::plan::{Plan, UnionPlan};
 use crate::common::types::RuneMap;
+use crate::common::validate::enum_values;
 use crate::common::writer::Writer;
 use crate::constants::GENERATED_NAMEDTUPLE_PREFIX;
+use crate::msgpack::ext::ext_type;
 use pyo3::Python;
 use pyo3::exceptions::{PyOverflowError, PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyTypeMethods};
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyByteArray, PyByteArrayMethods, PyBytes, PySlice, PyString, PyTuple, PyType};
+use pyo3::types::{
+    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList,
+    PySet, PySlice, PyString, PyTuple, PyType,
+};
 use pyo3::{Bound, PyAny, PyErr, PyResult, intern};
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
@@ -417,4 +428,114 @@ pub(crate) fn type_name_of(obj: &Bound<'_, PyAny>) -> String {
     obj.get_type()
         .name()
         .map_or_else(|_| "?".to_owned(), |name| name.to_string())
+}
+
+pub(crate) fn container_kind(ty: &Bound<'_, PyAny>) -> PyResult<Option<UnionKind>> {
+    let is_frozendict = frozendict(ty.py()).is_some_and(|frozendict| ty.is(frozendict));
+    Ok(if is_type::<PyDict>(ty) || is_frozendict {
+        Some(UnionKind::Dict)
+    } else if is_type::<PyList>(ty)
+        || is_type::<PySet>(ty)
+        || is_type::<PyFrozenSet>(ty)
+        || is_type::<PyTuple>(ty)
+    {
+        Some(UnionKind::Array)
+    } else if ty.is(deque(ty.py())?) {
+        Some(UnionKind::Deque)
+    } else {
+        AbstractContainer::of(ty)?.map(|container| match container {
+            AbstractContainer::Mapping => UnionKind::Dict,
+            AbstractContainer::Sequence | AbstractContainer::Set => UnionKind::Array,
+        })
+    })
+}
+
+pub(crate) fn union_kind(ty: &Bound<'_, PyAny>) -> PyResult<UnionKind> {
+    use UnionKind::{
+        Array, Custom, Dict, IntEnum, IntPlain, NamedTuple, Other, StrEnum, StrPlain, StrStrict,
+    };
+    if is_typevar(ty)? {
+        let bound = ty.getattr(intern!(ty.py(), "__bound__"))?;
+        return if bound.is_none() {
+            Ok(Other)
+        } else {
+            union_kind(&bound)
+        };
+    } else if is_new_type(ty)? {
+        return union_kind(&new_type_supertype(ty)?);
+    } else if let Some(class) = struct_class(ty)? {
+        return Ok(if StructSettings::of_class(&class)?.array_like {
+            Array
+        } else {
+            Dict
+        });
+    } else if is_named_tuple_class(&origin_or_self(ty)?)? {
+        return Ok(NamedTuple);
+    } else if let Some(origin) = type_origin(ty)? {
+        if is_annotated_origin(&origin)? {
+            return union_kind(&ty.getattr(intern!(ty.py(), "__origin__"))?);
+        }
+        if is_final_origin(&origin)? {
+            return union_kind(&type_arg_or_any(ty, 0)?);
+        }
+        if is_literal_origin(&origin)? {
+            return Ok(value_kind(&type_args(ty)?, IntPlain, StrPlain));
+        }
+        if crate::common::validate::is_plain_or_typeddict(&origin)? {
+            return Ok(Dict);
+        }
+        return Ok(container_kind(&origin)?.unwrap_or(Other));
+    }
+    let is_bool_or_float = is_type::<PyBool>(ty) || is_type::<PyFloat>(ty);
+    Ok(if !ty.is_instance_of::<PyType>() || is_bool_or_float {
+        Other
+    } else if is_enum_class(ty)? {
+        value_kind(&enum_values(ty)?, IntEnum, StrEnum)
+    } else if is_type::<PyInt>(ty) {
+        IntPlain
+    } else if is_type::<PyString>(ty) {
+        StrPlain
+    } else if is_strict_str_type(ty)? {
+        StrStrict
+    } else if let Some(kind) = container_kind(ty)? {
+        kind
+    } else if is_plain_or_typeddict(ty)? {
+        Dict
+    } else if ty.is(ext_type(ty.py())) {
+        Other
+    } else {
+        Custom
+    })
+}
+
+fn value_kind(values: &[Bound<'_, PyAny>], int_kind: UnionKind, str_kind: UnionKind) -> UnionKind {
+    if values.is_empty() {
+        UnionKind::Other
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyInt>)
+    {
+        int_kind
+    } else if values
+        .iter()
+        .all(PyAnyMethods::is_exact_instance_of::<PyString>)
+    {
+        str_kind
+    } else {
+        UnionKind::Other
+    }
+}
+
+fn is_strict_str_type(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = ty.py();
+    Ok(ty.is(datetime(py)?)
+        || ty.is(date(py)?)
+        || ty.is(time(py)?)
+        || ty.is(uuid(py)?)
+        || ty.is(decimal_type(py)?)
+        || ty.is(timedelta(py)?))
+}
+
+pub(crate) fn is_plain_or_typeddict(ty: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(is_typeddict_class(ty)? || is_plain_class(ty)?)
 }

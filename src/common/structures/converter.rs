@@ -18,14 +18,14 @@ use crate::common::structures::temporal::{
     duration_from_seconds, time_from_text, timedelta_from_text,
 };
 use crate::common::structures::values::{
-    base64_text, big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes,
-    uuid_from_text,
+    big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes, uuid_from_text,
 };
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,
 };
-use crate::constants::{MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, TIMESTAMP_EXT_CODE};
+use crate::constants::{INVALID_BASE64, MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, TIMESTAMP_EXT_CODE};
 use crate::msgpack::ext::Ext;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyBytesMethods};
 use pyo3::types::{
@@ -490,7 +490,11 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         self.expect_kind(wire_kind, expected, kind::name)?;
         let data = match self.wire.read_scalar()? {
             Scalar::Bytes(data) => data,
-            Scalar::Str(text) => base64_text(&text)?,
+            Scalar::Str(text) => Cow::Owned(
+                STANDARD
+                    .decode(text.as_bytes())
+                    .map_err(|_| Fail::invalid(INVALID_BASE64.to_owned()))?,
+            ),
             _ => unreachable!("kind is checked as bytes or str above"),
         };
         Ok(output.create(self.py, &data)?)
@@ -1131,7 +1135,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::DateTime => datetime_from_text(py, key)?,
             Shape::TimeDelta => timedelta_from_text(py, key)?,
             Shape::Decimal => decimal_from_text(py, key)?,
-            Shape::Bytes(output) => output.create(py, &base64_text(key)?)?,
+            Shape::Bytes(output) => output.create(
+                py,
+                &STANDARD
+                    .decode(key.as_bytes())
+                    .map_err(|_| Fail::invalid(INVALID_BASE64.to_owned()))?,
+            )?,
             Shape::Custom(base) => {
                 let raw = PyString::new(py, key).into_any();
                 return self.finish_custom(node.ty.bind(py), base.bind(py), raw);

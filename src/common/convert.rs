@@ -19,14 +19,14 @@ use crate::common::structures::temporal::{
     timedelta_from_text,
 };
 use crate::common::structures::values::{
-    base64_text, custom_value, decimal_from_text, uuid_from_bytes, uuid_from_text,
+    custom_value, decimal_from_text, uuid_from_bytes, uuid_from_text,
 };
 use crate::common::types::{Decoded, Length, NodeId, Outcome};
 use crate::common::validate::validate_type;
 use crate::constants::{
     BUILTIN_BYTEARRAY, BUILTIN_BYTES, BUILTIN_DATE, BUILTIN_DATETIME, BUILTIN_DECIMAL,
-    BUILTIN_MEMORYVIEW, BUILTIN_TIME, BUILTIN_TIMEDELTA, BUILTIN_UUID, INVALID_BUILTIN_TYPES,
-    MAX_SAFE_INTEGER,
+    BUILTIN_MEMORYVIEW, BUILTIN_TIME, BUILTIN_TIMEDELTA, BUILTIN_UUID, INVALID_BASE64,
+    INVALID_BUILTIN_TYPES, MAX_SAFE_INTEGER,
 };
 use crate::msgpack::ext::Ext;
 use pyo3::exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError};
@@ -38,6 +38,7 @@ use pyo3::types::{
     PyType, PyTypeMethods,
 };
 use pyo3::{Bound, PyAny, PyErr, PyResult, Python, intern, pyfunction};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
 
 type ShapeTest = fn(&Shape) -> bool;
@@ -683,7 +684,15 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             let Shape::Bytes(output) = self.base_shape(member) else {
                 unreachable!("member is checked as bytes above")
             };
-            return self.constrain(member, output.create(py, &base64_text(text)?)?);
+            return self.constrain(
+                member,
+                output.create(
+                    py,
+                    &STANDARD
+                        .decode(text.as_bytes())
+                        .map_err(|_| Fail::invalid(INVALID_BASE64.to_owned()))?,
+                )?,
+            );
         }
         Err(self.mismatch(id, "str")?)
     }

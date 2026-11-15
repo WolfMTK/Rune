@@ -11,10 +11,11 @@ use crate::common::r#struct::{FieldDefault, StructInfo};
 use crate::common::structures::layout::{Field, StructLayout, StructSettings};
 use crate::common::structures::temporal::{epoch_micros, temporal_text, timestamp_payload};
 use crate::common::types::RuneMap;
+use crate::common::uuid_format;
 use crate::common::writer::Writer;
-use crate::common::{base64, uuid_format};
 use crate::constants::{MICROS_PER_SECOND, TIMESTAMP_EXT_CODE};
 use crate::msgpack::ext::Ext;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::{
     PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
@@ -172,7 +173,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Bytes => {
                 let data = buffer_bytes(key.py(), key)?;
                 self.writer
-                    .write_key(Token::Str(&base64::encode(data.as_bytes())));
+                    .write_key(Token::Str(&STANDARD.encode(data.as_bytes())));
                 Ok(())
             }
             Kind::Unknown => self.encode_hooked_key(key),

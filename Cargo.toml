@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 description = "Typed serialization for Python."
+license = "MIT"
 
 [lib]
 name = "rune"
@@ -24,6 +25,3 @@ rustc-hash = "2.1.3"
 zmij = "1.0.23"
 base64 = "0.23.1"
 uuid = "1.29.2"
-
-[dev-dependencies]
-rstest = "0.27.0"

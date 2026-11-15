@@ -1,12 +1,14 @@
-use pyo3::buffer::PyUntypedBuffer;
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::{
-    Bound, IntoPyObject, PyAnyMethods, PyBytesMethods, PyDictMethods, PyTupleMethods, pyclass,
-    pymethods,
+use pyo3::{
+    Py, PyAny, PyResult, Python,
+    buffer::PyUntypedBuffer,
+    exceptions::{PyTypeError, PyValueError},
+    prelude::{
+        Bound, IntoPyObject, PyAnyMethods, PyBytesMethods, PyDictMethods, PyTupleMethods, pyclass,
+        pymethods,
+    },
+    sync::PyOnceLock,
+    types::{PyBytes, PyDict, PyInt, PyTuple, PyType},
 };
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyTuple, PyType};
-use pyo3::{Py, PyAny, PyResult, Python};
 
 #[pyclass(module = "rune.msgpack", frozen)]
 pub(crate) struct Ext {

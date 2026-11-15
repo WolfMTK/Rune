@@ -1,14 +1,22 @@
-use crate::common::helpers::untyped_plan;
-use crate::common::py_typing::any;
-use crate::common::reader::Reader;
-use crate::common::structures::converter::Converter;
-use crate::common::structures::options::{ExtraHooks, Hook, TypeArgument};
-use crate::common::structures::plan::Plan;
-use crate::common::validate::validate_type;
-use crate::common::{Format, recursion_limit};
-use pyo3::prelude::{PyAnyMethods, PyBytesMethods};
-use pyo3::types::{PyBytes, PyList, PyNone};
-use pyo3::{Bound, Py, PyAny, PyResult, Python};
+use pyo3::{
+    Bound, Py, PyAny, PyResult, Python,
+    prelude::{PyAnyMethods, PyBytesMethods},
+    types::{PyBytes, PyList, PyNone},
+};
+
+use crate::common::{
+    Format,
+    helpers::untyped_plan,
+    py_typing::any,
+    reader::Reader,
+    recursion_limit,
+    structures::{
+        converter::decode::Converter,
+        options::{ExtraHooks, Hook, TypeArgument},
+        plan::Plan,
+    },
+    validate::validate_type,
+};
 
 pub(crate) struct DecoderCore {
     pub(crate) typed_plan: Option<Plan>,

@@ -1,10 +1,12 @@
-use crate::common::py_typing::{decimal_type, type_name};
-use crate::common::structures::errors::Fail;
-use crate::common::types::{Decoded, Outcome};
-use pyo3::exceptions::PyArithmeticError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::types::PyFloat;
-use pyo3::{Bound, PyAny, Python};
+use pyo3::{
+    Bound, PyAny, Python, exceptions::PyArithmeticError, prelude::PyAnyMethods, types::PyFloat,
+};
+
+use crate::common::{
+    py_typing::{decimal_type, type_name},
+    structures::errors::Fail,
+    types::{Decoded, Outcome},
+};
 
 pub(crate) fn custom_value<'py>(
     hook: Option<&Bound<'py, PyAny>>,

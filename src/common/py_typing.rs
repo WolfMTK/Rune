@@ -1,8 +1,11 @@
+use pyo3::{
+    Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern,
+    prelude::PyAnyMethods,
+    sync::PyOnceLock,
+    types::{PyType, PyTypeMethods},
+};
+
 use crate::common::macros::cached_objects;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyType, PyTypeMethods};
-use pyo3::{Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern};
 
 cached_objects! {
     annotated => "typing"."Annotated",

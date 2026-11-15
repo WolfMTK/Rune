@@ -1,7 +1,9 @@
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::{PyAnyMethods, PyTupleMethods};
-use pyo3::types::{PyDict, PyTuple};
-use pyo3::{Borrowed, Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python};
+use pyo3::{
+    Borrowed, Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python,
+    exceptions::PyTypeError,
+    prelude::{PyAnyMethods, PyTupleMethods},
+    types::{PyDict, PyTuple},
+};
 
 pub(crate) enum TypeArgument<'py> {
     Untyped,

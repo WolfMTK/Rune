@@ -1,9 +1,15 @@
-use crate::common::enums::{Scalar, Value};
+use std::{
+    borrow::Cow,
+    ops::{DerefMut, Range},
+};
 
-use crate::common::structures::cursor::Cursor;
-use crate::exceptions::ParseError;
-use std::borrow::Cow;
-use std::ops::{DerefMut, Range};
+use crate::{
+    common::{
+        enums::{Scalar, Value},
+        structures::cursor::Cursor,
+    },
+    exceptions::ParseError,
+};
 
 pub(crate) mod kind {
     pub(crate) use crate::constants::kind::{

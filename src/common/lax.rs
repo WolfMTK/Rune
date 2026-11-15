@@ -1,10 +1,15 @@
-use crate::common::enums::{Primitive, Scalar};
-use crate::constants::MAX_SAFE_INTEGER;
-use crate::exceptions::ValidationError;
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::types::{PyBool, PyFloat, PyInt};
-use pyo3::{Bound, PyAny, PyResult, Python};
+use pyo3::{
+    Bound, PyAny, PyResult, Python,
+    exceptions::PyValueError,
+    prelude::PyAnyMethods,
+    types::{PyBool, PyFloat, PyInt},
+};
+
+use crate::{
+    common::enums::{Primitive, Scalar},
+    constants::MAX_SAFE_INTEGER,
+    exceptions::ValidationError,
+};
 
 pub(crate) fn primitive<'py>(
     py: Python<'py>,

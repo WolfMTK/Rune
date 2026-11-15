@@ -1,12 +1,19 @@
-use crate::common::enums::{Scalar, Value};
-use crate::common::macros::big_endian_readers;
-use crate::common::reader::{Key, Reader, kind};
-use crate::common::structures::cursor::Cursor;
-use crate::constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING};
-use crate::exceptions::ParseError;
-use crate::msgpack::enums::Container;
-use crate::msgpack::helpers::{invalid_opcode, truncated};
 use std::borrow::Cow;
+
+use crate::{
+    common::{
+        enums::{Scalar, Value},
+        macros::big_endian_readers,
+        reader::{Key, Reader, kind},
+        structures::cursor::Cursor,
+    },
+    constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING},
+    exceptions::ParseError,
+    msgpack::{
+        enums::Container,
+        helpers::{invalid_opcode, truncated},
+    },
+};
 
 pub(crate) struct Parser<'a> {
     pub(crate) cursor: Cursor<'a>,

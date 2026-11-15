@@ -1,11 +1,16 @@
-use crate::common::cache::{cached_fields, plain_fields};
-use crate::common::helpers::{has_generated_new, struct_field_pairs, struct_info};
-use crate::common::py_typing::{resolve_generic_fields, resolve_namedtuple_fields};
-use crate::common::r#struct::StructInfo;
-use crate::common::structures::compiler::accepts_unset;
-use pyo3::prelude::{PyAnyMethods, PyDictMethods, PyStringMethods};
-use pyo3::types::PyString;
-use pyo3::{Bound, Py, PyAny, PyResult, intern};
+use pyo3::{
+    Bound, Py, PyAny, PyResult, intern,
+    prelude::{PyAnyMethods, PyDictMethods, PyStringMethods},
+    types::PyString,
+};
+
+use crate::common::{
+    cache::{cached_fields, plain_fields},
+    helpers::{has_generated_new, struct_field_pairs, struct_info},
+    py_typing::{resolve_generic_fields, resolve_namedtuple_fields},
+    r#struct::StructInfo,
+    structures::compiler::accepts_unset,
+};
 
 pub(crate) struct Field {
     pub(crate) name: Box<str>,

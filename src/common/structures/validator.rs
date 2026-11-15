@@ -1,19 +1,21 @@
-use crate::common::helpers::{
-    container_kind, enter_type_alias, expand_type_alias, is_named_tuple_class, is_struct_class,
-    named_tuple_field_pairs, parametrized_identity, struct_field_pairs, type_arg_or_any,
+use pyo3::{
+    Bound, PyAny, PyResult, exceptions::PyTypeError, intern, prelude::PyAnyMethods, types::PyType,
 };
-use crate::common::py_typing::{
-    is_annotated_origin, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
-    is_type_alias, is_typeddict_class, is_typevar, is_union_origin, new_type_supertype, type_args,
-    type_origin,
+
+use crate::common::{
+    helpers::{
+        container_kind, enter_type_alias, expand_type_alias, is_named_tuple_class, is_struct_class,
+        named_tuple_field_pairs, parametrized_identity, struct_field_pairs, type_arg_or_any,
+    },
+    py_typing::{
+        is_annotated_origin, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
+        is_type_alias, is_typeddict_class, is_typevar, is_union_origin, new_type_supertype,
+        type_args, type_origin,
+    },
+    structures::compiler::plain_field_pairs,
+    types::RuneSet,
+    validate::ensure_union_is_unambiguous,
 };
-use crate::common::structures::compiler::plain_field_pairs;
-use crate::common::types::RuneSet;
-use crate::common::validate::ensure_union_is_unambiguous;
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::types::PyType;
-use pyo3::{Bound, PyAny, PyResult, intern};
 
 #[derive(Default)]
 pub(crate) struct Validator {

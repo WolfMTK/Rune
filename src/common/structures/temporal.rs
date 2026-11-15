@@ -1,17 +1,22 @@
-use crate::common::datetime_format;
-use crate::common::py_typing::{date, datetime, time, timedelta};
-use crate::common::structures::errors::{Fail, overflow_failure};
-use crate::common::types::{Decoded, Outcome};
-use crate::constants::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND};
-use pyo3::prelude::PyDictMethods;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::PyDateAccess;
-use pyo3::types::PyDeltaAccess;
-use pyo3::types::PyDict;
-use pyo3::types::PyFloatMethods;
-use pyo3::types::PyTimeAccess;
-use pyo3::types::{PyAnyMethods, PyDate, PyDateTime, PyDelta, PyFloat, PyTime, PyTzInfo};
-use pyo3::{Bound, Py, PyAny, PyResult, Python, intern};
+use pyo3::{
+    Bound, Py, PyAny, PyResult, Python, intern,
+    prelude::PyDictMethods,
+    sync::PyOnceLock,
+    types::{
+        PyAnyMethods, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyDict, PyFloat,
+        PyFloatMethods, PyTime, PyTimeAccess, PyTzInfo,
+    },
+};
+
+use crate::{
+    common::{
+        datetime_format,
+        py_typing::{date, datetime, time, timedelta},
+        structures::errors::{Fail, overflow_failure},
+        types::{Decoded, Outcome},
+    },
+    constants::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND},
+};
 
 pub(crate) fn timedelta_from_seconds<'py>(
     py: Python<'py>,

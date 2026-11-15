@@ -1,7 +1,9 @@
-use crate::constants::{
-    EXPONENT_MINUS_FIVE, EXPONENT_MINUS_FIVE_PREFIX, HEX_DIGITS, SCIENTIFIC_NOTATION_START,
+use crate::{
+    constants::{
+        EXPONENT_MINUS_FIVE, EXPONENT_MINUS_FIVE_PREFIX, HEX_DIGITS, SCIENTIFIC_NOTATION_START,
+    },
+    json::helpers::for_each_special_byte,
 };
-use crate::json::helpers::for_each_special_byte;
 
 pub(crate) fn write_integer(out: &mut Vec<u8>, value: impl itoa::Integer) {
     out.extend_from_slice(itoa::Buffer::new().format(value).as_bytes());

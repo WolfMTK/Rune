@@ -1,15 +1,20 @@
-use crate::common::enums::{Scalar, Token, Value};
-use crate::common::reader::{Key, Reader, kind};
-use crate::common::structures::cursor::Cursor;
-use crate::common::writer::Writer;
-use crate::constants::INITIAL_CAPACITY;
-use crate::exceptions::ParseError;
-use crate::json;
-use crate::json::helpers::plain_prefix_len;
-use crate::json::writer::write_escaped;
+use std::borrow::Cow;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use json::writer::{write_float, write_integer};
-use std::borrow::Cow;
+
+use crate::{
+    common::{
+        enums::{Scalar, Token, Value},
+        reader::{Key, Reader, kind},
+        structures::cursor::Cursor,
+        writer::Writer,
+    },
+    constants::INITIAL_CAPACITY,
+    exceptions::ParseError,
+    json,
+    json::{helpers::plain_prefix_len, writer::write_escaped},
+};
 
 pub(crate) struct JsonWriter {
     out: Vec<u8>,

@@ -1,7 +1,8 @@
-use crate::common::enums::Token;
-use crate::common::writer::Writer;
-use crate::constants::{MSGPACK_ARRAY as ARRAY, MSGPACK_MAP as MAP};
-use crate::msgpack::structures::MsgpackWriter;
+use crate::{
+    common::{enums::Token, writer::Writer},
+    constants::{MSGPACK_ARRAY as ARRAY, MSGPACK_MAP as MAP},
+    msgpack::structures::MsgpackWriter,
+};
 
 impl Writer for MsgpackWriter {
     const BINARY: bool = true;

@@ -1,13 +1,17 @@
-use crate::common::py_typing::type_name;
-use pyo3::buffer::PyUntypedBuffer;
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::{
-    Bound, PyAnyMethods, PyBytesMethods, PyStringMethods, PyTypeMethods, pyclass, pymethods,
-};
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyByteArray, PyBytes, PyMemoryView, PyString, PyTuple, PyType};
-use pyo3::{Py, PyAny, PyResult, Python};
 use std::ops::Range;
+
+use pyo3::{
+    Py, PyAny, PyResult, Python,
+    buffer::PyUntypedBuffer,
+    exceptions::PyTypeError,
+    prelude::{
+        Bound, PyAnyMethods, PyBytesMethods, PyStringMethods, PyTypeMethods, pyclass, pymethods,
+    },
+    sync::PyOnceLock,
+    types::{PyByteArray, PyBytes, PyMemoryView, PyString, PyTuple, PyType},
+};
+
+use crate::common::py_typing::type_name;
 
 enum Source {
     Bytes(Py<PyBytes>),

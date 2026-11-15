@@ -1,20 +1,25 @@
-use crate::common::enums::UnionKind;
+use pyo3::{
+    Bound, PyAny, PyResult,
+    exceptions::{PyNotImplementedError, PyTypeError},
+    intern,
+    prelude::{PyAnyMethods, PySetMethods},
+    types::{PyBool, PyInt, PyNone, PySet, PyString},
+};
+
 pub(crate) use crate::common::helpers::{
     is_plain_or_typeddict, resolve_type_aliases, struct_class, union_contains_any, union_kind,
     union_members,
 };
-use crate::common::macros::reject_union_if;
-use crate::common::py_typing::{
-    is_enum_class, is_plain_class, is_type, is_typeddict_class, is_unset_type, origin_or_self,
+use crate::common::{
+    enums::UnionKind,
+    macros::reject_union_if,
+    py_typing::{
+        is_enum_class, is_plain_class, is_type, is_typeddict_class, is_unset_type, origin_or_self,
+    },
+    raw::raw_type,
+    structures::{layout::StructSettings, validator::Validator},
+    types::UnionOption,
 };
-use crate::common::raw::raw_type;
-use crate::common::structures::layout::StructSettings;
-use crate::common::structures::validator::Validator;
-use crate::common::types::UnionOption;
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
-use pyo3::prelude::{PyAnyMethods, PySetMethods};
-use pyo3::types::{PyBool, PyInt, PyNone, PySet, PyString};
-use pyo3::{Bound, PyAny, PyResult, intern};
 
 pub(crate) fn validate_literal_value(value: &Bound<'_, PyAny>) -> PyResult<()> {
     if value.is_exact_instance_of::<PyInt>() {

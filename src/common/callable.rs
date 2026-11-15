@@ -1,10 +1,13 @@
-use pyo3::exceptions::PyTypeError;
-use pyo3::impl_::trampoline::{MethodDef, fastcall_cfunction_with_keywords};
-use pyo3::prelude::{PyAnyMethods, PyModuleMethods};
-use pyo3::types::{PyModule, PyString, PyType, PyTypeMethods};
-use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult, Python, ffi};
-use std::ffi::CStr;
-use std::marker::PhantomData;
+use std::{ffi::CStr, marker::PhantomData};
+
+use pyo3::{
+    Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult, Python,
+    exceptions::PyTypeError,
+    ffi,
+    impl_::trampoline::{MethodDef, fastcall_cfunction_with_keywords},
+    prelude::{PyAnyMethods, PyModuleMethods},
+    types::{PyModule, PyString, PyType, PyTypeMethods},
+};
 
 pub(crate) trait Function {
     const NAME: &'static CStr;
@@ -85,14 +88,11 @@ impl<'a, 'py> Arguments<'a, 'py> {
             let keyword = self.borrow(unsafe {
                 ffi::PyTuple_GET_ITEM(self.keyword_names, index as ffi::Py_ssize_t)
             });
-            let slot = names
-                .iter()
-                .position(|name| name.is(keyword))
-                .or_else(|| {
-                    names
-                        .iter()
-                        .position(|name| name.as_any().eq(keyword).unwrap_or(false))
-                });
+            let slot = names.iter().position(|name| name.is(keyword)).or_else(|| {
+                names
+                    .iter()
+                    .position(|name| name.as_any().eq(keyword).unwrap_or(false))
+            });
             let Some(slot) = slot else {
                 return Err(extra_keyword());
             };

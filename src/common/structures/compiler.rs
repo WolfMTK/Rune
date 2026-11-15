@@ -1,32 +1,41 @@
-use crate::common::cache::{cached_tag_lookup, plain_field_cache, plain_fields};
-use crate::common::enums::{
-    AbstractContainer, BytesType, Constraint, ConstraintSubject, Constructor, Insertion, Primitive,
-    Shape,
+use pyo3::{
+    Bound, PyAny, PyResult, Python,
+    exceptions::PyTypeError,
+    intern,
+    prelude::{PyAnyMethods, PyDictMethods},
+    types::{PyDict, PyFrozenSet, PyList, PyNone, PySet, PyString, PyStringMethods, PyTuple},
 };
-use crate::common::helpers::{
-    class_tag, expand_type_alias, is_named_tuple_class, is_struct_class, struct_class, struct_info,
-    type_arg_or_any, typevar_bound, union_contains_any, union_members,
+
+use crate::{
+    common::{
+        cache::{cached_tag_lookup, plain_field_cache, plain_fields},
+        enums::{
+            AbstractContainer, BytesType, Constraint, ConstraintSubject, Constructor, Insertion,
+            Primitive, Shape,
+        },
+        helpers::{
+            class_tag, expand_type_alias, is_named_tuple_class, is_struct_class, struct_class,
+            struct_info, type_arg_or_any, typevar_bound, union_contains_any, union_members,
+        },
+        py_typing::{
+            any, date, datetime, decimal_type, deque, frozendict, is_annotated_origin,
+            is_enum_class, is_final_origin, is_literal_origin, is_new_type, is_plain_class,
+            is_type, is_type_alias, is_typeddict_class, is_typevar, is_union_origin, is_unset_type,
+            new_type_supertype, time, timedelta, type_args, type_name, type_origin, uuid,
+        },
+        raw::raw_type,
+        structures::{
+            layout::{StructLayout, TupleLayout},
+            plan::{
+                ArrayPlan, ConstraintSet, EnumPlan, FieldPlan, LiteralPlan, Node, StructPlan,
+                TuplePlan, UnionMember, UnionPlan,
+            },
+        },
+        types::{NodeId, RuneMap, TagIndex},
+    },
+    constants::kind,
+    msgpack::ext::ext_type,
 };
-use crate::common::py_typing::{
-    any, date, datetime, decimal_type, deque, frozendict, is_annotated_origin, is_enum_class,
-    is_final_origin, is_literal_origin, is_new_type, is_plain_class, is_type, is_type_alias,
-    is_typeddict_class, is_typevar, is_union_origin, is_unset_type, new_type_supertype, time,
-    timedelta, type_args, type_name, type_origin, uuid,
-};
-use crate::common::raw::raw_type;
-use crate::common::structures::layout::{StructLayout, TupleLayout};
-use crate::common::structures::plan::{
-    ArrayPlan, ConstraintSet, EnumPlan, FieldPlan, LiteralPlan, Node, StructPlan, TuplePlan,
-    UnionMember, UnionPlan,
-};
-use crate::common::types::{NodeId, RuneMap, TagIndex};
-use crate::constants::kind;
-use crate::msgpack::ext::ext_type;
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::{PyAnyMethods, PyDictMethods};
-use pyo3::types::PyStringMethods;
-use pyo3::types::{PyDict, PyFrozenSet, PyList, PyNone, PySet, PyString, PyTuple};
-use pyo3::{Bound, PyAny, PyResult, Python, intern};
 
 pub(crate) struct Compiler<'py> {
     pub(crate) py: Python<'py>,

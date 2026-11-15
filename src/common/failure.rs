@@ -1,8 +1,9 @@
-use crate::common::enums::PathSegment;
-use crate::common::structures::errors::Fail;
-use crate::common::types::Length;
-use crate::constants::{KEY_PATH_PREFIX, PATH_PREFIX};
 use std::fmt::Write as _;
+
+use crate::{
+    common::{enums::PathSegment, structures::errors::Fail, types::Length},
+    constants::{KEY_PATH_PREFIX, PATH_PREFIX},
+};
 
 pub(crate) fn with_path(mut message: String, reversed_path: &[PathSegment]) -> String {
     let (prefix, reversed_path) = match reversed_path.split_first() {

@@ -1,7 +1,6 @@
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::{Bound, PyAny, PyErr};
 use std::fmt::Display;
+
+use pyo3::{Bound, PyAny, PyErr, exceptions::PyTypeError, prelude::PyAnyMethods};
 
 macro_rules! reject_union_if {
     ($ty:expr, $condition:expr, $reason:expr $(,)?) => {

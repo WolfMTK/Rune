@@ -1,34 +1,43 @@
-use crate::common::enums::{BytesType, DecimalFormat, Kind, Order, Token, UuidFormat};
-use crate::common::helpers::{
-    class_default, int_token, is_struct_class, unsupported_key_error, unsupported_type_error,
-};
-use crate::common::py_typing::{
-    decimal_type, is_decimal, is_enum_class, is_frozendict_type, is_plain_class, is_temporal_type,
-    is_type, object_type, unset, uuid,
-};
-use crate::common::raw::{Raw, buffer_bytes};
-use crate::common::r#struct::{FieldDefault, StructInfo};
-use crate::common::structures::layout::{Field, StructLayout, StructSettings};
-use crate::common::structures::temporal::{epoch_micros, temporal_text, timestamp_payload};
-use crate::common::types::RuneMap;
-use crate::common::writer::Writer;
-use crate::constants::{MICROS_PER_SECOND, TIMESTAMP_EXT_CODE};
-use crate::msgpack::ext::Ext;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use uuid::Uuid;
-use pyo3::exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError};
-use pyo3::prelude::{
-    PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
-};
-use pyo3::types::PyByteArrayMethods;
-use pyo3::types::PyFrozenSetMethods;
-use pyo3::types::PySetMethods;
-use pyo3::types::PyTupleMethods;
-use pyo3::types::{
-    PyByteArray, PyBytes, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple, PyType,
-};
-use pyo3::{Bound, Py, PyAny, PyResult, intern};
 use std::rc::Rc;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use pyo3::{
+    Bound, Py, PyAny, PyResult,
+    exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError},
+    intern,
+    prelude::{
+        PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
+    },
+    types::{
+        PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyFrozenSet, PyFrozenSetMethods, PyInt,
+        PyList, PySet, PySetMethods, PyString, PyTuple, PyTupleMethods, PyType,
+    },
+};
+use uuid::Uuid;
+
+use crate::{
+    common::{
+        enums::{BytesType, DecimalFormat, Kind, Order, Token, UuidFormat},
+        helpers::{
+            class_default, int_token, is_struct_class, unsupported_key_error,
+            unsupported_type_error,
+        },
+        py_typing::{
+            decimal_type, is_decimal, is_enum_class, is_frozendict_type, is_plain_class,
+            is_temporal_type, is_type, object_type, unset, uuid,
+        },
+        raw::{Raw, buffer_bytes},
+        r#struct::{FieldDefault, StructInfo},
+        structures::{
+            layout::{Field, StructLayout, StructSettings},
+            temporal::{epoch_micros, temporal_text, timestamp_payload},
+        },
+        types::RuneMap,
+        writer::Writer,
+    },
+    constants::{MICROS_PER_SECOND, TIMESTAMP_EXT_CODE},
+    msgpack::ext::Ext,
+};
 
 pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) writer: W,
@@ -166,8 +175,9 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             }
             Kind::Uuid => {
                 let value: u128 = key.getattr(intern!(key.py(), "int"))?.extract()?;
-                self.writer
-                    .write_key(Token::Str(&Uuid::from_bytes(value.to_be_bytes()).to_string()));
+                self.writer.write_key(Token::Str(
+                    &Uuid::from_bytes(value.to_be_bytes()).to_string(),
+                ));
                 Ok(())
             }
             Kind::Bytes => {

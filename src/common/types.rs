@@ -1,8 +1,8 @@
-use crate::common::structures::errors::Fail;
-use crate::common::structures::layout::StructSettings;
-use crate::common::structures::plan::ScalarIndex;
-use pyo3::{Bound, PyAny};
 use std::ops::RangeInclusive;
+
+use pyo3::{Bound, PyAny};
+
+use crate::common::structures::{errors::Fail, layout::StructSettings, plan::ScalarIndex};
 
 pub(crate) type NodeId = usize;
 pub(crate) type ConstraintSetId = usize;

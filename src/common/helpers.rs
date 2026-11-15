@@ -1,41 +1,49 @@
-use crate::common::enums::{
-    AbstractContainer, DecimalFormat, Insertion, Order, Primitive, Token, UnionKind, UuidFormat,
+use std::{collections::hash_map::Entry, fmt::Write as _};
+
+use pyo3::{
+    Bound, PyAny, PyErr, PyResult, Python,
+    exceptions::{PyOverflowError, PyRecursionError, PyTypeError, PyValueError},
+    intern,
+    prelude::{PyAnyMethods, PyTypeMethods},
+    sync::PyOnceLock,
+    types::{
+        PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt,
+        PyList, PySet, PySlice, PyString, PyTuple, PyType,
+    },
 };
-use crate::common::py_typing::{
-    any, date, datetime, decimal_type, default_factory_type, deque, enum_type, frozendict,
-    is_annotated_origin, is_enum_class, is_final_origin, is_literal_origin, is_new_type,
-    is_plain_class, is_type, is_type_alias, is_typeddict_class, is_union_origin,
-    new_type_supertype, resolve_type_alias, time, timedelta, type_alias_of, type_args, type_name,
-    type_origin, uuid,
+
+use crate::{
+    common::{
+        enums::{
+            AbstractContainer, DecimalFormat, Insertion, Order, Primitive, Token, UnionKind,
+            UuidFormat,
+        },
+        py_typing::{
+            any, date, datetime, decimal_type, default_factory_type, deque, enum_type, frozendict,
+            is_annotated_origin, is_enum_class, is_final_origin, is_literal_origin, is_new_type,
+            is_plain_class, is_type, is_type_alias, is_typeddict_class, is_typevar,
+            is_union_origin, new_type_supertype, origin_or_self, resolve_generic_fields,
+            resolve_namedtuple_fields, resolve_type_alias, struct_field_types, struct_meta, time,
+            timedelta, type_alias_of, type_args, type_name, type_origin, typing_generic_alias,
+            uuid,
+        },
+        reader::kind,
+        recursion_limit,
+        r#struct::{StructInfo, own_info},
+        structures::{
+            encoder::Encoder,
+            errors::Fail,
+            layout::StructSettings,
+            options::Hook,
+            plan::{Plan, UnionPlan},
+        },
+        types::RuneMap,
+        validate::enum_values,
+        writer::Writer,
+    },
+    constants::GENERATED_NAMEDTUPLE_PREFIX,
+    msgpack::ext::ext_type,
 };
-use crate::common::py_typing::{
-    is_typevar, origin_or_self, resolve_generic_fields, resolve_namedtuple_fields,
-    struct_field_types, struct_meta, typing_generic_alias,
-};
-use crate::common::reader::kind;
-use crate::common::recursion_limit;
-use crate::common::r#struct::{StructInfo, own_info};
-use crate::common::structures::encoder::Encoder;
-use crate::common::structures::errors::Fail;
-use crate::common::structures::layout::StructSettings;
-use crate::common::structures::options::Hook;
-use crate::common::structures::plan::{Plan, UnionPlan};
-use crate::common::types::RuneMap;
-use crate::common::validate::enum_values;
-use crate::common::writer::Writer;
-use crate::constants::GENERATED_NAMEDTUPLE_PREFIX;
-use crate::msgpack::ext::ext_type;
-use pyo3::Python;
-use pyo3::exceptions::{PyOverflowError, PyRecursionError, PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyTypeMethods};
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{
-    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList,
-    PySet, PySlice, PyString, PyTuple, PyType,
-};
-use pyo3::{Bound, PyAny, PyErr, PyResult, intern};
-use std::collections::hash_map::Entry;
-use std::fmt::Write as _;
 
 pub(crate) fn expand_type_alias<'py>(ty: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     resolve_type_alias(ty.py())?.call1((ty,))

@@ -1,10 +1,10 @@
-use crate::common::py_typing::get_recursion_limit;
-use crate::common::reader::Reader;
-use crate::common::writer::Writer;
-use crate::constants::MAX_DEPTH;
-use crate::exceptions::ParseError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::{PyResult, Python};
+use pyo3::{PyResult, Python, prelude::PyAnyMethods};
+
+use crate::{
+    common::{py_typing::get_recursion_limit, reader::Reader, writer::Writer},
+    constants::MAX_DEPTH,
+    exceptions::ParseError,
+};
 
 pub(crate) mod cache;
 pub(crate) mod callable;

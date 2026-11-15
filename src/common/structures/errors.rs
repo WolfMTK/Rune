@@ -1,9 +1,16 @@
-use crate::common::enums::{Failure, PathSegment};
-use crate::common::failure::with_path;
-use crate::common::reader::kind;
-use crate::exceptions::{DecodeError, ParseError, ValidationError};
-use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
-use pyo3::{PyErr, Python};
+use pyo3::{
+    PyErr, Python,
+    exceptions::{PyOverflowError, PyTypeError, PyValueError},
+};
+
+use crate::{
+    common::{
+        enums::{Failure, PathSegment},
+        failure::with_path,
+        reader::kind,
+    },
+    exceptions::{DecodeError, ParseError, ValidationError},
+};
 
 pub(crate) struct Fail(Box<Failure>);
 

@@ -1,29 +1,37 @@
-use crate::common::helpers::{check_instantiable_alias, has_default_call, struct_info};
-use crate::common::macros::first_matching_kind;
-use crate::common::py_typing::{
-    abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence, abc_mutable_set,
-    abc_sequence, abc_set, compile_regex, is_type, meta_type,
+use std::{borrow::Cow, rc::Rc};
+
+use pyo3::{
+    Bound, Py, PyAny, PyErr, PyResult, Python,
+    basic::CompareOp,
+    exceptions::{PyTypeError, PyValueError},
+    intern,
+    prelude::{PyAnyMethods, PyStringMethods},
+    types::{
+        PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
+        PyNone, PySet, PyString, PyTuple,
+    },
 };
-use crate::common::raw::Raw;
-use crate::common::reader::kind;
-use crate::common::r#struct::StructInfo;
-use crate::common::structures::layout::StructLayout;
-use crate::common::structures::plan::{
-    ArrayPlan, EnumPlan, LiteralPlan, StructPlan, TuplePlan, UnionPlan,
+
+use crate::{
+    common::{
+        helpers::{check_instantiable_alias, has_default_call, struct_info},
+        macros::first_matching_kind,
+        py_typing::{
+            abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence,
+            abc_mutable_set, abc_sequence, abc_set, compile_regex, is_type, meta_type,
+        },
+        raw::Raw,
+        reader::kind,
+        r#struct::StructInfo,
+        structures::{
+            layout::StructLayout,
+            plan::{ArrayPlan, EnumPlan, LiteralPlan, StructPlan, TuplePlan, UnionPlan},
+        },
+        types::{ConstraintSetId, NodeId},
+    },
+    exceptions::ParseError,
+    msgpack::ext::Ext,
 };
-use crate::common::types::{ConstraintSetId, NodeId};
-use crate::exceptions::ParseError;
-use crate::msgpack::ext::Ext;
-use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyStringMethods};
-use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
-    PyNone, PySet, PyString, PyTuple,
-};
-use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
-use std::borrow::Cow;
-use std::rc::Rc;
 
 pub(crate) enum Token<'a> {
     Null,

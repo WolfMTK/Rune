@@ -1,15 +1,24 @@
-use crate::common::helpers::class_tag;
-use crate::common::py_typing::{
-    builtin_generic_alias, plain_class_fields, struct_lookup_cache, type_args, typing_generic_alias,
+use pyo3::{
+    Bound, Py, PyAny, PyResult, Python,
+    exceptions::{PyRuntimeError, PyTypeError},
+    intern,
+    prelude::{PyAnyMethods, PyDictMethods},
+    sync::PyOnceLock,
+    types::{PyDict, PyFrozenSet, PyInt, PyString, PyType},
 };
-use crate::common::structures::layout::Field;
-use crate::common::validate::{validate_i64_range, validate_literal_value};
-use crate::constants::{CACHE_ATTR, STRUCT_LOOKUP_CACHE_SIZE};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
-use pyo3::prelude::{PyAnyMethods, PyDictMethods};
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyFrozenSet, PyInt, PyString, PyType};
-use pyo3::{Bound, Py, PyAny, PyResult, Python, intern};
+
+use crate::{
+    common::{
+        helpers::class_tag,
+        py_typing::{
+            builtin_generic_alias, plain_class_fields, struct_lookup_cache, type_args,
+            typing_generic_alias,
+        },
+        structures::layout::Field,
+        validate::{validate_i64_range, validate_literal_value},
+    },
+    constants::{CACHE_ATTR, STRUCT_LOOKUP_CACHE_SIZE},
+};
 
 static ALIAS_TARGETS: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
 

@@ -1,15 +1,23 @@
-use crate::common::py_typing::{default_factory_type, nodefault};
-use crate::constants::STRUCT_INFO_ATTRIBUTE as INFO_ATTRIBUTE;
-use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
-use pyo3::ffi;
-use pyo3::prelude::{
-    PyAnyMethods, PyDictMethods, PyTupleMethods, PyTypeMethods, pyclass, pyfunction, pymethods,
+use std::{
+    ffi::{c_int, c_ulong, c_void},
+    ptr,
+    sync::OnceLock,
 };
-use pyo3::types::{PyDict, PyString, PyTuple, PyType};
-use pyo3::{Borrowed, Bound, Py, PyAny, PyErr, PyResult, PyTraverseError, PyVisit, Python, intern};
-use std::ffi::{c_int, c_ulong, c_void};
-use std::ptr;
-use std::sync::OnceLock;
+
+use pyo3::{
+    Borrowed, Bound, Py, PyAny, PyErr, PyResult, PyTraverseError, PyVisit, Python,
+    exceptions::{PyAttributeError, PyRuntimeError, PyTypeError},
+    ffi, intern,
+    prelude::{
+        PyAnyMethods, PyDictMethods, PyTupleMethods, PyTypeMethods, pyclass, pyfunction, pymethods,
+    },
+    types::{PyDict, PyString, PyTuple, PyType},
+};
+
+use crate::{
+    common::py_typing::{default_factory_type, nodefault},
+    constants::STRUCT_INFO_ATTRIBUTE as INFO_ATTRIBUTE,
+};
 
 pub(crate) enum FieldDefault {
     Value(Py<PyAny>),

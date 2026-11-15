@@ -1,5 +1,4 @@
 pub mod compiler;
-pub mod convert;
 pub mod converter;
 pub mod cursor;
 pub mod decoder;

@@ -6,14 +6,16 @@ mod msgpack;
 
 #[pyo3::pymodule]
 mod rune {
-    use pyo3::prelude::{PyAnyMethods, PyModuleMethods};
-    use pyo3::types::{PyDict, PyModule};
-    use pyo3::{Bound, PyResult, pymodule};
+    use pyo3::{
+        Bound, PyResult,
+        prelude::{PyAnyMethods, PyModuleMethods},
+        pymodule,
+        types::{PyDict, PyModule},
+    };
 
     #[pymodule]
     mod json {
-        use pyo3::types::PyModule;
-        use pyo3::{Bound, PyResult};
+        use pyo3::{Bound, PyResult, types::PyModule};
 
         #[pymodule_export]
         use crate::json::{Decoder, Encoder, format};
@@ -26,12 +28,10 @@ mod rune {
 
     #[pymodule]
     mod msgpack {
-        use pyo3::types::PyModule;
-        use pyo3::{Bound, PyResult};
+        use pyo3::{Bound, PyResult, types::PyModule};
 
         #[pymodule_export]
         use crate::msgpack::ext::Ext;
-
         #[pymodule_export]
         use crate::msgpack::{Decoder, Encoder};
 
@@ -42,16 +42,13 @@ mod rune {
     }
 
     #[pymodule_export]
-    use crate::common::structures::convert::convert;
-
-    #[pymodule_export]
     use crate::common::raw::Raw;
-
     #[pymodule_export]
     use crate::common::r#struct::{
         _struct_copy, _struct_finalize, _struct_replace, _struct_values, force_setattr,
     };
-
+    #[pymodule_export]
+    use crate::common::structures::converter::convert::convert;
     #[pymodule_export]
     use crate::exceptions::{DecodeError, ValidationError};
 

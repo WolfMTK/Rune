@@ -1,22 +1,27 @@
-use crate::common::cache::{enum_cache, literal_cache};
-use crate::common::enums::{
-    ArrayOutput, Constraint, ConstraintSubject, Constructor, Insertion, Primitive, Scalar, Shape,
+use pyo3::{
+    Bound, Py, PyAny, PyErr, PyResult, Python,
+    exceptions::PyTypeError,
+    intern,
+    prelude::{PyAnyMethods, PyDictMethods},
+    types::{
+        PyBool, PyBoolMethods, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString,
+        PyStringMethods, PyTuple, PyType,
+    },
 };
-use crate::common::helpers::{has_custom_missing, insert_new, plain_default};
-use crate::common::py_typing::is_type;
-use crate::common::reader::kind;
-use crate::common::r#struct;
-use crate::common::structures::compiler::Compiler;
-use crate::common::structures::errors::Fail;
-use crate::common::types::{
-    ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,
+
+use crate::common::{
+    cache::{enum_cache, literal_cache},
+    enums::{
+        ArrayOutput, Constraint, ConstraintSubject, Constructor, Insertion, Primitive, Scalar,
+        Shape,
+    },
+    helpers::{has_custom_missing, insert_new, plain_default},
+    py_typing::is_type,
+    reader::kind,
+    r#struct,
+    structures::{compiler::Compiler, errors::Fail},
+    types::{ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex},
 };
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::{PyAnyMethods, PyDictMethods};
-use pyo3::types::PyBoolMethods;
-use pyo3::types::PyStringMethods;
-use pyo3::types::{PyBool, PyDict, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple, PyType};
-use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
 
 pub(crate) struct Plan {
     nodes: Vec<Node>,

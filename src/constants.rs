@@ -1,5 +1,6 @@
-use crate::msgpack::LengthMarkers;
 use std::ops::Range;
+
+use crate::msgpack::LengthMarkers;
 
 pub(crate) const MAX_DEPTH: usize = 512;
 pub(crate) const GENERATED_NAMEDTUPLE_PREFIX: &str = "namedtuple_";

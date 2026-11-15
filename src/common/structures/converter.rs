@@ -18,7 +18,7 @@ use crate::common::structures::temporal::{
     duration_from_seconds, time_from_text, timedelta_from_text,
 };
 use crate::common::structures::values::{
-    big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes, uuid_from_text,
+    big_integer_as_float, custom_value, decimal_from_text, uuid_from_bytes,
 };
 use crate::common::types::{
     ConstraintSetId, Decoded, FieldValues, Length, NodeId, Outcome, RuneMap, TagIndex,
@@ -26,6 +26,7 @@ use crate::common::types::{
 use crate::constants::{INVALID_BASE64, MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS, TIMESTAMP_EXT_CODE};
 use crate::msgpack::ext::Ext;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use uuid::Uuid;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::{PyAnyMethods, PyBytesMethods};
 use pyo3::types::{
@@ -459,7 +460,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             let Scalar::Str(text) = self.wire.read_scalar()? else {
                 unreachable!("kind is checked as str above")
             };
-            return uuid_from_text(py, &text);
+            return Ok(uuid_from_bytes(
+                py,
+                Uuid::try_parse(&text)
+                    .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?
+                    .as_bytes(),
+            )?);
         }
         let Scalar::Bytes(raw) = self.wire.read_scalar()? else {
             unreachable!("kind is checked as bytes above")
@@ -1129,7 +1135,12 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Shape::Literal(literal) => return self.decode_literal_key(literal, key),
             Shape::Enum(members) => return self.decode_enum_key(node.ty.bind(py), members, key),
             Shape::Union(union) => return self.decode_union_key(union, key),
-            Shape::Uuid => uuid_from_text(py, key)?,
+            Shape::Uuid => uuid_from_bytes(
+                py,
+                Uuid::try_parse(key)
+                    .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?
+                    .as_bytes(),
+            )?,
             Shape::Date => date_from_text(py, key)?,
             Shape::Time => time_from_text(py, key)?,
             Shape::DateTime => datetime_from_text(py, key)?,

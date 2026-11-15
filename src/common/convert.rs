@@ -19,7 +19,7 @@ use crate::common::structures::temporal::{
     timedelta_from_text,
 };
 use crate::common::structures::values::{
-    custom_value, decimal_from_text, uuid_from_bytes, uuid_from_text,
+    custom_value, decimal_from_text, uuid_from_bytes,
 };
 use crate::common::types::{Decoded, Length, NodeId, Outcome};
 use crate::common::validate::validate_type;
@@ -39,6 +39,7 @@ use pyo3::types::{
 };
 use pyo3::{Bound, PyAny, PyErr, PyResult, Python, intern, pyfunction};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use uuid::Uuid;
 use std::borrow::Cow;
 
 type ShapeTest = fn(&Shape) -> bool;
@@ -661,7 +662,11 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             (
                 BUILTIN_UUID,
                 |shape| matches!(shape, Shape::Uuid),
-                uuid_from_text,
+                |py: Python<'_>, text: &str| {
+                    let parsed = Uuid::try_parse(text)
+                        .map_err(|_| Fail::invalid("Invalid UUID".to_owned()))?;
+                    Ok(uuid_from_bytes(py, parsed.as_bytes())?)
+                },
             ),
             (
                 BUILTIN_DECIMAL,

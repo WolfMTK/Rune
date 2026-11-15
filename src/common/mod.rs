@@ -21,7 +21,6 @@ pub(crate) mod reader;
 pub(crate) mod r#struct;
 pub(crate) mod structures;
 pub(crate) mod types;
-pub(crate) mod uuid_format;
 pub(crate) mod validate;
 pub(crate) mod writer;
 

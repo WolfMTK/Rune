@@ -39,8 +39,6 @@ pub(crate) const MAX_DURATION_DAYS: i128 = 999_999_999;
 pub(crate) const MAX_DURATION_MICROS: i128 = MAX_DURATION_DAYS * MICROS_PER_DAY;
 pub(crate) const MAX_DURATION_FRACTION_DIGITS: usize = 11;
 
-pub(crate) const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
-
 pub(crate) const JSON_WORD_ONES: u64 = 0x0101_0101_0101_0101;
 pub(crate) const JSON_WORD_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 pub(crate) const JSON_WORD_SIZE: usize = 8;

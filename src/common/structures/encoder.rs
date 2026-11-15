@@ -11,11 +11,11 @@ use crate::common::r#struct::{FieldDefault, StructInfo};
 use crate::common::structures::layout::{Field, StructLayout, StructSettings};
 use crate::common::structures::temporal::{epoch_micros, temporal_text, timestamp_payload};
 use crate::common::types::RuneMap;
-use crate::common::uuid_format;
 use crate::common::writer::Writer;
 use crate::constants::{MICROS_PER_SECOND, TIMESTAMP_EXT_CODE};
 use crate::msgpack::ext::Ext;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use uuid::Uuid;
 use pyo3::exceptions::{PyKeyError, PyRecursionError, PyTypeError, PyValueError};
 use pyo3::prelude::{
     PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
@@ -167,7 +167,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Uuid => {
                 let value: u128 = key.getattr(intern!(key.py(), "int"))?.extract()?;
                 self.writer
-                    .write_key(Token::Str(&uuid_format::canonical(&value.to_be_bytes())));
+                    .write_key(Token::Str(&Uuid::from_bytes(value.to_be_bytes()).to_string()));
                 Ok(())
             }
             Kind::Bytes => {
@@ -204,8 +204,10 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         match self.uuid_format {
             UuidFormat::Canonical => self
                 .writer
-                .write(Token::Str(&uuid_format::canonical(&bytes))),
-            UuidFormat::Hex => self.writer.write(Token::Str(&uuid_format::hex(&bytes))),
+                .write(Token::Str(&Uuid::from_bytes(bytes).to_string())),
+            UuidFormat::Hex => self
+                .writer
+                .write(Token::Str(&Uuid::from_bytes(bytes).simple().to_string())),
             UuidFormat::Bytes => self.writer.write(Token::Bytes(&bytes)),
         }
         Ok(())

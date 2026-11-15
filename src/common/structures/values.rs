@@ -1,7 +1,6 @@
 use crate::common::py_typing::{decimal_type, type_name, uuid};
 use crate::common::structures::errors::Fail;
 use crate::common::types::{Decoded, Outcome};
-use crate::common::uuid_format;
 use pyo3::exceptions::PyArithmeticError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::{PyBytes, PyDict, PyFloat};
@@ -42,11 +41,6 @@ pub(crate) fn decimal_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bou
             Fail::from(err)
         }
     })
-}
-
-pub(crate) fn uuid_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<Bound<'py, PyAny>> {
-    let bytes = uuid_format::parse(text).ok_or_else(|| Fail::invalid("Invalid UUID".to_owned()))?;
-    Ok(uuid_from_bytes(py, &bytes)?)
 }
 
 pub(crate) fn uuid_from_bytes<'py>(

@@ -3,7 +3,8 @@
 Rune is an experimental project that implements the full functionality of the [msgspec](https://github.com/msgspec/msgspec) library and is written in Rust.
 
 ```
-WARNING: This project is not currently intended for use in production environments, as some algorithms need to be reviewed and the code needs to be refactored.
+WARNING: This project is not currently intended for use in production environments,
+as some algorithms need to be reviewed and the code needs to be refactored.
 ```
 
 # How to Install?

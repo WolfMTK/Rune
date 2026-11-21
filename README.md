@@ -55,6 +55,6 @@ Traceback (most recent call last):
 rune.exceptions.ValidationError: Expected `str`, got `int` - at `$.groups[0]`
 ```
 
-* License
+# License
 
 MIT. See the [License file](LICENSE)

@@ -1,6 +1,6 @@
 from rune import rune as rune  # isort: skip
 
-from rune import json, msgpack, structs
+from rune import json, msgpack, structs, toml
 from rune._conversion import to_builtins
 from rune.meta import Meta
 from rune.rune import DecodeError, Raw, ValidationError, convert
@@ -29,4 +29,5 @@ __all__ = [
     "msgpack",
     "structs",
     "to_builtins",
+    "toml",
 ]

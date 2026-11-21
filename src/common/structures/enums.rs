@@ -1,27 +1,38 @@
-use crate::common::helpers::{check_default_construction, check_instantiable_alias};
-use crate::common::macros::first_matching_kind;
-use crate::common::py_typing::{
-    abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence, abc_mutable_set,
-    abc_sequence, abc_set, compile_regex, is_type, meta_type, object_type,
+use std::{borrow::Cow, rc::Rc};
+
+use pyo3::{
+    Bound, Py, PyAny, PyErr, PyResult, Python,
+    basic::CompareOp,
+    exceptions::{PyTypeError, PyValueError},
+    intern,
+    prelude::{PyAnyMethods, PyStringMethods},
+    types::{
+        PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
+        PyNone, PySet, PyString, PyTuple,
+    },
 };
-use crate::common::raw::Raw;
-use crate::common::reader::kind;
-use crate::common::structures::{
-    ArrayPlan, EnumPlan, LiteralPlan, StructLayout, StructPlan, TuplePlan, UnionPlan,
+
+use crate::{
+    common::{
+        classes::{check_instantiable_alias, has_default_call, struct_info},
+        macros::first_matching_kind,
+        py_typing::{
+            abc_collection, abc_mapping, abc_mutable_mapping, abc_mutable_sequence,
+            abc_mutable_set, abc_sequence, abc_set, compile_regex, is_type, meta_type,
+        },
+        raw::Raw,
+        reader::{Text, kind},
+        r#struct::StructInfo,
+        structures::{
+            layout::StructLayout,
+            plan::{ArrayPlan, EnumPlan, LiteralPlan, StructPlan, TuplePlan, UnionPlan},
+            values::string_from_read_text,
+        },
+        types::{ConstraintSetId, NodeId},
+    },
+    exceptions::ParseError,
+    msgpack::ext::Ext,
 };
-use crate::common::types::{ConstraintSetId, NodeId};
-use crate::exceptions::ParseError;
-use crate::msgpack::ext::Ext;
-use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::{PyAnyMethods, PyStringMethods};
-use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView,
-    PyNone, PySet, PyString, PyTuple,
-};
-use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, intern};
-use std::borrow::Cow;
-use std::rc::Rc;
 
 pub(crate) enum Token<'a> {
     Null,
@@ -44,7 +55,7 @@ pub(crate) enum Scalar<'a> {
     UInt(u64),
     BigInt(&'a str),
     Float(f64),
-    Str(Cow<'a, str>),
+    Str(Text<'a>),
     Bytes(Cow<'a, [u8]>),
     Ext { code: i8, data: &'a [u8] },
 }
@@ -59,7 +70,7 @@ impl Scalar<'_> {
             Scalar::UInt(value) => PyInt::new(py, *value).into_any(),
             Scalar::BigInt(digits) => return big_integer(py, digits),
             Scalar::Float(value) => PyFloat::new(py, *value).into_any(),
-            Scalar::Str(value) => PyString::new(py, value).into_any(),
+            Scalar::Str(value) => string_from_read_text(py, value)?.into_any(),
             Scalar::Bytes(value) => PyBytes::new(py, value).into_any(),
             Scalar::Ext { code, data } => return extension(py, *code, data),
         })
@@ -88,8 +99,9 @@ pub(crate) enum Value<'a> {
 
 pub(crate) enum PathSegment {
     Key(String),
-    Entry(String),
     Index(usize),
+    DictKey,
+    Ellipsis,
 }
 
 pub(crate) enum Failure {
@@ -112,12 +124,14 @@ pub(crate) enum Shape {
     AbstractArray(NodeId),
     Dict {
         keys: Option<NodeId>,
+        key: NodeId,
         values: NodeId,
     },
     AbstractDict(NodeId),
     Frozendict {
         class: Py<PyAny>,
         keys: Option<NodeId>,
+        key: NodeId,
         values: NodeId,
     },
     Struct(Box<StructPlan>),
@@ -170,15 +184,18 @@ impl Shape {
 
     pub(crate) fn accepted_kinds(&self, lax: bool) -> u16 {
         match self {
-            Self::Any | Self::Custom(_) | Self::Union(_) | Self::Raw => kind::ANY,
+            Self::Any | Self::Custom(_) | Self::Raw => kind::ANY,
+            Self::Union(union) => union.accepted_kinds,
             Self::Ext => kind::EXT,
             Self::Primitive(primitive) => primitive.accepted_kinds(lax),
             Self::Literal(plan) => plan.accepted_kinds(),
             Self::Enum(_) | Self::Decimal => kind::NUMBER_OR_STR,
             Self::Date | Self::Time => kind::STR,
             Self::Uuid | Self::Bytes(_) => kind::STR | kind::BYTES,
-            Self::DateTime | Self::TimeDelta if lax => kind::NUMBER_OR_STR,
-            Self::DateTime | Self::TimeDelta => kind::STR,
+            Self::DateTime if lax => kind::NUMBER_OR_STR | kind::EXT,
+            Self::DateTime => kind::STR | kind::EXT,
+            Self::TimeDelta if lax => kind::NUMBER_OR_STR,
+            Self::TimeDelta => kind::STR,
             Self::Array(_) | Self::AbstractArray(_) | Self::NamedTuple(_) => kind::ARRAY,
             Self::Struct(plan) if plan.array_like => kind::ARRAY,
             Self::Dict { .. }
@@ -288,7 +305,7 @@ impl Primitive {
 
 pub(crate) enum Constructor {
     Direct {
-        object_new: Py<PyAny>,
+        info: Py<StructInfo>,
         class: Py<PyAny>,
         alias: Option<Py<PyAny>>,
         post_init: Option<Py<PyAny>>,
@@ -309,12 +326,11 @@ impl Constructor {
             return Ok(Self::Init);
         };
         let py = ty.py();
-        let object_new = object_type(py)?.getattr(intern!(py, "__new__"))?;
-        if !check_default_construction(class, &object_new)? {
+        if !has_default_call(class)? {
             return Ok(Self::Init);
         }
         Ok(Self::Direct {
-            object_new: object_new.unbind(),
+            info: struct_info(class)?.unbind(),
             class: class.clone().unbind(),
             alias,
             post_init: class
@@ -814,7 +830,7 @@ impl Constraint {
     }
 
     pub(crate) fn applies_to(&self, subject: ConstraintSubject) -> bool {
-        use ConstraintSubject::*;
+        use ConstraintSubject::{Array, Bytes, DateTime, Float, Int, Object, Str, Time};
         match self {
             Self::Bound(..) | Self::MultipleOf(_) => matches!(subject, Int | Float),
             Self::Pattern { .. } => subject == Str,

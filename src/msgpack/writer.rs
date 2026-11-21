@@ -1,29 +1,10 @@
-use crate::common::enums::Token;
-use crate::common::writer::Writer;
-use crate::msgpack::structures::{LengthMarkers, MsgpackWriter};
-
-pub(crate) const STRING: LengthMarkers = LengthMarkers {
-    fixed: 0xa0,
-    fixed_max: 31,
-    wide8: Some(0xd9),
-    wide16: 0xda,
-    wide32: 0xdb,
-};
-
-const ARRAY: LengthMarkers = LengthMarkers {
-    fixed: 0x90,
-    fixed_max: 15,
-    wide8: None,
-    wide16: 0xdc,
-    wide32: 0xdd,
-};
-
-const MAP: LengthMarkers = LengthMarkers {
-    fixed: 0x80,
-    fixed_max: 15,
-    wide8: None,
-    wide16: 0xde,
-    wide32: 0xdf,
+use crate::{
+    common::{
+        structures::enums::Token,
+        writer::{Writer, recycle_buffer},
+    },
+    constants::{MSGPACK_ARRAY as ARRAY, MSGPACK_MAP as MAP},
+    msgpack::structures::MsgpackWriter,
 };
 
 impl Writer for MsgpackWriter {
@@ -44,6 +25,64 @@ impl Writer for MsgpackWriter {
             Token::MapStart(len) => self.write_length(len, &MAP),
             Token::ArrayEnd | Token::MapEnd => {}
         }
+    }
+
+    #[inline(always)]
+    fn write_str(&mut self, value: &str) {
+        self.write_string(value);
+    }
+
+    #[inline(always)]
+    fn write_int(&mut self, value: i64) {
+        self.write_signed(value);
+    }
+
+    #[inline(always)]
+    fn write_uint(&mut self, value: u64) {
+        self.write_unsigned(value);
+    }
+
+    #[inline(always)]
+    fn write_float(&mut self, value: f64) {
+        self.write_tagged(0xcb, &value.to_be_bytes());
+    }
+
+    #[inline(always)]
+    fn write_str_key(&mut self, value: &str) {
+        self.write_string(value);
+    }
+
+    #[inline(always)]
+    fn write_key_unescaped(&mut self, name: &str) {
+        self.write_string(name);
+    }
+
+    #[inline(always)]
+    fn write_bytes(&mut self, data: &[u8]) {
+        self.write_binary(data);
+    }
+
+    fn write_map_header(&mut self, len: usize) -> usize {
+        let header = self.out.len();
+        self.write_length(len, &MAP);
+        header
+    }
+
+    fn finish_map(&mut self, header: usize, actual_len: usize) {
+        match self.out[header] {
+            0x80..=0x8f => self.out[header] = 0x80 | actual_len as u8,
+            0xde => {
+                self.out[header + 1..header + 3].copy_from_slice(&(actual_len as u16).to_be_bytes())
+            }
+            0xdf => {
+                self.out[header + 1..header + 5].copy_from_slice(&(actual_len as u32).to_be_bytes())
+            }
+            _ => unreachable!("map header is written above"),
+        }
+    }
+
+    fn write_binary_key(&mut self, _name: &str, encoded: &[u8]) {
+        self.out.extend_from_slice(encoded);
     }
 
     fn write_decimal(&mut self, text: &str, _as_key: bool) {
@@ -78,5 +117,9 @@ impl Writer for MsgpackWriter {
 
     fn finish(self) -> Vec<u8> {
         self.out
+    }
+
+    fn recycle_output(output: Vec<u8>) {
+        recycle_buffer(output);
     }
 }

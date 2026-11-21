@@ -1,5 +1,7 @@
-use pyo3::exceptions::{PyException, PyRecursionError};
-use pyo3::{PyErr, create_exception};
+use pyo3::{
+    PyErr, create_exception,
+    exceptions::{PyException, PyRecursionError},
+};
 
 create_exception!(
     "rune.exceptions",

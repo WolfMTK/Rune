@@ -1,28 +1,33 @@
-use crate::common::enums::PathSegment;
-use crate::common::structures::Fail;
-use crate::common::types::Length;
-use crate::constants::PATH_PREFIX;
 use std::fmt::Write as _;
 
+use crate::{
+    common::{
+        structures::{enums::PathSegment, errors::Fail},
+        types::Length,
+    },
+    constants::{KEY_PATH_PREFIX, PATH_PREFIX},
+};
+
 pub(crate) fn with_path(mut message: String, reversed_path: &[PathSegment]) -> String {
-    if reversed_path.is_empty() {
-        return message;
-    }
+    let (prefix, reversed_path) = match reversed_path.split_first() {
+        Some((PathSegment::DictKey, rest)) => (KEY_PATH_PREFIX, rest),
+        Some(_) => (PATH_PREFIX, reversed_path),
+        None => return message,
+    };
     let path_len: usize = reversed_path.iter().map(rendered_len).sum();
-    message.reserve(PATH_PREFIX.len() + path_len + 1);
-    message.push_str(PATH_PREFIX);
+    message.reserve(prefix.len() + path_len + 1);
+    message.push_str(prefix);
     for segment in reversed_path.iter().rev() {
         match segment {
             PathSegment::Key(key) => {
                 message.push('.');
                 message.push_str(key);
             }
-            PathSegment::Entry(key) => {
-                let _ = write!(message, "[{key:?}]");
-            }
             PathSegment::Index(index) => {
                 let _ = write!(message, "[{index}]");
             }
+            PathSegment::Ellipsis => message.push_str("[...]"),
+            PathSegment::DictKey => {}
         }
     }
     message.push('`');
@@ -32,8 +37,9 @@ pub(crate) fn with_path(mut message: String, reversed_path: &[PathSegment]) -> S
 fn rendered_len(segment: &PathSegment) -> usize {
     match segment {
         PathSegment::Key(key) => 1 + key.len(),
-        PathSegment::Entry(key) => 4 + key.len(),
         PathSegment::Index(index) => 2 + index.checked_ilog10().map_or(1, |d| d as usize + 1),
+        PathSegment::Ellipsis => 5,
+        PathSegment::DictKey => 0,
     }
 }
 

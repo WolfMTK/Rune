@@ -1,8 +1,11 @@
+use pyo3::{
+    Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern,
+    prelude::PyAnyMethods,
+    sync::PyOnceLock,
+    types::{PyType, PyTypeMethods},
+};
+
 use crate::common::macros::cached_objects;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyType, PyTypeMethods};
-use pyo3::{Bound, Py, PyAny, PyResult, PyTypeInfo, Python, intern};
 
 cached_objects! {
     annotated => "typing"."Annotated",
@@ -40,11 +43,12 @@ cached_objects! {
     resolve_namedtuple_fields => "rune.struct"."resolve_namedtuple_fields",
     resolve_type_alias => "rune.struct"."resolve_type_alias",
     struct_lookup_cache => "rune.rune"."_struct_lookup_cache",
-    struct_base => "rune.struct"."Struct",
+    struct_field_types => "rune.struct"."_struct_field_types",
     struct_meta => "rune.struct"."StructMeta",
     object_type => "builtins"."object",
     meta_type => "rune.meta"."Meta",
     default_factory_type => "rune.struct"."_DefaultFactory",
+    nodefault => "rune.struct"."NODEFAULT",
     plain_class_fields => "rune.helpers"."plain_class_fields",
     typeddict_check => "rune.helpers"."is_typeddict",
     unset => "rune.unset"."UNSET",

@@ -1,25 +1,26 @@
-use crate::common::py_typing::get_recursion_limit;
-use crate::common::reader::Reader;
-use crate::common::writer::Writer;
-use crate::constants::MAX_DEPTH;
-use crate::exceptions::ParseError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::{PyResult, Python};
+use pyo3::{PyResult, Python, prelude::PyAnyMethods};
 
-pub(crate) mod base64;
+use crate::{
+    common::{py_typing::get_recursion_limit, reader::Reader, writer::Writer},
+    constants::MAX_DEPTH,
+    exceptions::ParseError,
+};
+
+pub mod aliases;
 pub(crate) mod cache;
-pub(crate) mod datetime_format;
-pub(crate) mod enums;
+pub(crate) mod callable;
+pub mod classes;
+pub mod defaults;
 pub(crate) mod failure;
-pub(crate) mod helpers;
 pub(crate) mod lax;
 pub(crate) mod macros;
+pub mod naming;
 pub(crate) mod py_typing;
 pub(crate) mod raw;
 pub(crate) mod reader;
+pub(crate) mod r#struct;
 pub(crate) mod structures;
 pub(crate) mod types;
-pub(crate) mod uuid_format;
 pub(crate) mod validate;
 pub(crate) mod writer;
 

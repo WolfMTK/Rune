@@ -25,12 +25,11 @@ from typing import (
 import rune
 from rune.meta import Meta
 from rune.struct import (
-    _ARRAY_LIKE_FLAG,
-    _FORBID_UNKNOWN_FIELDS_FLAG,
-    _RENAMED_FLAG,
     NODEFAULT,
+    StructMeta,
     _DefaultFactory,
     _is_struct_type,
+    _struct_field_types,
     _substitute,
     _type_mapping,
     resolve_generic_fields,
@@ -482,35 +481,35 @@ class _Builder:
         )
         return Field(name, encode_name, self.build(annotation), required, default, default_factory)
 
-    def _struct(self, tp: Any, origin: type) -> Any:
+    def _struct(self, tp: Any, origin: StructMeta) -> Any:
         cached = self.memo.get(tp)
         if cached is not None:
             return cached
-        flags = origin.__struct_flags__
-        tag = origin.__struct_tag__
+        config = origin.__struct_config__
         info = StructType(
             tp,
             (),
-            origin.__struct_tag_field__ if tag is not None else None,
-            tag,
-            bool(flags & _ARRAY_LIKE_FLAG),
-            bool(flags & _FORBID_UNKNOWN_FIELDS_FLAG),
+            config.tag_field,
+            config.tag,
+            config.array_like,
+            config.forbid_unknown_fields,
         )
         self.memo[tp] = info
-        raw_fields = origin.__struct_fields__ if tp is origin else resolve_generic_fields(tp)
-        rename = origin.__struct_rename__ if flags & _RENAMED_FLAG else None
+        raw_fields = _struct_field_types(origin) if tp is origin else resolve_generic_fields(tp)
+        encode_names = origin.__struct_encode_fields__
+        defaults = origin.__struct_defaults__
+        first_default = len(raw_fields) - len(defaults)
         fields = []
-        for name, annotation in raw_fields:
-            default = getattr(origin, name, NODEFAULT)
+        for index, (name, annotation) in enumerate(raw_fields):
+            default = defaults[index - first_default] if index >= first_default else NODEFAULT
             factory = NODEFAULT
             if type(default) is _DefaultFactory:
                 default, factory = NODEFAULT, default.factory
-            encode_name = rename(name) if rename else name
-            fields.append(self._field(name, encode_name, annotation, default, factory))
+            fields.append(self._field(name, encode_names[index], annotation, default, factory))
         object.__setattr__(info, "fields", tuple(fields))
         return info
 
-    def _namedtuple(self, tp: Any, origin: type) -> Any:
+    def _namedtuple(self, tp: Any, origin: Any) -> Any:
         cached = self.memo.get(tp)
         if cached is not None:
             return cached
@@ -524,7 +523,7 @@ class _Builder:
         object.__setattr__(info, "fields", fields)
         return info
 
-    def _typeddict(self, tp: Any, origin: type) -> Any:
+    def _typeddict(self, tp: Any, origin: Any) -> Any:
         cached = self.memo.get(tp)
         if cached is not None:
             return cached
@@ -557,7 +556,7 @@ class _Builder:
         object.__setattr__(info, "fields", tuple(fields))
         return info
 
-    def _attrs(self, tp: Any, origin: type) -> Any:
+    def _attrs(self, tp: Any, origin: Any) -> Any:
         import attrs
 
         cached = self.memo.get(tp)
@@ -607,7 +606,7 @@ def _apply_metadata(info: Any, metadata: list[Any]) -> Any:
         if isinstance(item, Meta):
             constraints.update(_specified(item, _CONSTRAINT_NAMES))
             described = _specified(item, _DESCRIPTION_NAMES)
-            schema = _merge_json(schema, _merge_json(item.extra_json_schema or {}, described))
+            schema = _merge_json(schema, _merge_json(described, item.extra_json_schema or {}))
             extra = _merge_json(extra, item.extra or {})
     base = info
     if isinstance(info, Metadata):

@@ -1,22 +1,20 @@
-use crate::common::enums::{Scalar, Value};
-use crate::common::structures::Cursor;
-use crate::exceptions::ParseError;
-use std::borrow::Cow;
-use std::ops::DerefMut;
+use std::{
+    cell::RefCell,
+    ops::{Deref, DerefMut, Range},
+};
+
+use crate::{
+    common::structures::{
+        cursor::Cursor,
+        enums::{Scalar, Value},
+    },
+    exceptions::ParseError,
+};
+
 pub(crate) mod kind {
-    pub(crate) const NULL: u16 = 1 << 0;
-    pub(crate) const BOOL: u16 = 1 << 1;
-    pub(crate) const INT: u16 = 1 << 2;
-    pub(crate) const BYTES: u16 = 1 << 3;
-    pub(crate) const FLOAT: u16 = 1 << 4;
-    pub(crate) const STR: u16 = 1 << 5;
-    pub(crate) const ARRAY: u16 = 1 << 6;
-    pub(crate) const MAP: u16 = 1 << 7;
-    pub(crate) const EXT: u16 = 1 << 8;
-    pub(crate) const ANY: u16 = u16::MAX;
-    pub(crate) const INTEGER: u16 = INT;
-    pub(crate) const NUMBER_OR_STR: u16 = INTEGER | FLOAT | STR;
-    pub(crate) const LITERAL: u16 = NULL | BOOL | INT | STR;
+    pub(crate) use crate::constants::kind::{
+        ANY, ARRAY, BOOL, BYTES, EXT, FLOAT, INT, INTEGER, LITERAL, MAP, NULL, NUMBER_OR_STR, STR,
+    };
 
     pub(crate) fn name(kind: u16) -> &'static str {
         match kind {
@@ -27,7 +25,7 @@ pub(crate) mod kind {
             FLOAT => "float",
             STR => "str",
             ARRAY => "list",
-            EXT => "Ext",
+            EXT => "ext",
             _ => "dict",
         }
     }
@@ -41,22 +39,119 @@ pub(crate) mod kind {
     }
 }
 
+const MAX_POOLED_STRINGS: usize = 8;
+const MAX_POOLED_STRING_CAPACITY: usize = 1 << 20;
+
+thread_local! {
+    static STRING_POOL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) enum Text<'a> {
+    Borrowed(&'a str),
+    BorrowedAscii(&'a str),
+    Owned(PooledString),
+    OwnedAscii(PooledString),
+}
+
+impl Text<'_> {
+    #[inline(always)]
+    pub(crate) fn is_ascii(&self) -> bool {
+        match self {
+            Self::BorrowedAscii(_) | Self::OwnedAscii(_) => true,
+            Self::Borrowed(text) => text.is_ascii(),
+            Self::Owned(text) => text.0.is_ascii(),
+        }
+    }
+}
+
+pub(crate) struct PooledString(pub(crate) String);
+
+pub(crate) fn owned_string(capacity: usize) -> String {
+    let mut value = STRING_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default();
+    value.clear();
+    if value.capacity() < capacity {
+        value.reserve(capacity);
+    }
+    value
+}
+
+impl Drop for PooledString {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let value = &mut self.0;
+        if value.capacity() > MAX_POOLED_STRING_CAPACITY {
+            return;
+        }
+        STRING_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < MAX_POOLED_STRINGS {
+                pool.push(std::mem::take(value));
+            }
+        });
+    }
+}
+
+impl Deref for Text<'_> {
+    type Target = str;
+
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        match self {
+            Self::Borrowed(text) | Self::BorrowedAscii(text) => text,
+            Self::Owned(text) | Self::OwnedAscii(text) => &text.0,
+        }
+    }
+}
+
+impl AsRef<str> for Text<'_> {
+    #[inline(always)]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl PartialEq<&str> for Text<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<String> for Text<'_> {
+    fn eq(&self, other: &String) -> bool {
+        self.deref() == other.as_str()
+    }
+}
+
+pub(crate) enum Key<'a> {
+    Text(Text<'a>),
+    Value(u16),
+}
+
 pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
     const BINARY: bool;
 
     fn peek_kind(&mut self) -> Result<u16, ParseError>;
     fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError>;
+    fn read_string(&mut self) -> Result<Text<'a>, ParseError> {
+        let Scalar::Str(text) = self.read_scalar()? else {
+            unreachable!("kind is checked as str above")
+        };
+        Ok(text)
+    }
     fn read_value(&mut self) -> Result<Value<'a>, ParseError>;
     fn open_array(&mut self) -> Result<Option<usize>, ParseError>;
     fn open_map(&mut self) -> Result<Option<usize>, ParseError>;
     fn has_next_item(&mut self, len: Option<usize>, index: usize) -> Result<bool, ParseError>;
-    fn next_key(
-        &mut self,
-        len: Option<usize>,
-        index: usize,
-    ) -> Result<Option<Cow<'a, str>>, ParseError>;
+    fn next_key(&mut self, len: Option<usize>, index: usize)
+    -> Result<Option<Key<'a>>, ParseError>;
 
     fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
+        Ok(None)
+    }
+
+    fn read_integer(&mut self) -> Result<Option<Scalar<'a>>, ParseError> {
         Ok(None)
     }
 
@@ -80,12 +175,11 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
         Ok(len)
     }
 
-    fn read_raw(&mut self) -> Result<&'a [u8], ParseError> {
+    fn read_raw(&mut self) -> Result<Range<usize>, ParseError> {
         self.skip_leading_whitespace();
-        let bytes = self.bytes;
         let start = self.position;
         self.skip_value()?;
-        Ok(&bytes[start..self.position])
+        Ok(start..self.position)
     }
 
     fn skip_value(&mut self) -> Result<(), ParseError> {
@@ -101,7 +195,10 @@ pub(crate) trait Reader<'a>: DerefMut<Target = Cursor<'a>> {
             }
             Value::Map(len) => {
                 self.enter()?;
-                while self.next_key(len, index)?.is_some() {
+                while let Some(key) = self.next_key(len, index)? {
+                    if let Key::Value(_) = key {
+                        self.skip_value()?;
+                    }
                     self.skip_value()?;
                     index += 1;
                 }

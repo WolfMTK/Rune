@@ -1,4 +1,3 @@
-use crate::common::macros::deref_to_cursor;
-use crate::json::structures::Parser;
+use crate::{common::macros::deref_to_cursor, json::structures::Parser};
 
 deref_to_cursor!(Parser);

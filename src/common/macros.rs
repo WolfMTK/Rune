@@ -1,7 +1,6 @@
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::PyAnyMethods;
-use pyo3::{Bound, PyAny, PyErr};
 use std::fmt::Display;
+
+use pyo3::{Bound, PyAny, PyErr, exceptions::PyTypeError, prelude::PyAnyMethods};
 
 macro_rules! reject_union_if {
     ($ty:expr, $condition:expr, $reason:expr $(,)?) => {
@@ -23,7 +22,7 @@ pub(crate) fn unsupported_union(ty: &Bound<'_, PyAny>, reason: impl Display) -> 
 macro_rules! deref_to_cursor {
     ($parser:ident) => {
         impl<'a> ::core::ops::Deref for $parser<'a> {
-            type Target = $crate::common::structures::Cursor<'a>;
+            type Target = $crate::common::structures::cursor::Cursor<'a>;
 
             #[inline]
             fn deref(&self) -> &Self::Target {
@@ -70,16 +69,33 @@ macro_rules! first_matching_kind {
 pub(crate) use first_matching_kind;
 
 macro_rules! format_bindings {
-    ($module:literal, $format:ident, $writer:ty, $($reader:ident)::+) => {
-        use pyo3::exceptions::PyValueError;
+    (
+        $module:literal,
+        $format:ident,
+        $writer:ty,
+        $($reader:ident)::+,
+        decode_hooks: [$($decode_hook:ident),*],
+        decode_signature: $decode_signature:literal,
+        decoder_hooks: [$($decoder_hook:ident),*],
+    ) => {
+        use pyo3::exceptions::{PyTypeError, PyValueError};
         use pyo3::prelude::PyAnyMethods;
         use pyo3::types::{
-            PyByteArray, PyBytes, PyBytesMethods, PyDict, PyStringMethods, PyTuple, PyType,
+            PyByteArray, PyBytes, PyBytesMethods, PyStringMethods, PyTuple, PyType,
         };
-        use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pyfunction, pymethods};
-        use $crate::common::enums::{DecimalFormat, Order, UuidFormat};
-        use $crate::common::structures::{DecoderCore, Hook, RequiredArgument, TypeArgument};
-        use $crate::common::helpers::{encode_object, encode_partial, write_into_buffer};
+        use pyo3::{Bound, Py, PyAny, PyResult, Python, intern, pyclass, pymethods};
+        use std::ffi::CStr;
+        use $crate::common::callable::extract_keyword;
+        use $crate::common::structures::enums::{DecimalFormat, Order, UuidFormat};
+        use $crate::common::structures::decoder::DecoderCore;
+        use $crate::common::structures::options::{
+            ExtraHooks, Hook, RequiredArgument, TypeArgument, reject_extra_arguments,
+        };
+        use $crate::common::naming::type_name_of;
+        use $crate::common::structures::encoder::{
+            LayoutCache, encode_object, encode_object_cached, encode_partial_cached,
+            write_into_buffer,
+        };
         use $crate::common::raw::input_bytes;
         use $crate::common::{Format, writer::Writer};
         use $crate::exceptions::ParseError;
@@ -95,36 +111,38 @@ macro_rules! format_bindings {
             }
         }
 
-        #[pyfunction]
-        #[pyo3(
-            signature = (obj = RequiredArgument::Missing, *args, enc_hook = None, order = None, **kwargs),
-            text_signature = "(obj, *, enc_hook=None, order=None)"
-        )]
-        pub(crate) fn encode<'py>(
-            py: Python<'py>,
-            obj: RequiredArgument<'py>,
-            args: &Bound<'py, PyTuple>,
-            enc_hook: Option<Bound<'py, PyAny>>,
-            order: Option<Bound<'py, PyAny>>,
-            kwargs: Option<&Bound<'py, PyDict>>,
-        ) -> PyResult<Bound<'py, PyBytes>> {
-            let obj = obj.only("obj", args, kwargs)?;
-            encode_object::<$writer>(
-                py,
-                &obj,
-                &Hook::from_argument(enc_hook, "enc_hook")?,
-                &DecimalFormat::default(),
-                Order::from_argument(order)?,
-                UuidFormat::default(),
-            )
+        pub(crate) struct EncodeFunction;
+
+        impl $crate::common::callable::Function for EncodeFunction {
+            const NAME: &'static CStr = c"encode";
+            const DOC: &'static CStr = c"encode(obj, *, enc_hook=None, order=None)\n--\n\n";
+
+            fn call<'py>(
+                py: Python<'py>,
+                arguments: &$crate::common::callable::Arguments<'_, 'py>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let obj = arguments.only_positional("obj")?;
+                let [enc_hook, order] =
+                    arguments.keywords([intern!(py, "enc_hook"), intern!(py, "order")])?;
+                encode_object::<$writer>(
+                    py,
+                    &obj,
+                    &Hook::from_argument(enc_hook.map(|hook| hook.to_owned()), "enc_hook")?,
+                    &DecimalFormat::default(),
+                    Order::from_argument(order.map(|order| order.to_owned()))?,
+                    UuidFormat::default(),
+                )
+                .map(Bound::into_any)
+            }
         }
 
-        #[pyclass(name = "Encoder", module = $module, frozen)]
+        #[pyclass(name = "Encoder", module = $module, frozen, unsendable)]
         pub(crate) struct Encoder {
             hook: Hook,
             decimal_format: DecimalFormat,
             order: Order,
             uuid_format: UuidFormat,
+            layouts: LayoutCache,
         }
 
         #[pymethods]
@@ -142,6 +160,7 @@ macro_rules! format_bindings {
                     decimal_format: DecimalFormat::from_argument(decimal_format)?,
                     order: Order::from_argument(order)?,
                     uuid_format: UuidFormat::from_argument(uuid_format, <$writer as Writer>::BINARY)?,
+                    layouts: LayoutCache::default(),
                 })
             }
 
@@ -165,21 +184,6 @@ macro_rules! format_bindings {
                 self.uuid_format.get()
             }
 
-            fn encode<'py>(
-                &self,
-                py: Python<'py>,
-                obj: &Bound<'py, PyAny>,
-            ) -> PyResult<Bound<'py, PyBytes>> {
-                encode_object::<$writer>(
-                    py,
-                    obj,
-                    &self.hook,
-                    &self.decimal_format,
-                    self.order,
-                    self.uuid_format,
-                )
-            }
-
             fn encode_lines<'py>(
                 &self,
                 py: Python<'py>,
@@ -187,54 +191,130 @@ macro_rules! format_bindings {
             ) -> PyResult<Bound<'py, PyBytes>> {
                 let mut out = Vec::new();
                 for item in items.try_iter()? {
-                    out.extend_from_slice(self.encode(py, &item?)?.as_bytes());
+                    out.extend_from_slice(self.encode_one(py, &item?)?.as_bytes());
                     out.push(b'\n');
                 }
                 Ok(PyBytes::new(py, &out))
             }
 
-            #[pyo3(signature = (obj, buffer, offset = 0))]
+            #[pyo3(
+                signature = (obj = RequiredArgument::Missing, buffer = RequiredArgument::Missing, offset = 0, *args),
+                text_signature = "($self, obj, buffer, offset=0, /)"
+            )]
             fn encode_into<'py>(
                 &self,
                 py: Python<'py>,
-                obj: &Bound<'py, PyAny>,
-                buffer: &Bound<'py, PyByteArray>,
+                obj: RequiredArgument<'py>,
+                buffer: RequiredArgument<'py>,
                 offset: isize,
+                args: &Bound<'py, PyTuple>,
             ) -> PyResult<()> {
+                reject_extra_arguments(args, None)?;
+                let obj = obj.require("obj")?;
+                let buffer = buffer.require("buffer")?;
+                let buffer = buffer.cast::<PyByteArray>().map_err(|_| {
+                    PyTypeError::new_err(format!(
+                        "buffer must be a `bytearray`, got `{}`",
+                        type_name_of(&buffer)
+                    ))
+                })?;
                 if offset < -1 {
                     return Err(PyValueError::new_err("offset must be >= -1"));
                 }
-                let (result, encoded) = encode_partial::<$writer>(
+                let (result, encoded) = encode_partial_cached::<$writer>(
+                    py,
+                    &obj,
+                    &self.hook,
+                    &self.decimal_format,
+                    self.order,
+                    self.uuid_format,
+                    &self.layouts,
+                );
+                write_into_buffer::<$writer>(py, buffer, offset, encoded)?;
+                result
+            }
+        }
+
+        pub(crate) struct EncodeMethod;
+
+        impl $crate::common::callable::Method for EncodeMethod {
+            const NAME: &'static CStr = c"encode";
+            const DOC: &'static CStr = c"encode($self, obj, /)\n--\n\n";
+
+            fn call<'py>(
+                py: Python<'py>,
+                receiver: pyo3::Borrowed<'_, 'py, PyAny>,
+                arguments: &$crate::common::callable::Arguments<'_, 'py>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let encoder = receiver.cast::<Encoder>().map_err(pyo3::PyErr::from)?;
+                let obj = arguments.only_positional("obj")?;
+                arguments.keywords([])?;
+                encoder.borrow().encode_one(py, &obj).map(Bound::into_any)
+            }
+        }
+
+        impl Encoder {
+            fn encode_one<'py>(
+                &self,
+                py: Python<'py>,
+                obj: &Bound<'py, PyAny>,
+            ) -> PyResult<Bound<'py, PyBytes>> {
+                encode_object_cached::<$writer>(
                     py,
                     obj,
                     &self.hook,
                     &self.decimal_format,
                     self.order,
                     self.uuid_format,
-                );
-                write_into_buffer(py, buffer, offset, &encoded)?;
-                result
+                    &self.layouts,
+                )
             }
         }
 
-        #[pyfunction]
-        #[pyo3(
-            signature = (buf = RequiredArgument::Missing, *args, r#type = TypeArgument::Untyped, dec_hook = None, strict = true, **kwargs),
-            text_signature = "(buf, *, type=..., dec_hook=None, strict=True)"
-        )]
-        pub(crate) fn decode<'py>(
-            py: Python<'py>,
-            buf: RequiredArgument<'py>,
-            args: &Bound<'py, PyTuple>,
-            r#type: TypeArgument<'py>,
-            dec_hook: Option<Bound<'py, PyAny>>,
-            strict: bool,
-            kwargs: Option<&Bound<'py, PyDict>>,
-        ) -> PyResult<Bound<'py, PyAny>> {
-            let buf = buf.only("buf", args, kwargs)?;
-            let data = input_bytes(py, &buf, <$format as Format>::accepts_str())?;
-            DecoderCore::new(py, r#type, dec_hook, None, strict)?
-                .decode::<$format>(py, data.as_bytes())
+        pub(crate) struct DecodeFunction;
+
+        impl $crate::common::callable::Function for DecodeFunction {
+            const NAME: &'static CStr = c"decode";
+            const DOC: &'static CStr = match CStr::from_bytes_with_nul(
+                concat!("decode", $decode_signature, "\n--\n\n\0").as_bytes(),
+            ) {
+                Ok(doc) => doc,
+                Err(_) => panic!("decode signature must not contain NUL bytes"),
+            };
+
+            fn call<'py>(
+                py: Python<'py>,
+                arguments: &$crate::common::callable::Arguments<'_, 'py>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let buf = arguments.only_positional("buf")?;
+                let [r#type, dec_hook, strict $(, $decode_hook)*] = arguments.keywords([
+                    intern!(py, "type"),
+                    intern!(py, "dec_hook"),
+                    intern!(py, "strict"),
+                    $(intern!(py, stringify!($decode_hook)),)*
+                ])?;
+                let r#type = match r#type {
+                    Some(ty) => TypeArgument::Typed(ty.to_owned()),
+                    None => TypeArgument::Untyped,
+                };
+                let strict = extract_keyword(strict, "strict", true)?;
+                let data = input_bytes(py, &buf, <$format as Format>::accepts_str())?;
+                let hooks = ExtraHooks {
+                    $($decode_hook: Hook::from_argument(
+                        $decode_hook.map(|hook| hook.to_owned()),
+                        stringify!($decode_hook),
+                    )?,)*
+                    ..ExtraHooks::default()
+                };
+                DecoderCore::new(py, r#type, dec_hook.map(|hook| hook.to_owned()), hooks, strict)?
+                    .decode::<$format>(py, &data)
+            }
+        }
+
+        pub(crate) fn add_functions(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+            $crate::common::callable::add_function::<EncodeFunction>(module)?;
+            $crate::common::callable::add_method::<EncodeMethod>(&module.py().get_type::<Encoder>())?;
+            $crate::common::callable::add_function::<DecodeFunction>(module)
         }
 
         #[pyclass(name = "Decoder", module = $module, frozen)]
@@ -245,23 +325,34 @@ macro_rules! format_bindings {
         #[pymethods]
         impl Decoder {
             #[new]
-            #[pyo3(signature = (r#type = TypeArgument::Untyped, *, dec_hook = None, strict = true, float_hook = None))]
+            #[pyo3(signature = (r#type = TypeArgument::Untyped, *, dec_hook = None, strict = true $(, $decoder_hook = None)*))]
             fn new(
                 py: Python<'_>,
                 r#type: TypeArgument<'_>,
                 dec_hook: Option<Bound<'_, PyAny>>,
                 strict: bool,
-                float_hook: Option<Bound<'_, PyAny>>,
+                $($decoder_hook: Option<Bound<'_, PyAny>>,)*
             ) -> PyResult<Self> {
+                let hooks = ExtraHooks {
+                    $($decoder_hook: Hook::from_argument($decoder_hook, stringify!($decoder_hook))?,)*
+                    ..ExtraHooks::default()
+                };
                 Ok(Self {
-                    core: DecoderCore::new(py, r#type, dec_hook, float_hook, strict)?,
+                    core: DecoderCore::new(py, r#type, dec_hook, hooks, strict)?,
                 })
             }
 
+            $(
+                #[getter]
+                fn $decoder_hook(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+                    self.core.hooks().$decoder_hook.get(py)
+                }
+            )*
+
             #[getter]
             #[pyo3(name = "type")]
-            fn type_(&self, py: Python<'_>) -> Py<PyAny> {
-                self.core.ty().clone_ref(py)
+            fn type_(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                Ok(self.core.ty(py)?.unbind())
             }
 
             #[getter]
@@ -270,17 +361,12 @@ macro_rules! format_bindings {
             }
 
             #[getter]
-            fn float_hook(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-                self.core.float_hook().get(py)
-            }
-
-            #[getter]
             fn strict(&self) -> bool {
                 self.core.strict()
             }
 
             fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-                let ty = self.core.ty().bind(py).repr()?;
+                let ty = self.core.ty(py)?.repr()?;
                 Ok(format!("{}.Decoder({})", $module, ty.to_str()?))
             }
 
@@ -298,7 +384,7 @@ macro_rules! format_bindings {
                 buf: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyAny>> {
                 let data = input_bytes(py, buf, <$format as Format>::accepts_str())?;
-                self.core.decode::<$format>(py, data.as_bytes())
+                self.core.decode::<$format>(py, &data)
             }
 
             fn decode_lines<'py>(
@@ -307,7 +393,7 @@ macro_rules! format_bindings {
                 buf: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyAny>> {
                 let data = input_bytes(py, buf, <$format as Format>::accepts_str())?;
-                self.core.decode_lines::<$format>(py, data.as_bytes())
+                self.core.decode_lines::<$format>(py, &data)
             }
         }
     };

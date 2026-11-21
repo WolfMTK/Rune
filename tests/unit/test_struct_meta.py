@@ -6,10 +6,10 @@ import secrets
 from abc import ABCMeta, _abc_init, abstractmethod
 
 import pytest
+from rune.structs import asdict, astuple, force_setattr, replace
 
 import rune
 from rune import Struct, StructMeta
-from rune.structs import asdict, astuple, force_setattr, replace
 
 
 def test_struct_meta_exists():
@@ -130,7 +130,7 @@ def test_struct_meta_inheritance():
         """
 
         # Class attribute to store kw_only_default settings for each class
-        _kw_only_default_settings = {}
+        _kw_only_default_settings = {}  # noqa
 
         def __new__(mcls, name, bases, namespace, **kwargs):
             # Check if kw_only is explicitly specified
@@ -277,7 +277,8 @@ def test_struct_meta_subclass_functions():
     # Test asdict with nested structs
     nested_dict = asdict(nested)
     assert isinstance(nested_dict, dict)
-    # Note: asdict doesn't recursively convert nested struct objects, so inner remains a CustomStruct object
+    # Note: asdict doesn't recursively convert nested struct objects,
+    # so inner remains a CustomStruct object
     assert isinstance(nested_dict["inner"], CustomStruct)
     assert nested_dict["inner"].x == 100
     assert nested_dict["inner"].y == "test"
@@ -332,7 +333,7 @@ def test_struct_meta_subclass_with_encoder():
     class EncoderStruct(metaclass=EncoderMeta):
         id: int
         name: str
-        tags: list[str] = []
+        tags: list[str] = []  # noqa
 
     # Create an instance
     obj = EncoderStruct(id=123, name="test")
@@ -383,11 +384,11 @@ def test_structmeta_abcmeta_mixed_behaves_like_abc():
 
     # Abstract base cannot be instantiated when there are abstract methods
     with pytest.raises(
-            TypeError,
-            match=(
-                    r"^Can't instantiate abstract class IntegerStructBase without an "
-                    r"implementation for abstract methods 'from_integer', 'to_integer'$"
-            ),
+        TypeError,
+        match=(
+            r"^Can't instantiate abstract class IntegerStructBase without an "
+            r"implementation for abstract methods 'from_integer', 'to_integer'$"
+        ),
     ):
         IntegerStructBase()
 
@@ -430,11 +431,11 @@ def test_structmeta_abcmeta_intermediate_still_abstract_and_message():
 
     # Intermediate remains abstract: only to_integer is missing
     with pytest.raises(
-            TypeError,
-            match=(
-                    r"^Can't instantiate abstract class Intermediate without an "
-                    r"implementation for abstract method 'to_integer'$"
-            ),
+        TypeError,
+        match=(
+            r"^Can't instantiate abstract class Intermediate without an "
+            r"implementation for abstract method 'to_integer'$"
+        ),
     ):
         Intermediate()
 
@@ -448,11 +449,11 @@ def test_structmeta_abcmeta_single_abstract_method_message():
         def only(self) -> int: ...
 
     with pytest.raises(
-            TypeError,
-            match=(
-                    r"^Can't instantiate abstract class SingleAbstract without an "
-                    r"implementation for abstract method 'only'$"
-            ),
+        TypeError,
+        match=(
+            r"^Can't instantiate abstract class SingleAbstract without an "
+            r"implementation for abstract method 'only'$"
+        ),
     ):
         SingleAbstract()
 
@@ -532,9 +533,7 @@ def test_plain_struct_not_treated_as_abc():
 
     # Sanity: Plain should not suddenly be an ABC
     # (we don't rely on _abc_impl directly, but this is a cheap guard)
-    assert not any(
-        base.__module__ == "abc" and base.__name__ == "ABC" for base in Plain.__mro__
-    )
+    assert not any(base.__module__ == "abc" and base.__name__ == "ABC" for base in Plain.__mro__)
 
 
 def test_structmeta_abcmeta_mixed_nested_subclass():
@@ -603,8 +602,8 @@ def test_struct_abc_via_init_subclass_and__abc_init():
 
     # Base is abstract; instantiation should fail
     with pytest.raises(
-            TypeError,
-            match=r"Can't instantiate abstract class Base without an implementation for abstract method 'foo'",
+        TypeError,
+        match=r"Can't instantiate abstract class Base without an implementation for abstract method 'foo'",  # noqa
     ):
         Base()
 
@@ -635,7 +634,5 @@ def test_struct_meta_pattern_ref_leak():
     # there shouldn't be an re.Pattern with our pattern any more. if there is, it's
     # being kept alive by some reference
     assert not any(
-        o
-        for o in gc.get_objects()
-        if isinstance(o, re.Pattern) and o.pattern == pattern_string
+        o for o in gc.get_objects() if isinstance(o, re.Pattern) and o.pattern == pattern_string
     )

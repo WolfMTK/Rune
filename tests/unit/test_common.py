@@ -4,13 +4,13 @@ import datetime
 import decimal
 import enum
 import gc
+import inspect
 import sys
 import textwrap
 import types
 import typing
 import uuid
 import weakref
-import inspect
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, make_dataclass
@@ -5608,9 +5608,7 @@ class TestFrozendict:
             id="force_setattr",
         ),
         pytest.param(rune.Raw(b"1").copy, "()", id="Raw.copy"),
-        pytest.param(
-            rune.json.Encoder().encode, "(obj, /)", id="json.Encoder.encode"
-        ),
+        pytest.param(rune.json.Encoder().encode, "(obj, /)", id="json.Encoder.encode"),
         pytest.param(
             rune.json.Encoder().encode_into,
             "(obj, buffer, offset=0, /)",
@@ -5621,25 +5619,19 @@ class TestFrozendict:
             "(items, /)",
             id="json.Encoder.encode_lines",
         ),
-        pytest.param(
-            rune.json.Decoder().decode, "(buf, /)", id="json.Decoder.decode"
-        ),
+        pytest.param(rune.json.Decoder().decode, "(buf, /)", id="json.Decoder.decode"),
         pytest.param(
             rune.json.Decoder().decode_lines,
             "(buf, /)",
             id="json.Decoder.decode_lines",
         ),
-        pytest.param(
-            rune.msgpack.Encoder().encode, "(obj, /)", id="rune.Encoder.encode"
-        ),
+        pytest.param(rune.msgpack.Encoder().encode, "(obj, /)", id="rune.Encoder.encode"),
         pytest.param(
             rune.msgpack.Encoder().encode_into,
             "(obj, buffer, offset=0, /)",
             id="rune.Encoder.encode_into",
         ),
-        pytest.param(
-            rune.msgpack.Decoder().decode, "(buf, /)", id="rune.Decoder.decode"
-        ),
+        pytest.param(rune.msgpack.Decoder().decode, "(buf, /)", id="rune.Decoder.decode"),
     ],
 )
 def test_reported_signature(func, expected):

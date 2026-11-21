@@ -4,9 +4,9 @@ from typing import Any, Literal, TypeVar, overload
 
 from typing_extensions import Buffer
 
-from rune import DecodeError as _DecodeError
-from rune import convert as _convert
-from rune import to_builtins as _to_builtins
+from rune._conversion import to_builtins as _to_builtins
+from rune.rune import DecodeError as _DecodeError
+from rune.rune import convert as _convert
 
 __all__ = ("decode", "encode")
 

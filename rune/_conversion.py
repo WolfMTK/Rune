@@ -1,13 +1,18 @@
+import builtins
+import dataclasses
 import enum
 from collections.abc import Iterable, Mapping
 from functools import cache
 from typing import Any
 
-from rune import json, structs
-from rune.struct import Struct
+from rune import json
+from rune.struct import Struct, _is_default
+from rune.unset import UNSET
 
-_BUILTIN_SCALARS = (str, int, float, bool)
+_BUILTIN_SCALARS = frozenset((str, int, float, bool))
 _INVALID_BUILTIN_TYPES = "builtin_types must be an iterable of types"
+_INVALID_DICT_KEY = "Only dicts with str-like or number-like keys are supported"
+_FROZENDICT = getattr(builtins, "frozendict", None)
 
 
 def to_builtins(
@@ -16,9 +21,14 @@ def to_builtins(
     builtin_types: Iterable[type] | None = None,
     str_keys: bool = False,
     enc_hook: Any = None,
+    order: str | None = None,
 ) -> Any:
+    if order not in (None, "deterministic", "sorted"):
+        raise ValueError("`order` must be one of None, 'deterministic', or 'sorted'")
+    if enc_hook is not None and not callable(enc_hook):
+        raise TypeError("enc_hook must be callable")
     exact, subclassable = _builtin_types(builtin_types)
-    return _Converter(exact, subclassable, str_keys, enc_hook).convert(obj)
+    return _Converter(exact, subclassable, str_keys, enc_hook, order).convert(obj)
 
 
 @cache
@@ -51,13 +61,19 @@ def _builtin_types(types: Iterable[type] | None) -> tuple[frozenset[type], tuple
     for item in items:
         if not isinstance(item, type):
             raise TypeError(_INVALID_BUILTIN_TYPES)
-        if item not in known:
-            raise TypeError(f"Cannot treat {item!r} as a builtin type")
-    return frozenset(items), tuple(item for item in items if known[item])
+    return frozenset(items), tuple(item for item in items if known.get(item, False))
 
 
 class _Converter:
-    __slots__ = ("builtin_types", "enc_hook", "str_keys", "subclassable_types")
+    __slots__ = (
+        "builtin_types",
+        "enc_hook",
+        "json_types",
+        "order",
+        "str_keys",
+        "subclassable_types",
+        "uuid_type",
+    )
 
     def __init__(
         self,
@@ -65,61 +81,135 @@ class _Converter:
         subclassable_types: tuple[type, ...],
         str_keys: bool,
         enc_hook: Any,
+        order: str | None,
     ) -> None:
+        known = _passthrough_types()
         self.builtin_types = builtin_types
         self.subclassable_types = subclassable_types
         self.str_keys = str_keys
         self.enc_hook = enc_hook
+        self.order = order
+        self.json_types = frozenset(known)
+        self.uuid_type = next(item for item, subclassable in known.items() if subclassable)
 
-    def convert(self, obj: Any) -> Any:
-        if isinstance(obj, enum.Enum):
-            return self.convert(obj.value)
-        if obj is None or isinstance(obj, _BUILTIN_SCALARS):
+    def convert(self, obj: Any, is_key: bool = False) -> Any:
+        cls = type(obj)
+        if obj is None or cls in _BUILTIN_SCALARS:
             return obj
-        if self.builtin_types and self.passes_through(obj):
-            return obj
-        if isinstance(obj, Mapping):
-            return {self.convert_key(key): self.convert(value) for key, value in obj.items()}
-        if isinstance(obj, (list, tuple, set, frozenset)):
+        if cls in self.json_types or isinstance(obj, self.uuid_type):
+            if self.passes_through(obj):
+                return obj
+            return json.decode(json.encode(obj))
+        if isinstance(obj, list):
             return [self.convert(item) for item in obj]
-        encoded = json.decode(json.encode(obj, enc_hook=self.enc_hook))
-        if self.builtin_types:
-            self.restore_fields(obj, encoded)
-        return encoded
+        if isinstance(obj, tuple):
+            return tuple(self.convert(item, is_key) for item in obj)
+        if isinstance(obj, Mapping):
+            return self.convert_mapping(obj)
+        if isinstance(obj, Struct):
+            return self.convert_struct(obj, is_key)
+        if isinstance(obj, enum.Enum):
+            return obj.value
+        if is_key and isinstance(obj, str):
+            return str(obj)
+        if isinstance(obj, (set, frozenset)):
+            return self.convert_set(obj, is_key)
+        if not isinstance(obj, type):
+            if dataclasses.is_dataclass(obj):
+                return self.convert_dataclass(obj)
+            if getattr(cls, "__attrs_attrs__", None) is not None:
+                return self.convert_attrs(obj)
+        if self.passes_through(obj):
+            return obj
+        if self.enc_hook is not None:
+            return self.convert(self.enc_hook(obj), is_key)
+        raise TypeError(f"Encoding objects of type {cls.__name__} is not supported")
 
     def passes_through(self, obj: Any) -> bool:
         return type(obj) in self.builtin_types or isinstance(obj, self.subclassable_types)
 
-    def restore_fields(self, obj: Any, encoded: Any) -> None:
-        names = _encoded_field_names(obj)
-        if isinstance(encoded, dict):
-            for name, key in names:
-                if key in encoded:
-                    encoded[key] = self.convert(getattr(obj, name))
-        elif isinstance(encoded, list):
-            offset = 0 if getattr(type(obj), "__struct_tag__", None) is None else 1
-            for index, (name, _) in enumerate(names[: len(encoded) - offset]):
-                encoded[offset + index] = self.convert(getattr(obj, name))
-
-    def convert_key(self, key: Any) -> Any:
-        if isinstance(key, enum.Enum):
-            key = key.value
-        if isinstance(key, str) or (
-            not self.str_keys and (key is None or isinstance(key, (int, float)))
+    def convert_mapping(self, obj: Mapping[Any, Any]) -> Any:
+        out = {}
+        for key, value in obj.items():
+            key = self.convert(key, True)
+            if self.str_keys:
+                if type(key) in (int, float):
+                    key = str(key)
+                elif type(key) is not str:
+                    raise TypeError(_INVALID_DICT_KEY)
+            out[key] = self.convert(value)
+        if self.order is not None:
+            out = dict(sorted(out.items()))
+        if (
+            _FROZENDICT is not None
+            and isinstance(obj, _FROZENDICT)
+            and _FROZENDICT in self.builtin_types
         ):
-            return key
-        return next(iter(json.decode(json.encode({key: None}, enc_hook=self.enc_hook))))
+            return _FROZENDICT(out)
+        return out
 
+    def convert_set(self, obj: set[Any] | frozenset[Any], is_key: bool) -> Any:
+        items = list(obj)
+        if self.order is not None:
+            items.sort()
+        converted = [self.convert(item, is_key) for item in items]
+        return tuple(converted) if is_key else converted
 
-def _encoded_field_names(obj: Any) -> list[tuple[str, str]]:
-    cls = type(obj)
-    if isinstance(obj, Struct):
-        return [(info.name, info.encode_name) for info in structs.fields(cls)]
-    if hasattr(cls, "__dataclass_fields__"):
-        import dataclasses
+    def convert_struct(self, obj: Struct, is_key: bool) -> Any:
+        cls = type(obj)
+        config = cls.__struct_config__
+        names = cls.__struct_fields__
+        if config.array_like:
+            values = []
+            if config.tag is not None:
+                values.append(config.tag)
+            values.extend(self.convert(getattr(obj, name), is_key) for name in names)
+            return tuple(values) if is_key else values
+        out = {}
+        if config.tag is not None:
+            out[config.tag_field] = config.tag
+        encode_names = cls.__struct_encode_fields__
+        defaults = cls.__struct_defaults__
+        first_default = len(names) - len(defaults)
+        for index, (name, encode_name) in enumerate(zip(names, encode_names, strict=True)):
+            value = getattr(obj, name)
+            if value is UNSET:
+                continue
+            if (
+                config.omit_defaults
+                and index >= first_default
+                and _is_default(value, defaults[index - first_default])
+            ):
+                continue
+            out[encode_name] = self.convert(value)
+        return self.sort_object(out)
 
-        return [(field.name, field.name) for field in dataclasses.fields(cls)]
-    attributes = getattr(cls, "__attrs_attrs__", None)
-    if attributes is not None:
-        return [(attribute.name, attribute.name) for attribute in attributes]
-    return []
+    def convert_dataclass(self, obj: Any) -> dict[str, Any]:
+        out = {}
+        for field in dataclasses.fields(obj):
+            try:
+                value = getattr(obj, field.name)
+            except AttributeError:
+                continue
+            if value is not UNSET:
+                out[field.name] = self.convert(value)
+        return self.sort_object(out)
+
+    def convert_attrs(self, obj: Any) -> dict[str, Any]:
+        out = {}
+        for attribute in type(obj).__attrs_attrs__:
+            name = attribute.name
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(obj, name)
+            except AttributeError:
+                continue
+            if value is not UNSET:
+                out[name] = self.convert(value)
+        return self.sort_object(out)
+
+    def sort_object(self, obj: dict[str, Any]) -> dict[str, Any]:
+        if self.order == "sorted":
+            return dict(sorted(obj.items()))
+        return obj

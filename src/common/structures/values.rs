@@ -14,18 +14,8 @@ use crate::common::{
 };
 
 #[inline(always)]
-#[allow(clippy::undocumented_unsafe_blocks)]
 pub(crate) fn py_string_value<'a, 'py>(value: &'a Bound<'py, PyString>) -> PyResult<&'a str> {
-    if unsafe { ffi::PyUnicode_IS_COMPACT_ASCII(value.as_ptr()) } == 0 {
-        return value.to_str();
-    }
-    unsafe {
-        let len = ffi::PyUnicode_GET_LENGTH(value.as_ptr()) as usize;
-        let data = ffi::PyUnicode_DATA(value.as_ptr()).cast::<u8>();
-        Ok(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-            data, len,
-        )))
-    }
+    value.to_str()
 }
 
 #[inline(always)]

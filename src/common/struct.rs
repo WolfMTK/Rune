@@ -723,6 +723,7 @@ pub(crate) fn _struct_replace<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (object, name, value, /), text_signature = "(struct, name, value, /)")]
 pub(crate) fn force_setattr(
     object: &Bound<'_, PyAny>,
     name: &Bound<'_, PyString>,

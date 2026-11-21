@@ -73,9 +73,9 @@ pub(crate) fn raw_type(py: Python<'_>) -> &Bound<'_, PyType> {
 #[pymethods]
 impl Raw {
     #[new]
-    #[pyo3(signature = (data = None, /))]
-    fn py_new(py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
-        let Some(data) = data else {
+    #[pyo3(signature = (msg = None, /), text_signature = "(msg=b'', /)")]
+    fn py_new(py: Python<'_>, msg: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let Some(data) = msg else {
             return Ok(Self::from_bytes(PyBytes::new(py, b"")));
         };
         if let Ok(bytes) = data.cast_exact::<PyBytes>() {

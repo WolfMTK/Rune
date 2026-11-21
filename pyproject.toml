@@ -41,6 +41,7 @@ dev = [
     "attrs>=26.1.0",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
+    "pyyaml",
 ]
 
 [tool.ruff]

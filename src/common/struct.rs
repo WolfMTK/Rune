@@ -243,6 +243,21 @@ pub(crate) fn allocate<'py>(ty: &Bound<'py, PyType>) -> PyResult<Bound<'py, PyAn
     }
 }
 
+#[cold]
+fn check_abstract(ty: &Bound<'_, PyType>) -> PyResult<()> {
+    let args = PyTuple::empty(ty.py());
+    let object: PyResult<Bound<'_, PyAny>> = unsafe {
+        let new = ffi::PyBaseObject_Type
+            .tp_new
+            .expect("object.__new__ must be available");
+        Bound::from_owned_ptr_or_err(
+            ty.py(),
+            new(ty.as_type_ptr(), args.as_ptr(), ptr::null_mut()),
+        )
+    };
+    object.map(|_| ())
+}
+
 pub(crate) fn finish<'py>(
     object: Bound<'py, PyAny>,
     info: &StructInfo,
@@ -277,6 +292,9 @@ fn construct<'a, 'py: 'a>(
     keywords: impl Iterator<Item = (Borrowed<'a, 'py, PyAny>, Borrowed<'a, 'py, PyAny>)>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let py = ty.py();
+    if unsafe { ffi::PyType_HasFeature(ty.as_type_ptr(), ffi::Py_TPFLAGS_IS_ABSTRACT) } != 0 {
+        check_abstract(ty)?;
+    }
     let info = require_info(ty)?;
     let info = info.get();
     let given = positional.len();

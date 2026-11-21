@@ -11,7 +11,8 @@ use pyo3::{
     exceptions::{PyAttributeError, PyRuntimeError, PyTypeError},
     ffi, intern,
     prelude::{
-        PyAnyMethods, PyDictMethods, PyTupleMethods, PyTypeMethods, pyclass, pyfunction, pymethods,
+        PyAnyMethods, PyDictMethods, PyStringMethods, PyTupleMethods, PyTypeMethods, pyclass,
+        pyfunction, pymethods,
     },
     types::{PyDict, PyString, PyTuple, PyType},
 };
@@ -245,17 +246,31 @@ pub(crate) fn allocate<'py>(ty: &Bound<'py, PyType>) -> PyResult<Bound<'py, PyAn
 
 #[cold]
 fn check_abstract(ty: &Bound<'_, PyType>) -> PyResult<()> {
-    let args = PyTuple::empty(ty.py());
-    let object: PyResult<Bound<'_, PyAny>> = unsafe {
-        let new = ffi::PyBaseObject_Type
-            .tp_new
-            .expect("object.__new__ must be available");
-        Bound::from_owned_ptr_or_err(
-            ty.py(),
-            new(ty.as_type_ptr(), args.as_ptr(), ptr::null_mut()),
-        )
-    };
-    object.map(|_| ())
+    let py = ty.py();
+    let abstract_methods = ty.getattr(intern!(py, "__abstractmethods__"))?;
+    let mut methods = abstract_methods
+        .try_iter()?
+        .map(|method| {
+            let method = method?;
+            let name = method.cast::<PyString>()?.to_str()?.to_owned();
+            let repr = method.repr()?.to_str()?.to_owned();
+            Ok((name, repr))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if methods.is_empty() {
+        return Ok(());
+    }
+    methods.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let suffix = if methods.len() == 1 { "" } else { "s" };
+    let names = methods
+        .into_iter()
+        .map(|(_, repr)| repr)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(PyTypeError::new_err(format!(
+        "Can't instantiate abstract class {} without an implementation for abstract method{suffix} {names}",
+        ty.name()?
+    )))
 }
 
 pub(crate) fn finish<'py>(

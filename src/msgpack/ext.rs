@@ -63,7 +63,7 @@ fn ext_code(code: &Bound<'_, PyAny>) -> PyResult<i8> {
 #[pymethods]
 impl Ext {
     #[new]
-    #[pyo3(signature = (*args, **kwargs))]
+    #[pyo3(signature = (*args, **kwargs), text_signature = "(code, data, /)")]
     fn py_new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         if kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
             return Err(PyTypeError::new_err("Ext takes no keyword arguments"));

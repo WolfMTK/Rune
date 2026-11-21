@@ -494,8 +494,14 @@ _ROOT_CONFIG = StructConfig(
 )
 
 
+class _StructMetaMeta(type):
+    @property
+    def __text_signature__(cls) -> str:
+        return "(name, bases, namespace, /, **kwargs)"
+
+
 @dataclass_transform(field_specifiers=(field,))
-class StructMeta(type):
+class StructMeta(type, metaclass=_StructMetaMeta):
     __rune_config__ = _ROOT_CONFIG
     __rune_positional__ = 0
 

@@ -184,6 +184,7 @@ macro_rules! format_bindings {
                 self.uuid_format.get()
             }
 
+            #[pyo3(signature = (items, /))]
             fn encode_lines<'py>(
                 &self,
                 py: Python<'py>,
@@ -378,6 +379,7 @@ macro_rules! format_bindings {
                 cls.clone()
             }
 
+            #[pyo3(signature = (buf, /))]
             fn decode<'py>(
                 &self,
                 py: Python<'py>,
@@ -387,6 +389,7 @@ macro_rules! format_bindings {
                 self.core.decode::<$format>(py, &data)
             }
 
+            #[pyo3(signature = (buf, /))]
             fn decode_lines<'py>(
                 &self,
                 py: Python<'py>,

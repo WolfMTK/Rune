@@ -65,14 +65,14 @@ def fields(type_or_instance: Any) -> tuple[FieldInfo, ...]:
     return tuple(infos)
 
 
-def replace(struct: Any, /, **changes: Any) -> Any:
+def replace(struct, /, **changes):
     return _struct_replace(struct, changes)
 
 
-def asdict(struct: Any) -> dict[str, Any]:
+def asdict(struct, /):
     values = _struct_values(struct)
     return dict(zip(type(struct).__struct_fields__, values, strict=True))
 
 
-def astuple(struct: Any) -> tuple[Any, ...]:
+def astuple(struct, /):
     return _struct_values(struct)

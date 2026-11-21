@@ -4,6 +4,7 @@ import datetime
 import decimal
 import enum
 import gc
+import inspect
 import sys
 import textwrap
 import types
@@ -5591,3 +5592,54 @@ class TestFrozendict:
         msg = proto.encode(frozendict({"abc": "xyz"}))
         with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
             dec.decode(msg)
+
+
+@pytest.mark.parametrize(
+    "func, expected",
+    [
+        pytest.param(rune.Raw, "(msg=b'', /)", id="Raw"),
+        pytest.param(rune.msgpack.Ext, "(code, data, /)", id="Ext"),
+        pytest.param(rune.structs.replace, "(struct, /, **changes)", id="replace"),
+        pytest.param(rune.structs.asdict, "(struct, /)", id="asdict"),
+        pytest.param(rune.structs.astuple, "(struct, /)", id="astuple"),
+        pytest.param(
+            rune.structs.force_setattr,
+            "(struct, name, value, /)",
+            id="force_setattr",
+        ),
+        pytest.param(rune.Raw(b"1").copy, "()", id="Raw.copy"),
+        pytest.param(rune.json.Encoder().encode, "(obj, /)", id="json.Encoder.encode"),
+        pytest.param(
+            rune.json.Encoder().encode_into,
+            "(obj, buffer, offset=0, /)",
+            id="json.Encoder.encode_into",
+        ),
+        pytest.param(
+            rune.json.Encoder().encode_lines,
+            "(items, /)",
+            id="json.Encoder.encode_lines",
+        ),
+        pytest.param(rune.json.Decoder().decode, "(buf, /)", id="json.Decoder.decode"),
+        pytest.param(
+            rune.json.Decoder().decode_lines,
+            "(buf, /)",
+            id="json.Decoder.decode_lines",
+        ),
+        pytest.param(rune.msgpack.Encoder().encode, "(obj, /)", id="rune.Encoder.encode"),
+        pytest.param(
+            rune.msgpack.Encoder().encode_into,
+            "(obj, buffer, offset=0, /)",
+            id="rune.Encoder.encode_into",
+        ),
+        pytest.param(rune.msgpack.Decoder().decode, "(buf, /)", id="rune.Decoder.decode"),
+    ],
+)
+def test_reported_signature(func, expected):
+    """The reported signature must match how the callable is really called"""
+    assert str(inspect.signature(func)) == expected
+
+
+def test_structmeta_text_signature_is_valid():
+    """`StructMeta` has a `__signature__` getset, so only the text form is checkable"""
+    text_signature = rune.StructMeta.__text_signature__
+    exec(compile(f"def _f{text_signature}: pass", "<signature>", "exec"), {})

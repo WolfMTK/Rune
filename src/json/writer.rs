@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::{
     constants::{
         EXPONENT_MINUS_FIVE, EXPONENT_MINUS_FIVE_PREFIX, HEX_DIGITS, JSON_WORD_SIZE,

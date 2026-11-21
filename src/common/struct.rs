@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{
     ffi::{c_int, c_ulong, c_void},
     ptr,

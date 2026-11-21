@@ -238,6 +238,7 @@ impl<'a> TextBuf<'a> {
         self.len = end;
     }
 
+    #[allow(clippy::undocumented_unsafe_blocks)]
     pub(crate) fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len]) }
     }

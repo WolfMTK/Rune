@@ -703,10 +703,10 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
                 continue;
             };
             let value = &*value;
-            if slot.accepts_unset || (settings.omit_defaults && slot.default.is_some()) {
-                if self.is_omitted_slot_field(settings, slot, value)? {
-                    continue;
-                }
+            if (slot.accepts_unset || (settings.omit_defaults && slot.default.is_some()))
+                && self.is_omitted_slot_field(settings, slot, value)?
+            {
+                continue;
             }
             actual_len += 1;
             if W::BINARY {

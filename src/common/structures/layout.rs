@@ -56,23 +56,23 @@ impl Field {
         let py = key.py();
         let mut optional = false;
         let mut value_ty = ty.clone();
-        if let Some(origin) = type_origin(&ty)? {
-            if is_union_origin(&origin)? {
-                let mut target = None;
-                let mut multiple = false;
-                for arg in type_args(&ty)? {
-                    if arg.is_none() {
-                        optional = true;
-                    } else if target.is_some() {
-                        multiple = true;
-                        break;
-                    } else {
-                        target = Some(arg);
-                    }
+        if let Some(origin) = type_origin(&ty)?
+            && is_union_origin(&origin)?
+        {
+            let mut target = None;
+            let mut multiple = false;
+            for arg in type_args(&ty)? {
+                if arg.is_none() {
+                    optional = true;
+                } else if target.is_some() {
+                    multiple = true;
+                    break;
+                } else {
+                    target = Some(arg);
                 }
-                if !multiple && let Some(target) = target {
-                    value_ty = target;
-                }
+            }
+            if !multiple && let Some(target) = target {
+                value_ty = target;
             }
         }
         let hint = if is_type::<pyo3::types::PyString>(&value_ty) {
@@ -177,6 +177,8 @@ impl StructSettings {
     }
 }
 
+pub(crate) type ListPlans = Vec<(usize, Rc<StructLayout>)>;
+
 pub(crate) struct Slot {
     pub(crate) offset: isize,
     pub(crate) name: Box<str>,
@@ -192,7 +194,7 @@ pub(crate) struct Slot {
     pub(crate) json_key: Option<Box<[u8]>>,
     pub(crate) binary_key: Box<[u8]>,
     pub(crate) list_annotation: Option<Py<PyAny>>,
-    pub(crate) list_plan: OnceCell<Option<Vec<(usize, Rc<StructLayout>)>>>,
+    pub(crate) list_plan: OnceCell<Option<ListPlans>>,
 }
 
 impl Slot {

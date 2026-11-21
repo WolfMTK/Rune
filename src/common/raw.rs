@@ -50,6 +50,7 @@ impl Raw {
         }
     }
 
+    #[allow(clippy::undocumented_unsafe_blocks)]
     pub(crate) fn as_bytes<'a>(&'a self, py: Python<'a>) -> PyResult<&'a [u8]> {
         Ok(match &self.source {
             Source::Bytes(bytes) => bytes.bind(py).as_bytes(),

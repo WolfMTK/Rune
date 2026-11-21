@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use pyo3::{
     Bound, PyAny,
     prelude::PyAnyMethods,
@@ -10,7 +12,7 @@ use crate::common::{
     reader::{Key, Reader, kind},
     structures::{
         converter::{convert::ObjectConverter, decode::Converter},
-        enums::PathSegment,
+        enums::{Constructor, PathSegment, Scalar},
         errors::Fail,
         plan::{StructPlan, UnionPlan},
     },
@@ -25,6 +27,7 @@ pub(crate) struct TagGroup<'g, 'py> {
 }
 
 impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
+    #[inline(always)]
     pub(crate) fn decode_tagged(
         &mut self,
         group: &TagGroup<'_, 'py>,
@@ -52,7 +55,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         let plan = self.plan.struct_plan(id);
         let length = Length::at_least(plan.min_array_length + 1);
         let must_count_first = self.fields_call_user_code(id);
-        let mut values = vec![None; plan.fields.len()];
+        let mut values: FieldValues<'py> = smallvec![None; plan.fields.len()];
         self.decode_items(
             &array,
             &length,
@@ -76,10 +79,8 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
     fn decode_tagged_map(&mut self, group: &TagGroup<'_, 'py>) -> Decoded<'py> {
         let start = self.wire.checkpoint();
         if group.tag_index.is_some() {
-            match self.ordered_tagged_values(group) {
-                Ok(Some((id, values))) => {
-                    return self.plan.struct_plan(id).instantiate(self.py, values);
-                }
+            match self.decode_ordered_tagged(group) {
+                Ok(Some(value)) => return value,
                 Err(fail) if fail.is_syntax() => return Err(fail),
                 Ok(None) | Err(_) => self.wire.restore(start),
             }
@@ -101,22 +102,40 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         plan.instantiate(self.py, values)
     }
 
-    fn ordered_tagged_values(
+    fn decode_ordered_tagged(
         &mut self,
         group: &TagGroup<'_, 'py>,
-    ) -> Outcome<Option<(NodeId, FieldValues<'py>)>> {
+    ) -> Outcome<Option<Decoded<'py>>> {
+        let start = self.wire.checkpoint();
         let len = self.wire.enter_map()?;
         let tag_field = &self.plan.struct_plan(group.members[0]).tag_field;
-        match self.wire.next_key(len, 0)? {
-            Some(Key::Text(key)) if key == tag_field.as_str() => {}
-            _ => return Ok(None),
+        let mut index = 0;
+        while let Some(key) = self.wire.next_key(len, index)? {
+            match key {
+                Key::Text(key) if key == tag_field.as_str() => {
+                    let id = self.resolve_tag(group, || PathSegment::Key(tag_field.clone()))?;
+                    if self.fields_call_user_code(id) {
+                        return Ok(None);
+                    }
+                    let (len, first_index) = if index == 0 {
+                        (len, 1)
+                    } else {
+                        self.wire.restore(start);
+                        (self.wire.enter_map()?, 0)
+                    };
+                    let plan = self.plan.struct_plan(id);
+                    if matches!(plan.constructor, Constructor::Direct { .. }) {
+                        let instance = self.fill_direct(len, plan, first_index)?;
+                        return Ok(Some(plan.finish_direct(self.py, instance)));
+                    }
+                    let values = self.fill_values(len, plan, first_index)?;
+                    return Ok(Some(plan.instantiate(self.py, values)));
+                }
+                _ => self.skip()?,
+            }
+            index += 1;
         }
-        let id = self.resolve_tag(group, || PathSegment::Key(tag_field.clone()))?;
-        if self.fields_call_user_code(id) {
-            return Ok(None);
-        }
-        let values = self.fill_values(len, self.plan.struct_plan(id), 1)?;
-        Ok(Some((id, values)))
+        Ok(None)
     }
 
     fn resolve_tag(
@@ -135,7 +154,11 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         if !fits {
             return Err(Fail::mismatch(expected, kind::name(found)).at(segment()));
         }
-        let scalar = self.wire.read_scalar()?;
+        let scalar = if first.has_str_tag {
+            Scalar::Str(self.wire.read_string()?)
+        } else {
+            self.wire.read_scalar()?
+        };
         if let Some(&id) = group.tag_index.and_then(|tags| tags.get(&scalar)) {
             return Ok(id);
         }

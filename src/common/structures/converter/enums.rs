@@ -70,14 +70,19 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let raw = self.decode_any()?;
         Ok(invalid_enum_value(&raw)?)
     }
+    #[inline(always)]
     pub(crate) fn decode_enum(
         &mut self,
         ty: &Bound<'py, PyAny>,
         members: &EnumPlan,
     ) -> Decoded<'py> {
         let py = self.py;
-        self.expect_kind(kind::NUMBER_OR_STR, ty, kind::name)?;
-        let scalar = self.wire.read_scalar()?;
+        let found = self.expect_kind(kind::NUMBER_OR_STR, ty, kind::name)?;
+        let scalar = if found == kind::STR {
+            Scalar::Str(self.wire.read_string()?)
+        } else {
+            self.wire.read_scalar()?
+        };
         if let Some(member) = members.members.get(&scalar) {
             return Ok(member.bind(py).clone());
         }

@@ -1,16 +1,17 @@
 use pyo3::{
     prelude::{PyAnyMethods, PyBytesMethods},
-    types::{PyBytes, PyInt, PyList, PyMemoryView, PySlice, PyString, PyTuple},
+    types::{PyBytes, PyInt, PyMemoryView, PySlice, PyTuple},
 };
 
 use crate::{
     common::{
         reader::{Reader, kind},
         structures::{
-            converter::decode::Converter,
+            converter::{collections::ListBuilder, decode::Converter},
             enums::{Scalar, Value},
             errors::{Fail, number_out_of_range},
             temporal::datetime_from_timestamp,
+            values::string_from_read_text,
         },
         types::Decoded,
     },
@@ -27,7 +28,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let py = self.py;
         match self.wire.read_value() {
             Ok(Value::Scalar(Scalar::Int(value))) => Ok(PyInt::new(py, value).into_any()),
-            Ok(Value::Scalar(Scalar::Str(value))) => Ok(PyString::new(py, &value).into_any()),
+            Ok(Value::Scalar(Scalar::Str(value))) => {
+                Ok(string_from_read_text(py, &value)?.into_any())
+            }
             Ok(Value::Scalar(Scalar::Float(value))) if value.is_infinite() && !W::BINARY => {
                 Err(number_out_of_range())
             }
@@ -70,6 +73,15 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     }
     fn decode_untyped_array(&mut self, len: Option<usize>) -> Decoded<'py> {
         self.wire.enter()?;
+        if !self.in_key {
+            let list = ListBuilder::new(self.py, len.unwrap_or(0))?;
+            self.each_item(len, 0, |this, _| {
+                list.push(this.decode_any()?)?;
+                Ok(())
+            })?;
+            self.wire.leave();
+            return Ok(list.finish());
+        }
         let start = self.items.len();
         self.each_item(len, 0, |this, _| {
             let item = this.decode_any()?;
@@ -77,12 +89,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             Ok(())
         })?;
         self.wire.leave();
-        let items = self.items.drain(start..);
-        Ok(if self.in_key {
-            PyTuple::new(self.py, items)?.into_any()
-        } else {
-            PyList::new(self.py, items)?.into_any()
-        })
+        Ok(PyTuple::new(self.py, self.items.drain(start..))?.into_any())
     }
     fn decode_untyped_map(&mut self, len: Option<usize>) -> Decoded<'py> {
         self.wire.enter()?;

@@ -4,7 +4,7 @@ mod enums;
 pub(crate) mod ext;
 mod helpers;
 mod reader;
-mod structures;
+pub(crate) mod structures;
 mod writer;
 
 pub(crate) use structures::LengthMarkers;

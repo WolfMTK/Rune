@@ -1,8 +1,11 @@
+use smallvec::SmallVec;
+
 use pyo3::{
-    Bound, PyAny,
+    Bound, PyAny, PyResult, Python,
     exceptions::PyTypeError,
+    ffi,
     prelude::PyAnyMethods,
-    types::{PyDict, PyDictMethods, PyList, PyTuple},
+    types::{PyDict, PyDictMethods, PyList, PyListMethods, PyTuple},
 };
 
 use crate::common::{
@@ -16,6 +19,41 @@ use crate::common::{
     types::{Decoded, Length, NodeId, Outcome},
 };
 
+pub(super) struct ListBuilder<'py> {
+    list: Bound<'py, PyList>,
+}
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+impl<'py> ListBuilder<'py> {
+    pub(super) fn new(py: Python<'py>, len: usize) -> PyResult<Self> {
+        let list = unsafe {
+            let list = Bound::from_owned_ptr_or_err(py, ffi::PyList_New(len.min(16) as isize))?
+                .cast_into_unchecked::<PyList>();
+            (*list.as_ptr().cast::<ffi::PyListObject>()).ob_base.ob_size = 0;
+            list
+        };
+        Ok(Self { list })
+    }
+
+    pub(super) fn push(&self, item: Bound<'py, PyAny>) -> PyResult<()> {
+        let pointer = self.list.as_ptr();
+        unsafe {
+            let list = pointer.cast::<ffi::PyListObject>();
+            let len = (*list).ob_base.ob_size;
+            if (*list).allocated > len {
+                ffi::PyList_SET_ITEM(pointer, len, item.into_ptr());
+                (*list).ob_base.ob_size = len + 1;
+                return Ok(());
+            }
+        }
+        self.list.append(item)
+    }
+
+    pub(super) fn finish(self) -> Bound<'py, PyAny> {
+        self.list.into_any()
+    }
+}
+
 impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     pub(crate) fn decode_array(
         &mut self,
@@ -24,6 +62,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
     ) -> Decoded<'py> {
         let py = self.py;
         let container = array.container.bind(py);
+        if W::BINARY && matches!(array.output, ArrayOutput::List) {
+            return self.decode_binary_list(array, calls_user_code);
+        }
         self.expect_kind(kind::ARRAY, "array", kind::container_name)?;
         let length = if array.is_variadic {
             Length::at_least(0)
@@ -55,6 +96,36 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             ArrayOutput::Converted => container.call1((PyList::new(py, items)?,))?,
         })
     }
+
+    fn decode_binary_list(&mut self, array: &ArrayPlan, calls_user_code: bool) -> Decoded<'py> {
+        self.expect_kind(kind::ARRAY, "array", kind::container_name)?;
+        let length = if array.is_variadic {
+            Length::at_least(0)
+        } else {
+            Length::exactly(array.items.len())
+        };
+        let outer = std::mem::replace(&mut self.in_key, false);
+        let decoded = (|| {
+            let opened = self.open_array()?;
+            let list = ListBuilder::new(self.py, opened.len.unwrap_or(0))?;
+            self.decode_items(
+                &opened,
+                &length,
+                calls_user_code && length.restricts(),
+                opened.start,
+                0,
+                |this, index| {
+                    let item_node = array.items[if array.is_variadic { 0 } else { index }];
+                    list.push(this.decode_node(item_node)?)?;
+                    Ok(())
+                },
+            )?;
+            Ok(list.finish())
+        })();
+        self.in_key = outer;
+        decoded
+    }
+
     pub(crate) fn decode_dict(
         &mut self,
         keys: Option<NodeId>,
@@ -114,7 +185,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let outer = std::mem::replace(&mut self.in_key, false);
         let filled = self.each_key(len, |this, entry| {
             let key = match entry {
-                Key::Text(text) => this.keys.get(py, &text).into_any(),
+                Key::Text(text) => this.keys.get(py, &text)?.into_any(),
                 Key::Value(_) => this.decode_as_key(key)?,
             };
             let value = match values {
@@ -145,7 +216,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         calls_user_code: bool,
     ) -> Decoded<'py> {
         self.expect_kind(kind::ARRAY, "array", kind::container_name)?;
-        let mut values = Vec::with_capacity(tuple.fields.len());
+        let mut values = SmallVec::<[Bound<'py, PyAny>; 8]>::with_capacity(tuple.fields.len());
         self.decode_sequence(&tuple.length(), calls_user_code, |this, index| {
             values.push(this.decode_node(tuple.fields[index])?);
             Ok(())

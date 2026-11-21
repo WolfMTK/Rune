@@ -1,9 +1,37 @@
 use crate::{
     constants::{
-        EXPONENT_MINUS_FIVE, EXPONENT_MINUS_FIVE_PREFIX, HEX_DIGITS, SCIENTIFIC_NOTATION_START,
+        EXPONENT_MINUS_FIVE, EXPONENT_MINUS_FIVE_PREFIX, HEX_DIGITS, JSON_WORD_SIZE,
+        SCIENTIFIC_NOTATION_START,
     },
-    json::helpers::for_each_special_byte,
+    json::helpers::{is_special_byte, special_byte_mask},
 };
+
+#[inline(always)]
+pub(crate) fn push_byte_reserved(out: &mut Vec<u8>, byte: u8) {
+    let len = out.len();
+    unsafe {
+        *out.as_mut_ptr().add(len) = byte;
+        out.set_len(len + 1);
+    }
+}
+
+#[inline(always)]
+fn push_word_reserved(out: &mut Vec<u8>, word: u64) {
+    let len = out.len();
+    unsafe {
+        std::ptr::write_unaligned(out.as_mut_ptr().add(len).cast(), word.to_le_bytes());
+        out.set_len(len + JSON_WORD_SIZE);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn push_bytes_reserved(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = out.len();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().add(len), bytes.len());
+        out.set_len(len + bytes.len());
+    }
+}
 
 pub(crate) fn write_integer(out: &mut Vec<u8>, value: impl itoa::Integer) {
     out.extend_from_slice(itoa::Buffer::new().format(value).as_bytes());
@@ -47,17 +75,39 @@ fn write_with_exponent_minus_five(out: &mut Vec<u8>, text: &[u8], is_negative: b
     out.extend_from_slice(b"e-5");
 }
 
+#[inline(always)]
 pub(crate) fn write_escaped(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
     out.reserve(bytes.len() + 2);
     out.push(b'"');
-    let mut plain_start = 0;
-    for_each_special_byte(bytes, |index| {
-        out.extend_from_slice(&bytes[plain_start..index]);
-        write_escape_sequence(out, bytes[index]);
-        plain_start = index + 1;
-    });
-    out.extend_from_slice(&bytes[plain_start..]);
+    let mut start = 0;
+    while let Some(chunk) = bytes[start..].first_chunk::<JSON_WORD_SIZE>() {
+        let mask = special_byte_mask(u64::from_le_bytes(*chunk));
+        if mask == 0 {
+            push_word_reserved(out, u64::from_le_bytes(*chunk));
+            start += JSON_WORD_SIZE;
+            continue;
+        }
+        let index = start + mask.trailing_zeros() as usize / JSON_WORD_SIZE;
+        if is_special_byte(bytes[index]) {
+            out.reserve(bytes.len() - index + 7);
+            push_bytes_reserved(out, &bytes[start..index]);
+            write_escape_sequence(out, bytes[index]);
+            start = index + 1;
+        } else {
+            push_bytes_reserved(out, &bytes[start..index + 1]);
+            start = index + 1;
+        }
+    }
+    for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+        if is_special_byte(byte) {
+            out.reserve(bytes.len() - offset + 7);
+            push_bytes_reserved(out, &bytes[start..offset]);
+            write_escape_sequence(out, byte);
+            start = offset + 1;
+        }
+    }
+    push_bytes_reserved(out, &bytes[start..]);
     out.push(b'"');
 }
 

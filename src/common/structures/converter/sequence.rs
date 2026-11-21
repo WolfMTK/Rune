@@ -1,3 +1,5 @@
+use smallvec::SmallVec;
+
 use pyo3::{
     Bound, PyAny, PyResult,
     prelude::PyAnyMethods,
@@ -13,7 +15,9 @@ use crate::common::{
     types::{Decoded, Length, NodeId, Outcome},
 };
 
-pub(crate) fn sequence_items<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+pub(crate) fn sequence_items<'py>(
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<SmallVec<[Bound<'py, PyAny>; 8]>> {
     match obj.cast::<PyList>() {
         Ok(list) => Ok(list.iter().collect()),
         Err(_) => Ok(obj.cast::<PyTuple>()?.iter().collect()),
@@ -26,7 +30,9 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
         let Some(member) = self.find(id, variadic) else {
             return Err(self.mismatch(id, "set")?);
         };
-        let items = obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        let items = obj
+            .try_iter()?
+            .collect::<PyResult<SmallVec<[Bound<'py, PyAny>; 8]>>>()?;
         self.build_array(&items, member)
     }
 
@@ -74,7 +80,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
                     this.convert(item, node)
                         .map_err(|fail| fail.at(PathSegment::Index(index)))
                 })
-                .collect::<Outcome<Vec<_>>>()
+                .collect::<Outcome<SmallVec<[Bound<'py, PyAny>; 8]>>>()
         })?;
         let value = match array.output {
             ArrayOutput::List => PyList::new(py, converted)?.into_any(),
@@ -105,7 +111,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
                     this.convert(item, field)
                         .map_err(|fail| fail.at(PathSegment::Index(index)))
                 })
-                .collect::<Outcome<Vec<_>>>()
+                .collect::<Outcome<SmallVec<[Bound<'py, PyAny>; 8]>>>()
         })?;
         let value = tuple.class.bind(py).call1(PyTuple::new(py, values)?)?;
         self.constrain(member, value)

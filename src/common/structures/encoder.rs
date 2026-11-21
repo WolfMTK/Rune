@@ -1,10 +1,10 @@
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::{
-    Bound, Py, PyAny, PyErr, PyResult, Python,
+    Borrowed, Bound, Py, PyAny, PyErr, PyResult, Python,
     exceptions::{PyKeyError, PyOverflowError, PyRecursionError, PyTypeError, PyValueError},
-    intern,
+    ffi, intern,
     prelude::{
         PyAnyMethods, PyBytesMethods, PyDictMethods, PyListMethods, PyStringMethods, PyTypeMethods,
     },
@@ -23,17 +23,24 @@ use crate::{
         naming::type_name_of,
         py_typing::{
             any, decimal_type, is_decimal, is_enum_class, is_frozendict_type, is_plain_class,
-            is_temporal_type, is_type, object_type, unset, uuid,
+            is_temporal_type, object_type, type_args, unset, uuid,
         },
         raw::{Raw, buffer_bytes},
         recursion_limit,
-        r#struct::{FieldDefault, StructInfo},
+        r#struct::{FieldDefault, StructInfo, borrow_slot},
         structures::{
+            datetime_format::TextBuf,
             enums::{BytesType, DecimalFormat, Kind, Order, Token, UuidFormat},
-            layout::{Field, StructLayout, StructSettings},
+            layout::{
+                Field, FieldHint, Slot, StructLayout, StructSettings, is_empty_container_type,
+            },
             options::Hook,
             plan::Plan,
-            temporal::{epoch_micros, temporal_text, timestamp_payload},
+            temporal::{
+                date_text_into, datetime_text_into, epoch_micros, temporal_text,
+                temporal_text_into, time_text_into, timedelta_text_into, timestamp_payload,
+            },
+            values::py_string_value,
         },
         types::RuneMap,
         writer::Writer,
@@ -42,20 +49,27 @@ use crate::{
     msgpack::ext::Ext,
 };
 
+const KIND_CACHE_SIZE: usize = 8;
+
+pub(crate) type LayoutCache = RefCell<RuneMap<usize, (Py<PyType>, Rc<StructLayout>)>>;
+
 pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) writer: W,
     pub(crate) depth_left: usize,
     pub(crate) hook: Option<Bound<'py, PyAny>>,
     pub(crate) decimal_format: &'f DecimalFormat,
+    pub(crate) layouts: &'f LayoutCache,
     pub(crate) order: Order,
     pub(crate) uuid_format: UuidFormat,
     pub(crate) encoding_decimal_replacement: bool,
     pub(crate) kinds: RuneMap<usize, (Bound<'py, PyType>, Kind)>,
     pub(crate) enum_values: RuneMap<usize, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
     pub(crate) pending_fields: Vec<(usize, Bound<'py, PyAny>)>,
+    type_cache: [(usize, Kind); KIND_CACHE_SIZE],
 }
 
 impl<'py, W: Writer> Encoder<'_, 'py, W> {
+    #[inline(always)]
     pub(crate) fn encode(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
         let kind = self.kind_of(obj)?;
         self.encode_as::<false>(obj, kind)
@@ -63,14 +77,20 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
 
     #[inline(always)]
     fn kind_of(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<Kind> {
+        let key = obj.get_type().as_ptr() as usize;
+        let slot = (key >> 4) & (KIND_CACHE_SIZE - 1);
+        if self.type_cache[slot].0 == key {
+            return Ok(self.type_cache[slot].1.clone());
+        }
         if let Some(kind) = Kind::from_exact_instance(obj) {
             return Ok(kind);
         }
-        let key = obj.get_type().as_ptr() as usize;
-        if let Some((_, kind)) = self.kinds.get(&key) {
-            return Ok(kind.clone());
-        }
-        self.classify_kind(obj)
+        let kind = match self.kinds.get(&key) {
+            Some((_, kind)) => kind.clone(),
+            None => self.classify_kind(obj)?,
+        };
+        self.type_cache[slot] = (key, kind.clone());
+        Ok(kind)
     }
 
     #[inline(never)]
@@ -82,9 +102,9 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         } else if is_enum_class(&ty)? {
             Kind::Enum
         } else if is_struct_class(&ty)? {
-            Kind::Struct(Rc::new(StructLayout::load(&ty, &ty)?))
+            Kind::Struct(self.cached_layout(&ty, false)?)
         } else if is_plain_class(&ty)? {
-            Kind::Struct(Rc::new(StructLayout::load_plain(&ty)?))
+            Kind::Struct(self.cached_layout(&ty, true)?)
         } else if ty.is(decimal_type(ty.py())?)
             || is_temporal_type(&ty)?
             || is_frozendict_type(&ty)?
@@ -101,6 +121,23 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(kind)
     }
 
+    fn cached_layout(&self, ty: &Bound<'py, PyType>, plain: bool) -> PyResult<Rc<StructLayout>> {
+        let key = ty.as_ptr() as usize;
+        if let Some((_, layout)) = self.layouts.borrow().get(&key) {
+            return Ok(layout.clone());
+        }
+        let layout = Rc::new(if plain {
+            StructLayout::load_plain(ty)?
+        } else {
+            StructLayout::load(ty, ty)?
+        });
+        self.layouts
+            .borrow_mut()
+            .insert(key, (ty.clone().unbind(), layout.clone()));
+        Ok(layout)
+    }
+
+    #[inline(always)]
     fn encode_as<const AS_KEY: bool>(
         &mut self,
         obj: &Bound<'py, PyAny>,
@@ -109,17 +146,50 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         if AS_KEY && W::BINARY {
             return self.encode_as::<false>(obj, kind);
         }
-        let token = match kind {
-            Kind::Null => Token::Null,
-            Kind::Bool => Token::Bool(obj.extract()?),
+        match kind {
+            Kind::Null => {
+                if AS_KEY {
+                    self.writer.write_key(Token::Null);
+                } else {
+                    self.writer.write_null();
+                }
+            }
+            Kind::Bool => {
+                let value = obj.extract()?;
+                if AS_KEY {
+                    self.writer.write_key(Token::Bool(value));
+                } else {
+                    self.writer.write_bool(value);
+                }
+            }
             Kind::Int => match int_token(obj) {
-                Ok(token) => token,
+                Ok(IntegerToken::Int(value)) => {
+                    if AS_KEY {
+                        self.writer.write_key(Token::Int(value));
+                    } else {
+                        self.writer.write_int(value);
+                    }
+                }
+                Ok(IntegerToken::UInt(value)) => {
+                    if AS_KEY {
+                        self.writer.write_key(Token::UInt(value));
+                    } else {
+                        self.writer.write_uint(value);
+                    }
+                }
                 Err(_) if W::BIG_INTEGERS => return self.encode_big_integer::<AS_KEY>(obj),
                 Err(err) => return Err(err),
             },
             Kind::Float if AS_KEY => return self.encode_float_key(obj),
-            Kind::Float => Token::Float(obj.extract()?),
-            Kind::Str => Token::Str(obj.cast::<PyString>()?.to_str()?),
+            Kind::Float => self.writer.write_float(obj.extract()?),
+            Kind::Str => {
+                let value = py_string_value(obj.cast::<PyString>()?)?;
+                if AS_KEY {
+                    self.writer.write_key(Token::Str(value));
+                } else {
+                    self.writer.write_str(value);
+                }
+            }
             Kind::Enum => {
                 let value = self.enum_value(obj)?;
                 if AS_KEY && !Kind::from_instance(&value).is_some_and(|kind| kind.is_scalar()) {
@@ -147,11 +217,6 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             Kind::Struct(layout) => return self.encode_struct(obj, &layout),
             Kind::Uncommon => return self.encode_uncommon(obj),
             Kind::Unknown => return self.encode_with_hook(obj),
-        };
-        if AS_KEY {
-            self.writer.write_key(token);
-        } else {
-            self.writer.write(token);
         }
         Ok(())
     }
@@ -263,7 +328,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(())
     }
 
-    #[inline(never)]
+    #[inline]
     fn encode_uncommon(&mut self, obj: &Bound<'py, PyAny>) -> PyResult<()> {
         if is_decimal(obj)? {
             self.encode_decimal::<false>(obj)
@@ -284,8 +349,32 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
                 .write_ext(TIMESTAMP_EXT_CODE, &timestamp_payload(seconds, nanos));
             return Ok(());
         }
-        let text = temporal_text(obj)?;
-        self.writer.write(Token::Str(&text));
+        let mut storage = [0_u8; 40];
+        let mut text = TextBuf::new(&mut storage);
+        temporal_text_into(obj, &mut text)?;
+        self.writer.write_temporal(text.as_str());
+        Ok(())
+    }
+
+    fn encode_temporal_slot(&mut self, hint: FieldHint, obj: &Bound<'py, PyAny>) -> PyResult<()> {
+        if W::EXTENSIONS
+            && let Some(micros) = epoch_micros(obj)?
+        {
+            let seconds = micros.div_euclid(MICROS_PER_SECOND) as i64;
+            let nanos = (micros.rem_euclid(MICROS_PER_SECOND) * 1000) as u32;
+            self.writer
+                .write_ext(TIMESTAMP_EXT_CODE, &timestamp_payload(seconds, nanos));
+            return Ok(());
+        }
+        let mut storage = [0_u8; 40];
+        let mut text = TextBuf::new(&mut storage);
+        match hint {
+            FieldHint::DateTime => datetime_text_into(obj, &mut text)?,
+            FieldHint::Date => date_text_into(obj, &mut text)?,
+            FieldHint::Time => time_text_into(obj, &mut text)?,
+            _ => timedelta_text_into(obj, &mut text)?,
+        }
+        self.writer.write_temporal(text.as_str());
         Ok(())
     }
 
@@ -381,6 +470,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         self.nested(|encoder| encoder.encode(&replaced))
     }
 
+    #[inline(always)]
     fn encode_items(
         &mut self,
         items: impl ExactSizeIterator<Item = Bound<'py, PyAny>>,
@@ -429,14 +519,31 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         })
     }
 
+    #[allow(clippy::undocumented_unsafe_blocks)]
     fn encode_dict(&mut self, dict: &Bound<'py, PyDict>) -> PyResult<()> {
         if self.order.sorts_containers() {
             return self.encode_sorted_map(&dict.items());
         }
+        let py = dict.py();
         self.encode_container(Token::MapStart(dict.len()), |encoder| {
-            for (key, value) in dict.iter() {
-                let kind = encoder.kind_of(&key)?;
-                encoder.encode_as::<true>(&key, kind)?;
+            let mut position = 0;
+            loop {
+                let mut key = std::ptr::null_mut();
+                let mut value = std::ptr::null_mut();
+                if unsafe { ffi::PyDict_Next(dict.as_ptr(), &mut position, &mut key, &mut value) }
+                    == 0
+                {
+                    break;
+                }
+                let key = unsafe { Borrowed::from_ptr(py, key) };
+                let value = unsafe { Bound::from_borrowed_ptr(py, value) };
+                if let Ok(key) = key.cast_exact::<PyString>() {
+                    encoder.writer.write_str_key(py_string_value(&key)?);
+                } else {
+                    let key = key.to_owned();
+                    let kind = encoder.kind_of(&key)?;
+                    encoder.encode_as::<true>(&key, kind)?;
+                }
                 encoder.encode(&value)?;
             }
             Ok(())
@@ -496,12 +603,18 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         result
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn encode_struct(&mut self, obj: &Bound<'py, PyAny>, layout: &StructLayout) -> PyResult<()> {
         let py = obj.py();
         let settings = &layout.settings;
         if layout.may_miss_attributes {
             return self.encode_plain(obj, layout);
+        }
+        if !settings.array_like
+            && let Some(slots) = &layout.slots
+            && !self.order.sorts_fields()
+        {
+            return self.encode_struct_slots(obj, layout, slots);
         }
         if !settings.array_like
             && (settings.omit_defaults || layout.has_unset_fields || self.order.sorts_fields())
@@ -528,6 +641,222 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
             }
             Ok(())
         })
+    }
+
+    #[inline(always)]
+    fn encode_struct_slots(
+        &mut self,
+        obj: &Bound<'py, PyAny>,
+        layout: &StructLayout,
+        slots: &[Slot],
+    ) -> PyResult<()> {
+        if W::STREAMING
+            && let Some(prefix) = &layout.json_prefix
+        {
+            return self.nested(|encoder| {
+                encoder.writer.write_struct_prefix(prefix);
+                encoder.encode_struct_slot_fields(obj, layout, slots, false)?;
+                encoder.writer.write(Token::MapEnd);
+                Ok(())
+            });
+        }
+        if W::BINARY {
+            return self.nested(|encoder| {
+                let header = encoder.writer.write_map_header(layout.len());
+                let actual_len = encoder.encode_struct_slot_fields(obj, layout, slots, true)?;
+                encoder.writer.finish_map(header, actual_len);
+                Ok(())
+            });
+        }
+        self.encode_container(Token::MapStart(0), |encoder| {
+            encoder.encode_struct_slot_fields(obj, layout, slots, true)?;
+            Ok(())
+        })
+    }
+
+    fn encode_struct_slot_fields(
+        &mut self,
+        obj: &Bound<'py, PyAny>,
+        layout: &StructLayout,
+        slots: &[Slot],
+        encode_tag: bool,
+    ) -> PyResult<usize> {
+        let py = obj.py();
+        let settings = &layout.settings;
+        if encode_tag && let Some(tag) = &settings.tag {
+            if layout.tag_key_plain {
+                self.writer.write_key_unescaped(&settings.tag_field);
+            } else {
+                self.writer.write_key(Token::Str(&settings.tag_field));
+            }
+            let tag = tag.bind(py);
+            if tag.is_exact_instance_of::<PyString>() {
+                self.writer
+                    .write_str(py_string_value(tag.cast::<PyString>()?)?);
+            } else {
+                self.encode(tag)?;
+            }
+        }
+        let mut actual_len = usize::from(encode_tag && settings.tag.is_some());
+        for slot in slots {
+            let Some(value) = borrow_slot(obj, slot.offset) else {
+                continue;
+            };
+            let value = &*value;
+            if slot.accepts_unset || (settings.omit_defaults && slot.default.is_some()) {
+                if self.is_omitted_slot_field(settings, slot, value)? {
+                    continue;
+                }
+            }
+            actual_len += 1;
+            if W::BINARY {
+                self.writer.write_binary_key(&slot.name, &slot.binary_key);
+            } else {
+                self.writer
+                    .write_key_bytes(&slot.name, slot.json_key.as_deref());
+            }
+            if !self.encode_slot_hint(slot, value)? {
+                self.encode_fallback_slot(value)?;
+            }
+        }
+        Ok(actual_len)
+    }
+
+    #[inline(never)]
+    fn encode_fallback_slot(&mut self, value: &Bound<'py, PyAny>) -> PyResult<()> {
+        self.encode(value)
+    }
+
+    #[inline(never)]
+    fn encode_list_slot(&mut self, slot: &Slot, value: &Bound<'py, PyAny>) -> PyResult<()> {
+        if slot.list_plan.get().is_none() {
+            let plans = self.build_list_plans(value.py(), slot)?;
+            let _ = slot.list_plan.set(Some(plans));
+        }
+        let plans = match slot.list_plan.get().and_then(|plans| plans.as_ref()) {
+            Some(plans) => plans.as_slice(),
+            None => &[],
+        };
+        let list = value.cast::<PyList>()?;
+        self.encode_container(Token::ArrayStart(list.len()), |encoder| {
+            for item in list.iter() {
+                let key = item.get_type().as_ptr() as usize;
+                if let Some((_, layout)) = plans.iter().find(|(ty, _)| *ty == key) {
+                    encoder.encode_struct(&item, layout)?;
+                } else {
+                    encoder.encode(&item)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn build_list_plans(
+        &mut self,
+        py: Python<'py>,
+        slot: &Slot,
+    ) -> PyResult<Vec<(usize, Rc<StructLayout>)>> {
+        let Some(annotation) = &slot.list_annotation else {
+            return Ok(Vec::new());
+        };
+        let mut plans = Vec::new();
+        for ty in type_args(annotation.bind(py))? {
+            if !is_struct_class(&ty)? {
+                continue;
+            }
+            let layout = self.cached_layout(ty.cast::<PyType>()?, false)?;
+            plans.push((ty.as_ptr() as usize, layout));
+        }
+        Ok(plans)
+    }
+
+    #[inline(always)]
+    fn encode_slot_hint(&mut self, slot: &Slot, value: &Bound<'py, PyAny>) -> PyResult<bool> {
+        if slot.hint_type != Some(value.get_type().as_ptr() as usize) {
+            if slot.optional && value.is_none() {
+                self.writer.write_null();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        match slot.hint {
+            FieldHint::Str => {
+                self.writer
+                    .write_str(py_string_value(value.cast::<PyString>()?)?);
+            }
+            FieldHint::Int => match int_token(value) {
+                Ok(IntegerToken::Int(int)) => self.writer.write_int(int),
+                Ok(IntegerToken::UInt(int)) => self.writer.write_uint(int),
+                Err(_) if W::BIG_INTEGERS => {
+                    return self.encode_big_integer::<false>(value).map(|()| true);
+                }
+                Err(err) => return Err(err),
+            },
+            FieldHint::Float => {
+                self.writer.write_float(value.extract()?);
+            }
+            FieldHint::Bool => {
+                self.writer.write_bool(value.extract()?);
+            }
+            FieldHint::DateTime | FieldHint::Date | FieldHint::Time | FieldHint::TimeDelta => {
+                return self.encode_temporal_slot(slot.hint, value).map(|()| true);
+            }
+            FieldHint::Enum => {
+                let value = self.enum_value(value)?;
+                if value.is_exact_instance_of::<PyString>() {
+                    self.writer
+                        .write_str(py_string_value(value.cast::<PyString>()?)?);
+                } else {
+                    self.encode(&value)?;
+                }
+                return Ok(true);
+            }
+            FieldHint::List => {
+                return self.encode_list_slot(slot, value).map(|()| true);
+            }
+            FieldHint::Any => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn is_omitted_slot_field(
+        &self,
+        settings: &StructSettings,
+        slot: &Slot,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<bool> {
+        if slot.accepts_unset && value.is(unset(value.py())?) {
+            return Ok(true);
+        }
+        if !settings.omit_defaults || slot.default.is_none() {
+            return Ok(false);
+        }
+        if slot.default_is_none {
+            return Ok(value.is_none());
+        }
+        let default = slot
+            .default
+            .as_ref()
+            .map(|default| default.bind(value.py()));
+        let Some(default) = default else {
+            return Ok(false);
+        };
+        if slot.default_is_factory {
+            if slot.default_is_empty_container {
+                return Ok(value.get_type().is(default) && value.len()? == 0);
+            }
+            let value = value.clone();
+            let default = default.call0()?;
+            return Ok(value.get_type().is(default.get_type()) && value.eq(&default)?);
+        }
+        if slot.default_type != Some(value.get_type().as_ptr() as usize) {
+            return Ok(false);
+        }
+        if value.is(default) {
+            return Ok(true);
+        }
+        let value = value.clone();
+        value.eq(default)
     }
 
     #[inline(never)]
@@ -644,13 +973,6 @@ fn is_omitted_field(
     Ok(value.get_type().is(default.get_type()) && value.eq(&default)?)
 }
 
-fn is_empty_container_type(factory: &Bound<'_, PyAny>) -> bool {
-    is_type::<PyList>(factory)
-        || is_type::<PyDict>(factory)
-        || is_type::<PySet>(factory)
-        || is_type::<PyByteArray>(factory)
-}
-
 pub(crate) fn untyped_plan(py: Python<'_>) -> PyResult<&'static Plan> {
     static PLAN: PyOnceLock<Plan> = PyOnceLock::new();
     PLAN.get_or_try_init(py, || Plan::compile(any(py)?, false, false))
@@ -664,18 +986,34 @@ pub(crate) fn encode_object<'py, W: Writer>(
     order: Order,
     uuid_format: UuidFormat,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let (result, encoded) = encode_partial::<W>(py, obj, hook, decimal_format, order, uuid_format);
-    result?;
-    Ok(PyBytes::new(py, &encoded))
+    let layouts = LayoutCache::default();
+    encode_object_cached::<W>(py, obj, hook, decimal_format, order, uuid_format, &layouts)
 }
 
-pub(crate) fn encode_partial<'py, W: Writer>(
+pub(crate) fn encode_object_cached<'py, W: Writer>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
     hook: &Hook,
     decimal_format: &DecimalFormat,
     order: Order,
     uuid_format: UuidFormat,
+    layouts: &LayoutCache,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (result, encoded) =
+        encode_partial_cached::<W>(py, obj, hook, decimal_format, order, uuid_format, layouts);
+    let bytes = result.map(|()| PyBytes::new(py, &encoded));
+    W::recycle_output(encoded);
+    bytes
+}
+
+pub(crate) fn encode_partial_cached<'py, W: Writer>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    hook: &Hook,
+    decimal_format: &DecimalFormat,
+    order: Order,
+    uuid_format: UuidFormat,
+    layouts: &LayoutCache,
 ) -> (PyResult<()>, Vec<u8>) {
     let depth_left = match recursion_limit(py) {
         Ok(limit) => limit,
@@ -686,22 +1024,24 @@ pub(crate) fn encode_partial<'py, W: Writer>(
         depth_left,
         hook: hook.bind(py),
         decimal_format,
+        layouts,
         order,
         uuid_format,
         encoding_decimal_replacement: false,
         kinds: RuneMap::default(),
         enum_values: RuneMap::default(),
         pending_fields: Vec::new(),
+        type_cache: std::array::from_fn(|_| (0, Kind::Null)),
     };
     let result = encoder.encode(obj);
     (result, encoder.writer.finish())
 }
 
-pub(crate) fn write_into_buffer<'py>(
+pub(crate) fn write_into_buffer<'py, W: Writer>(
     py: Python<'py>,
     buffer: &Bound<'py, PyByteArray>,
     offset: isize,
-    encoded: &[u8],
+    encoded: Vec<u8>,
 ) -> PyResult<()> {
     let len = buffer.len();
     let start = usize::try_from(offset).unwrap_or(len);
@@ -711,14 +1051,21 @@ pub(crate) fn write_into_buffer<'py>(
     }
     buffer.set_item(
         PySlice::new(py, start as isize, isize::MAX, 1),
-        PyBytes::new(py, encoded),
-    )
+        PyBytes::new(py, &encoded),
+    )?;
+    W::recycle_output(encoded);
+    Ok(())
 }
 
-pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<Token<'static>> {
+pub(crate) enum IntegerToken {
+    Int(i64),
+    UInt(u64),
+}
+
+pub(crate) fn int_token(obj: &Bound<'_, PyAny>) -> PyResult<IntegerToken> {
     obj.extract::<i64>()
-        .map(Token::Int)
-        .or_else(|_| obj.extract::<u64>().map(Token::UInt))
+        .map(IntegerToken::Int)
+        .or_else(|_| obj.extract::<u64>().map(IntegerToken::UInt))
         .map_err(|_| {
             PyOverflowError::new_err("Integer is out of range for this encoder (64-bit only)")
         })

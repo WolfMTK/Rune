@@ -3,13 +3,14 @@ use std::borrow::Cow;
 use crate::{
     common::{
         macros::big_endian_readers,
-        reader::{Key, Reader, kind},
+        reader::{Key, Reader, Text, kind},
         structures::{
             cursor::Cursor,
             enums::{Scalar, Value},
         },
+        writer::take_buffer,
     },
-    constants::{INITIAL_CAPACITY, MSGPACK_STRING as STRING},
+    constants::MSGPACK_STRING as STRING,
     exceptions::ParseError,
     msgpack::{
         enums::Container,
@@ -27,6 +28,7 @@ impl<'a> Parser<'a> {
         })
     }
 
+    #[inline(always)]
     fn peek_bytes(&self, offset: usize, len: usize) -> Result<&'a [u8], ParseError> {
         let start = self.position + offset;
         start
@@ -35,12 +37,14 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| truncated(self.position))
     }
 
+    #[inline(always)]
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ParseError> {
         let bytes = self.peek_bytes(0, len)?;
         self.position += len;
         Ok(bytes)
     }
 
+    #[inline(always)]
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {
         let mut out = [0u8; N];
         out.copy_from_slice(self.read_bytes(N)?);
@@ -62,7 +66,7 @@ impl<'a> Parser<'a> {
 
     fn parse_scalar(&mut self, tag: u8) -> Result<Scalar<'a>, ParseError> {
         if let Some(string) = self.read_string(tag)? {
-            return Ok(Scalar::Str(Cow::Borrowed(string)));
+            return Ok(Scalar::Str(string));
         }
         match tag {
             0x00..=0x7f => Ok(Scalar::Int(tag.into())),
@@ -105,7 +109,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn read_string(&mut self, tag: u8) -> Result<Option<&'a str>, ParseError> {
+    #[inline(always)]
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn read_string(&mut self, tag: u8) -> Result<Option<Text<'a>>, ParseError> {
         let len = match tag {
             0xa0..=0xbf => usize::from(tag & 0x1f),
             0xd9 => usize::from(self.read_u8()?),
@@ -114,7 +120,13 @@ impl<'a> Parser<'a> {
             _ => return Ok(None),
         };
         let bytes = self.read_bytes(len)?;
+        if bytes.is_ascii() {
+            return Ok(Some(Text::BorrowedAscii(unsafe {
+                std::str::from_utf8_unchecked(bytes)
+            })));
+        }
         std::str::from_utf8(bytes)
+            .map(Text::Borrowed)
             .map(Some)
             .map_err(|_| self.error("Invalid UTF-8 in string"))
     }
@@ -150,6 +162,7 @@ impl<'a> Parser<'a> {
 impl<'a> Reader<'a> for Parser<'a> {
     const BINARY: bool = true;
 
+    #[inline(always)]
     fn peek_kind(&mut self) -> Result<u16, ParseError> {
         Ok(match self.peek_bytes(0, 1)?[0] {
             0x00..=0x7f | 0xcc..=0xd3 | 0xe0..=0xff => kind::INT,
@@ -168,6 +181,23 @@ impl<'a> Reader<'a> for Parser<'a> {
     fn read_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
         let tag = self.read_u8()?;
         self.parse_scalar(tag)
+    }
+
+    #[inline(always)]
+    fn read_string(&mut self) -> Result<Text<'a>, ParseError> {
+        let tag = self.read_u8()?;
+        self.read_string(tag)?
+            .ok_or_else(|| self.error("Expected str"))
+    }
+
+    #[inline(always)]
+    fn read_integer(&mut self) -> Result<Option<Scalar<'a>>, ParseError> {
+        let tag = self.peek_bytes(0, 1)?[0];
+        if !matches!(tag, 0x00..=0x7f | 0xca..=0xd3 | 0xe0..=0xff) {
+            return Ok(None);
+        }
+        self.position += 1;
+        self.parse_scalar(tag).map(Some)
     }
 
     fn read_value(&mut self) -> Result<Value<'a>, ParseError> {
@@ -195,10 +225,12 @@ impl<'a> Reader<'a> for Parser<'a> {
         }
     }
 
+    #[inline(always)]
     fn has_next_item(&mut self, len: Option<usize>, index: usize) -> Result<bool, ParseError> {
         Ok(len.is_some_and(|len| index < len))
     }
 
+    #[inline(always)]
     fn next_key(
         &mut self,
         len: Option<usize>,
@@ -215,7 +247,7 @@ impl<'a> Reader<'a> for Parser<'a> {
         let Some(key) = self.read_string(tag)? else {
             unreachable!("tag is checked as a string above")
         };
-        Ok(Some(Key::Text(Cow::Borrowed(key))))
+        Ok(Some(Key::Text(key)))
     }
 }
 
@@ -233,16 +265,29 @@ pub(crate) struct MsgpackWriter {
 
 impl Default for MsgpackWriter {
     fn default() -> Self {
-        Self {
-            out: Vec::with_capacity(INITIAL_CAPACITY),
-        }
+        Self { out: take_buffer() }
     }
 }
 
 impl MsgpackWriter {
+    pub(crate) fn encoded_string(value: &str) -> Box<[u8]> {
+        let mut writer = Self {
+            out: Vec::with_capacity(value.len() + 5),
+        };
+        writer.write_string(value);
+        writer.out.into_boxed_slice()
+    }
+
+    #[allow(clippy::undocumented_unsafe_blocks)]
     pub(crate) fn write_tagged(&mut self, tag: u8, payload: &[u8]) {
-        self.out.push(tag);
-        self.out.extend_from_slice(payload);
+        self.out.reserve(payload.len() + 1);
+        let len = self.out.len();
+        unsafe {
+            let destination = self.out.as_mut_ptr().add(len);
+            destination.write(tag);
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), destination.add(1), payload.len());
+            self.out.set_len(len + payload.len() + 1);
+        }
     }
 
     pub(crate) fn write_signed(&mut self, value: i64) {
@@ -275,7 +320,9 @@ impl MsgpackWriter {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn write_string(&mut self, value: &str) {
+        self.out.reserve(value.len() + 5);
         self.write_length(value.len(), &STRING);
         self.out.extend_from_slice(value.as_bytes());
     }
@@ -292,6 +339,7 @@ impl MsgpackWriter {
         self.out.extend_from_slice(value);
     }
 
+    #[inline(always)]
     pub(crate) fn write_length(&mut self, len: usize, markers: &LengthMarkers) {
         if len <= markers.fixed_max {
             self.out.push(markers.fixed | len as u8);

@@ -12,6 +12,7 @@ use crate::common::{
 };
 
 impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
+    #[inline(always)]
     pub(crate) fn decode_union(&mut self, union: &UnionPlan) -> Decoded<'py> {
         let py = self.py;
         let found = self.wire.peek_kind()?;
@@ -30,14 +31,16 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         }
         let tagged_group = match union.tagged.first() {
             Some(&first) => {
-                let group = TagGroup {
-                    members: &union.tagged,
-                    lookup: union.tag_lookup.as_ref().map(|lookup| lookup.bind(py)),
-                    tag_index: union.tag_index.as_ref(),
-                    optional_tag: false,
-                };
-                if let Some(value) = self.decode_tagged(&group, found)? {
-                    return Ok(value);
+                if union.tagged_kinds & found != 0 {
+                    let group = TagGroup {
+                        members: &union.tagged,
+                        lookup: union.tag_lookup.as_ref().map(|lookup| lookup.bind(py)),
+                        tag_index: union.tag_index.as_ref(),
+                        optional_tag: false,
+                    };
+                    if let Some(value) = self.decode_tagged(&group, found)? {
+                        return Ok(value);
+                    }
                 }
                 Some(if self.plan.struct_plan(first).array_like {
                     "array"
@@ -47,6 +50,18 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             }
             None => None,
         };
+        self.decode_union_remainder(union, found, start, tagged_group)
+    }
+
+    #[inline(never)]
+    fn decode_union_remainder(
+        &mut self,
+        union: &UnionPlan,
+        found: u16,
+        start: crate::common::structures::cursor::Checkpoint,
+        tagged_group: Option<&'static str>,
+    ) -> Decoded<'py> {
+        let py = self.py;
         let mut only_literals = union.tagged.is_empty();
         let plan = self.plan;
         let defer_decimal = found & (kind::INT | kind::FLOAT) != 0;

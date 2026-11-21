@@ -479,10 +479,23 @@ impl<'py> Compiler<'py> {
         } else {
             self.build_tag_index(&members)?
         };
+        let tagged: Vec<NodeId> = members.iter().map(|member| member.node).collect();
+        let tagged_kinds = tagged
+            .iter()
+            .fold(0, |mask, &node| mask | self.nodes[node].accepted_kinds);
+        let accepted_kinds = plain
+            .iter()
+            .map(|member| member.node)
+            .chain(tagged.iter().copied())
+            .fold(if accepts_none { kind::NULL } else { 0 }, |mask, node| {
+                mask | self.nodes[node].accepted_kinds
+            });
         Ok(UnionPlan {
             accepts_none,
+            accepted_kinds,
+            tagged_kinds,
             plain,
-            tagged: members.iter().map(|member| member.node).collect(),
+            tagged,
             tag_index,
             tag_lookup,
         })
@@ -512,7 +525,7 @@ impl<'py> Compiler<'py> {
                 Insertion::Duplicate | Insertion::Unsupported => return Ok(None),
             }
         }
-        Ok(Some(index))
+        Ok(Some(index.finish()))
     }
 
     fn compile_all(&mut self, types: &[Bound<'py, PyAny>]) -> PyResult<Vec<NodeId>> {

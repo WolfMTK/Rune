@@ -1,21 +1,18 @@
-use std::borrow::Cow;
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use json::writer::{write_float, write_integer};
 
 use crate::{
     common::{
-        reader::{Key, Reader, kind},
+        reader::{Key, PooledString, Reader, Text, kind, owned_string},
         structures::{
             cursor::Cursor,
             enums::{Scalar, Token, Value},
         },
-        writer::Writer,
+        writer::{Writer, recycle_buffer, take_buffer},
     },
-    constants::INITIAL_CAPACITY,
     exceptions::ParseError,
     json,
-    json::{helpers::plain_prefix_len, writer::write_escaped},
+    json::{helpers::plain_prefix, writer::write_escaped},
 };
 
 pub(crate) struct JsonWriter {
@@ -26,13 +23,22 @@ pub(crate) struct JsonWriter {
 impl Default for JsonWriter {
     fn default() -> Self {
         Self {
-            out: Vec::with_capacity(INITIAL_CAPACITY),
+            out: take_buffer(),
             needs_separator: false,
         }
     }
 }
 
 impl JsonWriter {
+    #[inline(always)]
+    fn begin_value(&mut self) {
+        if self.needs_separator {
+            self.out.push(b',');
+        }
+        self.needs_separator = true;
+    }
+
+    #[inline(always)]
     pub(crate) fn write_token(&mut self, token: Token<'_>) {
         match token {
             Token::Float(value) if value.is_finite() => write_float(&mut self.out, value),
@@ -56,7 +62,59 @@ impl JsonWriter {
 impl Writer for JsonWriter {
     const BINARY: bool = false;
     const BIG_INTEGERS: bool = true;
+    const STREAMING: bool = true;
 
+    #[inline(always)]
+    fn write_str(&mut self, value: &str) {
+        self.begin_value();
+        write_escaped(&mut self.out, value);
+    }
+
+    #[inline(always)]
+    fn write_int(&mut self, value: i64) {
+        self.begin_value();
+        write_integer(&mut self.out, value);
+    }
+
+    #[inline(always)]
+    fn write_uint(&mut self, value: u64) {
+        self.begin_value();
+        write_integer(&mut self.out, value);
+    }
+
+    fn write_bool(&mut self, value: bool) {
+        self.begin_value();
+        self.out
+            .extend_from_slice(if value { b"true" } else { b"false" });
+    }
+
+    fn write_float(&mut self, value: f64) {
+        self.begin_value();
+        if value.is_finite() {
+            write_float(&mut self.out, value);
+        } else {
+            self.out.extend_from_slice(b"null");
+        }
+    }
+
+    fn write_null(&mut self) {
+        self.begin_value();
+        self.out.extend_from_slice(b"null");
+    }
+
+    #[inline(always)]
+    fn write_temporal(&mut self, text: &str) {
+        self.out.reserve(text.len() + 3);
+        if self.needs_separator {
+            json::writer::push_byte_reserved(&mut self.out, b',');
+        }
+        self.needs_separator = true;
+        json::writer::push_byte_reserved(&mut self.out, b'"');
+        json::writer::push_bytes_reserved(&mut self.out, text.as_bytes());
+        json::writer::push_byte_reserved(&mut self.out, b'"');
+    }
+
+    #[inline(always)]
     fn write(&mut self, token: Token<'_>) {
         if self.needs_separator && !matches!(token, Token::ArrayEnd | Token::MapEnd) {
             self.out.push(b',');
@@ -81,6 +139,53 @@ impl Writer for JsonWriter {
         self.needs_separator = false;
     }
 
+    #[inline(always)]
+    fn write_str_key(&mut self, value: &str) {
+        if self.needs_separator {
+            self.out.push(b',');
+        }
+        write_escaped(&mut self.out, value);
+        self.out.push(b':');
+        self.needs_separator = false;
+    }
+
+    fn write_key_unescaped(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        self.out.reserve(bytes.len() + 4);
+        if self.needs_separator {
+            self.out.push(b',');
+        }
+        self.out.push(b'"');
+        self.out.extend_from_slice(bytes);
+        self.out.push(b'"');
+        self.out.push(b':');
+        self.needs_separator = false;
+    }
+
+    #[inline(always)]
+    fn write_key_bytes(&mut self, name: &str, encoded: Option<&[u8]>) {
+        let Some(bytes) = encoded else {
+            self.write_key_unescaped(name);
+            return;
+        };
+        self.out.reserve(bytes.len() + 1);
+        if self.needs_separator {
+            json::writer::push_byte_reserved(&mut self.out, b',');
+        }
+        json::writer::push_bytes_reserved(&mut self.out, bytes);
+        self.needs_separator = false;
+    }
+
+    #[inline(always)]
+    fn write_struct_prefix(&mut self, prefix: &[u8]) {
+        self.out.reserve(prefix.len() + 1);
+        if self.needs_separator {
+            json::writer::push_byte_reserved(&mut self.out, b',');
+        }
+        json::writer::push_bytes_reserved(&mut self.out, prefix);
+        self.needs_separator = true;
+    }
+
     fn write_decimal(&mut self, text: &str, as_key: bool) {
         let is_finite = text.ends_with(|c: char| c.is_ascii_digit());
         if as_key {
@@ -103,7 +208,13 @@ impl Writer for JsonWriter {
         }
         self.needs_separator = true;
         self.out.push(b'"');
-        self.out.extend_from_slice(STANDARD.encode(data).as_bytes());
+        let start = self.out.len();
+        let encoded_len = data.len().div_ceil(3) * 4;
+        self.out.resize(start + encoded_len, 0);
+        if STANDARD.encode_slice(data, &mut self.out[start..]).is_err() {
+            self.out.truncate(start);
+            self.out.extend_from_slice(STANDARD.encode(data).as_bytes());
+        }
         self.out.push(b'"');
     }
 
@@ -123,11 +234,25 @@ impl Writer for JsonWriter {
     fn finish(self) -> Vec<u8> {
         self.out
     }
+
+    fn recycle_output(output: Vec<u8>) {
+        recycle_buffer(output);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScannedNumber {
+    start: usize,
+    end: usize,
+    negative: bool,
+    magnitude: Option<u64>,
+    is_float: bool,
 }
 
 pub(crate) struct Parser<'a> {
     pub(crate) text: &'a str,
     pub(crate) cursor: Cursor<'a>,
+    number: Option<ScannedNumber>,
 }
 
 impl<'a> Parser<'a> {
@@ -137,6 +262,7 @@ impl<'a> Parser<'a> {
         Ok(Self {
             text,
             cursor: Cursor::new(input, max_depth),
+            number: None,
         })
     }
 
@@ -196,16 +322,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn number_has_fraction(&self) -> bool {
-        let rest = self.rest();
-        let sign = usize::from(rest.first() == Some(&b'-'));
-        let digits = rest[sign..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        matches!(rest.get(sign + digits), Some(b'.' | b'e' | b'E'))
-    }
-
+    #[inline(always)]
     pub(super) fn parse_scalar(&mut self) -> Result<Scalar<'a>, ParseError> {
         match self.peek() {
             None => Err(self.error("truncated")),
@@ -239,15 +356,21 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<Scalar<'a>, ParseError> {
         let start = self.position;
-        let (negative, magnitude, is_float) = self.scan_number()?;
-        if is_float {
-            return self.text[start..self.position]
+        let number = match self.number.take() {
+            Some(number) if number.start == start => {
+                self.position = number.end;
+                number
+            }
+            _ => self.scan_number()?,
+        };
+        if number.is_float {
+            return self.text[number.start..number.end]
                 .parse()
                 .map(Scalar::Float)
                 .map_err(|_| self.error("invalid number"));
         }
-        if let Some(magnitude) = magnitude {
-            let value = if negative {
+        if let Some(magnitude) = number.magnitude {
+            let value = if number.negative {
                 0i64.checked_sub_unsigned(magnitude)
             } else {
                 i64::try_from(magnitude).ok()
@@ -255,15 +378,16 @@ impl<'a> Parser<'a> {
             if let Some(value) = value {
                 return Ok(Scalar::Int(value));
             }
-            if !negative {
+            if !number.negative {
                 return Ok(Scalar::UInt(magnitude));
             }
         }
-        Ok(Scalar::BigInt(&self.text[start..self.position]))
+        Ok(Scalar::BigInt(&self.text[number.start..number.end]))
     }
 
     #[inline(always)]
-    fn scan_number(&mut self) -> Result<(bool, Option<u64>, bool), ParseError> {
+    fn scan_number(&mut self) -> Result<ScannedNumber, ParseError> {
+        let start = self.position;
         let negative = self.consume(b'-');
         if negative && !matches!(self.peek(), Some(b'0'..=b'9')) {
             return Err(match self.peek() {
@@ -272,38 +396,72 @@ impl<'a> Parser<'a> {
             });
         }
         let digits_start = self.position;
-        let magnitude = self.parse_digits()?;
+        let magnitude = self.parse_integer_digits()?;
         if self.bytes[digits_start] == b'0' && self.position - digits_start > 1 {
             return Err(self.error("invalid number"));
         }
         let has_fraction = self.consume(b'.');
         if has_fraction {
-            self.parse_digits()?;
+            self.skip_digits()?;
         }
         let has_exponent = self.consume(b'e') || self.consume(b'E');
         if has_exponent {
             let _ = self.consume(b'+') || self.consume(b'-');
-            self.parse_digits()?;
+            self.skip_digits()?;
         }
-        Ok((negative, magnitude, has_fraction || has_exponent))
+        Ok(ScannedNumber {
+            start,
+            end: self.position,
+            negative,
+            magnitude,
+            is_float: has_fraction || has_exponent,
+        })
     }
 
-    fn parse_digits(&mut self) -> Result<Option<u64>, ParseError> {
-        let start = self.position;
-        let mut value = Some(0u64);
-        while let Some(byte @ b'0'..=b'9') = self.peek() {
-            value = value
-                .and_then(|v| v.checked_mul(10))
-                .and_then(|v| v.checked_add(u64::from(byte - b'0')));
-            self.position += 1;
+    fn parse_integer_digits(&mut self) -> Result<Option<u64>, ParseError> {
+        let rest = self.rest();
+        let safe = rest.len().min(19);
+        let mut digits = 0;
+        let mut value = 0u64;
+        while digits < safe && rest[digits].is_ascii_digit() {
+            value = value * 10 + u64::from(rest[digits] - b'0');
+            digits += 1;
         }
-        if self.position == start {
+        if digits == 0 {
             return Err(self.error("invalid number"));
         }
-        Ok(value)
+        if digits < safe || safe == rest.len() || !rest[digits].is_ascii_digit() {
+            self.position += digits;
+            return Ok(Some(value));
+        }
+        let remaining = rest[digits..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let magnitude = rest[digits..digits + remaining]
+            .iter()
+            .try_fold(value, |value, byte| {
+                value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))
+            });
+        self.position += digits + remaining;
+        Ok(magnitude)
     }
 
-    fn parse_key(&mut self) -> Result<Cow<'a, str>, ParseError> {
+    fn skip_digits(&mut self) -> Result<(), ParseError> {
+        let digits = self
+            .rest()
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return Err(self.error("invalid number"));
+        }
+        self.position += digits;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn parse_key(&mut self) -> Result<Text<'a>, ParseError> {
         self.skip_whitespace();
         match self.peek() {
             Some(b'"') => {}
@@ -317,29 +475,49 @@ impl<'a> Parser<'a> {
         Ok(key)
     }
 
-    fn parse_string(&mut self) -> Result<Cow<'a, str>, ParseError> {
+    #[inline(always)]
+    fn parse_string(&mut self) -> Result<Text<'a>, ParseError> {
         self.position += 1;
-        let mut out = Cow::Borrowed("");
-        loop {
-            let start = self.position;
-            self.position += plain_prefix_len(self.rest());
-            let chunk = &self.text[start..self.position];
-            if out.is_empty() {
-                out = Cow::Borrowed(chunk);
-            } else {
-                out.to_mut().push_str(chunk);
+        let start = self.position;
+        let (prefix, mut ascii) = plain_prefix(self.rest());
+        self.position += prefix;
+        let first = &self.text[start..self.position];
+        match self.peek() {
+            Some(b'"') => {
+                self.position += 1;
+                return Ok(if ascii {
+                    Text::BorrowedAscii(first)
+                } else {
+                    Text::Borrowed(first)
+                });
             }
+            None => return Err(self.error("truncated")),
+            Some(b'\\') => {}
+            Some(_) => return Err(self.error("invalid character")),
+        }
+        let mut out = owned_string(first.len() + 8);
+        out.push_str(first);
+        loop {
+            self.position += 1;
+            let escaped = self.parse_escape()?;
+            ascii &= escaped.is_ascii();
+            out.push(escaped);
+            let start = self.position;
+            let (prefix, plain_ascii) = plain_prefix(self.rest());
+            ascii &= plain_ascii;
+            self.position += prefix;
+            out.push_str(&self.text[start..self.position]);
             match self.peek() {
                 None => return Err(self.error("truncated")),
                 Some(b'"') => {
                     self.position += 1;
-                    return Ok(out);
+                    return Ok(if ascii {
+                        Text::OwnedAscii(PooledString(out))
+                    } else {
+                        Text::Owned(PooledString(out))
+                    });
                 }
-                Some(b'\\') => {
-                    self.position += 1;
-                    let unescaped = self.parse_escape()?;
-                    out.to_mut().push(unescaped);
-                }
+                Some(b'\\') => {}
                 Some(_) => return Err(self.error("invalid character")),
             }
         }
@@ -412,6 +590,7 @@ impl<'a> Reader<'a> for Parser<'a> {
         Parser::error(self, message)
     }
 
+    #[inline(always)]
     fn peek_kind(&mut self) -> Result<u16, ParseError> {
         self.skip_whitespace();
         match self.peek() {
@@ -420,8 +599,23 @@ impl<'a> Reader<'a> for Parser<'a> {
             Some(b'"') => Ok(kind::STR),
             Some(b'n') => Ok(kind::NULL),
             Some(b't' | b'f') => Ok(kind::BOOL),
-            Some(b'-' | b'0'..=b'9') if self.number_has_fraction() => Ok(kind::FLOAT),
-            Some(b'-' | b'0'..=b'9') => Ok(kind::INT),
+            Some(b'-' | b'0'..=b'9') => {
+                let start = self.position;
+                let number = match self.number {
+                    Some(number) if number.start == start => number,
+                    _ => {
+                        let number = self.scan_number()?;
+                        self.number = Some(number);
+                        self.position = start;
+                        number
+                    }
+                };
+                Ok(if number.is_float {
+                    kind::FLOAT
+                } else {
+                    kind::INT
+                })
+            }
             None => Err(self.error("truncated")),
             Some(_) => Err(self.error("invalid character")),
         }
@@ -431,14 +625,32 @@ impl<'a> Reader<'a> for Parser<'a> {
         self.parse_scalar()
     }
 
+    #[inline(always)]
+    fn read_string(&mut self) -> Result<Text<'a>, ParseError> {
+        self.parse_string()
+    }
+
+    #[inline(always)]
+    fn read_integer(&mut self) -> Result<Option<Scalar<'a>>, ParseError> {
+        self.skip_whitespace();
+        if matches!(self.peek(), Some(b'-' | b'0'..=b'9')) {
+            return self.parse_number().map(Some);
+        }
+        Ok(None)
+    }
+
     fn read_number_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         self.skip_whitespace();
         if !matches!(self.peek(), Some(b'-' | b'0'..=b'9')) {
             return Ok(None);
         }
         let start = self.position;
-        self.scan_number()?;
-        Ok(Some(&self.text[start..self.position]))
+        let end = match self.number.take() {
+            Some(number) if number.start == start => number.end,
+            _ => self.scan_number()?.end,
+        };
+        self.position = end;
+        Ok(Some(&self.text[start..end]))
     }
 
     fn skip_leading_whitespace(&mut self) {
@@ -478,7 +690,7 @@ impl<'a> Reader<'a> for Parser<'a> {
         )
     }
 
-    #[inline]
+    #[inline(always)]
     fn next_key(
         &mut self,
         _len: Option<usize>,

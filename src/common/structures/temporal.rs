@@ -1,5 +1,7 @@
+use std::ptr;
+
 use pyo3::{
-    Bound, Py, PyAny, PyResult, Python, intern,
+    Bound, Py, PyAny, PyResult, Python, ffi, intern,
     prelude::PyDictMethods,
     sync::PyOnceLock,
     types::{
@@ -149,6 +151,9 @@ pub(crate) fn timedelta_from_text<'py>(py: Python<'py>, text: &str) -> Outcome<B
 }
 
 pub(crate) fn fixed_timezone<'py>(py: Python<'py>, minutes: i32) -> PyResult<Bound<'py, PyTzInfo>> {
+    if minutes == 0 {
+        return PyTzInfo::utc(py).map(|value| value.to_owned());
+    }
     static CACHE: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
     let cache = CACHE.get_or_init(py, || PyDict::new(py).unbind()).bind(py);
     if let Some(tzinfo) = cache.get_item(minutes)? {
@@ -160,62 +165,96 @@ pub(crate) fn fixed_timezone<'py>(py: Python<'py>, minutes: i32) -> PyResult<Bou
 }
 
 pub(crate) fn temporal_text(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    let mut storage = [0_u8; 40];
+    let mut buf = datetime_format::TextBuf::new(&mut storage);
+    temporal_text_into(obj, &mut buf)?;
+    Ok(buf.as_str().to_owned())
+}
+
+#[inline]
+pub(crate) fn temporal_text_into(
+    obj: &Bound<'_, PyAny>,
+    buf: &mut datetime_format::TextBuf<'_>,
+) -> PyResult<()> {
     let py = obj.py();
     let ty = obj.get_type();
     if ty.is(datetime(py)?) {
-        let value = obj.cast::<PyDateTime>()?;
-        let date_text =
-            datetime_format::format_date(value.get_year(), value.get_month(), value.get_day());
-        let time_text = datetime_format::format_time(
-            value.get_hour(),
-            value.get_minute(),
-            value.get_second(),
-            value.get_microsecond(),
-            utcoffset_minutes(obj)?,
-        );
-        Ok(format!("{date_text}T{time_text}"))
+        datetime_text_into(obj, buf)
     } else if ty.is(date(py)?) {
-        let value = obj.cast::<PyDate>()?;
-        Ok(datetime_format::format_date(
-            value.get_year(),
-            value.get_month(),
-            value.get_day(),
-        ))
+        date_text_into(obj, buf)
     } else if ty.is(time(py)?) {
-        let value = obj.cast::<PyTime>()?;
-        Ok(datetime_format::format_time(
-            value.get_hour(),
-            value.get_minute(),
-            value.get_second(),
-            value.get_microsecond(),
-            utcoffset_minutes(obj)?,
-        ))
+        time_text_into(obj, buf)
     } else {
-        let value = obj.cast::<PyDelta>()?;
-        Ok(datetime_format::format_duration(
-            datetime_format::total_micros(
-                value.get_days(),
-                value.get_seconds(),
-                value.get_microseconds(),
-            ),
-        ))
+        timedelta_text_into(obj, buf)
     }
+}
+
+pub(crate) fn datetime_text_into(
+    obj: &Bound<'_, PyAny>,
+    buf: &mut datetime_format::TextBuf<'_>,
+) -> PyResult<()> {
+    let value = obj.cast::<PyDateTime>()?;
+    datetime_format::write_date_text(buf, value.get_year(), value.get_month(), value.get_day());
+    buf.push(b'T');
+    datetime_format::write_time_text(
+        buf,
+        value.get_hour(),
+        value.get_minute(),
+        value.get_second(),
+        value.get_microsecond(),
+        utcoffset_minutes(obj, DATETIME_TZINFO_OFFSET)?,
+    );
+    Ok(())
+}
+
+pub(crate) fn date_text_into(
+    obj: &Bound<'_, PyAny>,
+    buf: &mut datetime_format::TextBuf<'_>,
+) -> PyResult<()> {
+    let value = obj.cast::<PyDate>()?;
+    datetime_format::write_date_text(buf, value.get_year(), value.get_month(), value.get_day());
+    Ok(())
+}
+
+pub(crate) fn time_text_into(
+    obj: &Bound<'_, PyAny>,
+    buf: &mut datetime_format::TextBuf<'_>,
+) -> PyResult<()> {
+    let value = obj.cast::<PyTime>()?;
+    datetime_format::write_time_text(
+        buf,
+        value.get_hour(),
+        value.get_minute(),
+        value.get_second(),
+        value.get_microsecond(),
+        utcoffset_minutes(obj, TIME_TZINFO_OFFSET)?,
+    );
+    Ok(())
+}
+
+pub(crate) fn timedelta_text_into(
+    obj: &Bound<'_, PyAny>,
+    buf: &mut datetime_format::TextBuf<'_>,
+) -> PyResult<()> {
+    let value = obj.cast::<PyDelta>()?;
+    datetime_format::write_duration_text(
+        buf,
+        datetime_format::total_micros(
+            value.get_days(),
+            value.get_seconds(),
+            value.get_microseconds(),
+        ),
+    );
+    Ok(())
 }
 
 pub(crate) fn epoch_micros(obj: &Bound<'_, PyAny>) -> PyResult<Option<i128>> {
     let Ok(value) = obj.cast_exact::<PyDateTime>() else {
         return Ok(None);
     };
-    let offset = obj.call_method0(intern!(obj.py(), "utcoffset"))?;
-    if offset.is_none() {
+    let Some(offset_micros) = utcoffset_micros(obj, DATETIME_TZINFO_OFFSET)? else {
         return Ok(None);
-    }
-    let delta = offset.cast::<PyDelta>()?;
-    let offset_micros = datetime_format::total_micros(
-        delta.get_days(),
-        delta.get_seconds(),
-        delta.get_microseconds(),
-    );
+    };
     let days =
         datetime_format::days_from_civil(value.get_year(), value.get_month(), value.get_day());
     Ok(Some(
@@ -227,18 +266,80 @@ pub(crate) fn epoch_micros(obj: &Bound<'_, PyAny>) -> PyResult<Option<i128>> {
             - offset_micros,
     ))
 }
-pub(crate) fn utcoffset_minutes(obj: &Bound<'_, PyAny>) -> PyResult<Option<i32>> {
-    let offset = obj.call_method0(intern!(obj.py(), "utcoffset"))?;
+
+pub(crate) fn utcoffset_minutes(
+    obj: &Bound<'_, PyAny>,
+    tzinfo_offset: usize,
+) -> PyResult<Option<i32>> {
+    let py = obj.py();
+    let tzinfo = unsafe { temporal_tzinfo(obj, tzinfo_offset) };
+    if tzinfo.is_null() || ptr::eq(tzinfo, unsafe { ffi::Py_None() }) {
+        return Ok(None);
+    }
+    if ptr::eq(tzinfo, timezone_utc(py)?.as_ptr()) {
+        return Ok(Some(0));
+    }
+    let offset = obj.call_method0(intern!(py, "utcoffset"))?;
     if offset.is_none() {
         return Ok(None);
     }
     let delta = offset.cast::<PyDelta>()?;
-    let micros = datetime_format::total_micros(
+    Ok(Some(datetime_format::utc_offset_minutes(
+        datetime_format::total_micros(
+            delta.get_days(),
+            delta.get_seconds(),
+            delta.get_microseconds(),
+        ),
+    )))
+}
+
+static TIMEZONE_UTC: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn timezone_utc(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    TIMEZONE_UTC.get_or_try_init(py, || {
+        py.import("datetime")?
+            .getattr("timezone")?
+            .getattr("utc")
+            .map(Bound::unbind)
+    })
+}
+
+const TEMPORAL_HASTZINFO_OFFSET: usize = 24;
+const DATETIME_TZINFO_OFFSET: usize = 40;
+const TIME_TZINFO_OFFSET: usize = 32;
+
+#[inline(always)]
+unsafe fn temporal_tzinfo(obj: &Bound<'_, PyAny>, tzinfo_offset: usize) -> *mut ffi::PyObject {
+    let has_tzinfo = unsafe { *obj.as_ptr().cast::<u8>().add(TEMPORAL_HASTZINFO_OFFSET) } != 0;
+    if !has_tzinfo {
+        return ptr::null_mut();
+    }
+    unsafe { *obj.as_ptr().cast::<u8>().add(tzinfo_offset).cast() }
+}
+
+#[inline]
+fn utcoffset_micros(obj: &Bound<'_, PyAny>, tzinfo_offset: usize) -> PyResult<Option<i128>> {
+    let py = obj.py();
+    let tzinfo = unsafe { temporal_tzinfo(obj, tzinfo_offset) };
+    if tzinfo.is_null() {
+        return Ok(None);
+    }
+    if ptr::eq(tzinfo, py.None().as_ptr()) {
+        return Ok(None);
+    }
+    if ptr::eq(tzinfo, timezone_utc(py)?.as_ptr()) {
+        return Ok(Some(0));
+    }
+    let offset = obj.call_method0(intern!(py, "utcoffset"))?;
+    if offset.is_none() {
+        return Ok(None);
+    }
+    let delta = offset.cast::<PyDelta>()?;
+    Ok(Some(datetime_format::total_micros(
         delta.get_days(),
         delta.get_seconds(),
         delta.get_microseconds(),
-    );
-    Ok(Some(datetime_format::utc_offset_minutes(micros)))
+    )))
 }
 
 fn duration_failure(error: datetime_format::DurationError) -> Fail {

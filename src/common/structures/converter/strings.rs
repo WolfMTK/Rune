@@ -1,6 +1,6 @@
-use std::borrow::Cow;
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use smallvec::SmallVec;
+
 use pyo3::{
     Bound, PyAny, PyErr, Python,
     exceptions::PyValueError,
@@ -15,6 +15,7 @@ use crate::{
         lax,
         naming::invalid_enum_value,
         py_typing::uuid,
+        reader::Text,
         structures::{
             converter::{
                 convert::ObjectConverter,
@@ -137,15 +138,15 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
 
     fn lax_str(&mut self, text: &str, id: NodeId) -> Outcome<Option<Bound<'py, PyAny>>> {
         let py = self.py;
-        let scalar = Scalar::Str(Cow::Borrowed(text));
+        let scalar = Scalar::Str(Text::Borrowed(text));
         let has_float = self
             .find(id, |shape| {
                 matches!(shape, Shape::Primitive(Primitive::Float))
             })
             .is_some();
-        let members: Vec<NodeId> = match self.union_of(id) {
+        let members: SmallVec<[NodeId; 8]> = match self.union_of(id) {
             Some(union) => union.plain.iter().map(|member| member.node).collect(),
-            None => vec![id],
+            None => SmallVec::from_slice(&[id]),
         };
         for member in members {
             let found = match self.base_shape(member) {
@@ -218,7 +219,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
     fn str_choice(&self, text: &str, member: NodeId) -> Decoded<'py> {
         let py = self.py;
         let node = self.plan.node(self.base(member));
-        let scalar = Scalar::Str(Cow::Borrowed(text));
+        let scalar = Scalar::Str(Text::Borrowed(text));
         let raw = PyString::new(py, text).into_any();
         let value = match &node.shape {
             Shape::Enum(members) => match members.members.get(&scalar) {

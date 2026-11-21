@@ -92,7 +92,10 @@ macro_rules! format_bindings {
             ExtraHooks, Hook, RequiredArgument, TypeArgument, reject_extra_arguments,
         };
         use $crate::common::naming::type_name_of;
-        use $crate::common::structures::encoder::{encode_object, encode_partial, write_into_buffer};
+        use $crate::common::structures::encoder::{
+            LayoutCache, encode_object, encode_object_cached, encode_partial_cached,
+            write_into_buffer,
+        };
         use $crate::common::raw::input_bytes;
         use $crate::common::{Format, writer::Writer};
         use $crate::exceptions::ParseError;
@@ -133,12 +136,13 @@ macro_rules! format_bindings {
             }
         }
 
-        #[pyclass(name = "Encoder", module = $module, frozen)]
+        #[pyclass(name = "Encoder", module = $module, frozen, unsendable)]
         pub(crate) struct Encoder {
             hook: Hook,
             decimal_format: DecimalFormat,
             order: Order,
             uuid_format: UuidFormat,
+            layouts: LayoutCache,
         }
 
         #[pymethods]
@@ -156,6 +160,7 @@ macro_rules! format_bindings {
                     decimal_format: DecimalFormat::from_argument(decimal_format)?,
                     order: Order::from_argument(order)?,
                     uuid_format: UuidFormat::from_argument(uuid_format, <$writer as Writer>::BINARY)?,
+                    layouts: LayoutCache::default(),
                 })
             }
 
@@ -216,15 +221,16 @@ macro_rules! format_bindings {
                 if offset < -1 {
                     return Err(PyValueError::new_err("offset must be >= -1"));
                 }
-                let (result, encoded) = encode_partial::<$writer>(
+                let (result, encoded) = encode_partial_cached::<$writer>(
                     py,
                     &obj,
                     &self.hook,
                     &self.decimal_format,
                     self.order,
                     self.uuid_format,
+                    &self.layouts,
                 );
-                write_into_buffer(py, buffer, offset, &encoded)?;
+                write_into_buffer::<$writer>(py, buffer, offset, encoded)?;
                 result
             }
         }
@@ -243,7 +249,7 @@ macro_rules! format_bindings {
                 let encoder = receiver.cast::<Encoder>().map_err(pyo3::PyErr::from)?;
                 let obj = arguments.only_positional("obj")?;
                 arguments.keywords([])?;
-                encoder.get().encode_one(py, &obj).map(Bound::into_any)
+                encoder.borrow().encode_one(py, &obj).map(Bound::into_any)
             }
         }
 
@@ -253,13 +259,14 @@ macro_rules! format_bindings {
                 py: Python<'py>,
                 obj: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyBytes>> {
-                encode_object::<$writer>(
+                encode_object_cached::<$writer>(
                     py,
                     obj,
                     &self.hook,
                     &self.decimal_format,
                     self.order,
                     self.uuid_format,
+                    &self.layouts,
                 )
             }
         }

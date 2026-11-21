@@ -1,4 +1,4 @@
-use std::collections::hash_map::Entry;
+use std::{collections::hash_map::Entry, hash::Hasher};
 
 use pyo3::{
     Bound, Py, PyAny, PyErr, PyResult, Python,
@@ -131,45 +131,172 @@ pub(crate) struct Node {
     pub(crate) children_call_user_code: bool,
 }
 
+enum IntScalarIndex<T> {
+    Map(RuneMap<i64, T>),
+    Dense { offset: i64, values: Vec<Option<T>> },
+}
+
+enum StrScalarIndex<T> {
+    Map(RuneMap<Box<str>, T>),
+    Table {
+        entries: Vec<Option<StrScalarEntry<T>>>,
+        mask: usize,
+    },
+}
+
+struct StrScalarEntry<T> {
+    key: Box<str>,
+    hash: u64,
+    value: T,
+}
+
 pub(crate) struct ScalarIndex<T> {
-    pub(crate) by_str: RuneMap<Box<str>, T>,
-    pub(crate) by_int: RuneMap<i64, T>,
+    by_str: StrScalarIndex<T>,
+    by_int: IntScalarIndex<T>,
 }
 
 impl<T> ScalarIndex<T> {
     pub(crate) fn get(&self, scalar: &Scalar<'_>) -> Option<&T> {
         match scalar {
-            Scalar::Str(text) => self.by_str.get(text.as_ref()),
-            Scalar::Int(number) => self.by_int.get(number),
+            Scalar::Str(text) => match &self.by_str {
+                StrScalarIndex::Map(map) if map.len() <= 8 => map
+                    .iter()
+                    .find(|(key, _)| key.as_ref() == text.as_ref())
+                    .map(|(_, value)| value),
+                StrScalarIndex::Map(map) => map.get(text.as_ref()),
+                StrScalarIndex::Table { entries, mask } => {
+                    let text = text.as_ref();
+                    let hash = string_hash(text);
+                    let mut slot = hash as usize & mask;
+                    loop {
+                        match &entries[slot] {
+                            Some(entry) if entry.hash == hash && entry.key.as_ref() == text => {
+                                return Some(&entry.value);
+                            }
+                            Some(_) => slot = (slot + 1) & mask,
+                            None => return None,
+                        }
+                    }
+                }
+            },
+            Scalar::Int(number) => match &self.by_int {
+                IntScalarIndex::Map(map) => map.get(number),
+                IntScalarIndex::Dense { offset, values } => {
+                    if number < offset {
+                        return None;
+                    }
+                    let index = (*number as u64).wrapping_sub(*offset as u64);
+                    if index >= values.len() as u64 {
+                        return None;
+                    }
+                    values[index as usize].as_ref()
+                }
+            },
             _ => None,
         }
     }
 
     pub(crate) fn insert(&mut self, key: &Bound<'_, PyAny>, value: T) -> PyResult<Insertion> {
         if let Ok(text) = key.cast::<PyString>() {
-            return Ok(insert_new(self.by_str.entry(text.to_str()?.into()), value));
+            let StrScalarIndex::Map(map) = &mut self.by_str else {
+                unreachable!("scalar indexes are inserted before finalization")
+            };
+            return Ok(insert_new(map.entry(text.to_str()?.into()), value));
         } else if key.is_instance_of::<PyInt>()
             && let Ok(number) = key.extract::<i64>()
         {
-            return Ok(insert_new(self.by_int.entry(number), value));
+            let IntScalarIndex::Map(map) = &mut self.by_int else {
+                unreachable!("scalar indexes are inserted before finalization")
+            };
+            return Ok(insert_new(map.entry(number), value));
         }
         Ok(Insertion::Unsupported)
     }
 
+    pub(crate) fn finish(self) -> Self {
+        Self {
+            by_str: self.by_str.finish(),
+            by_int: self.by_int.finish(),
+        }
+    }
+
     pub(crate) fn has_strings(&self) -> bool {
-        !self.by_str.is_empty()
+        match &self.by_str {
+            StrScalarIndex::Map(map) => !map.is_empty(),
+            StrScalarIndex::Table { .. } => true,
+        }
     }
 
     pub(crate) fn has_ints(&self) -> bool {
-        !self.by_int.is_empty()
+        match &self.by_int {
+            IntScalarIndex::Map(map) => !map.is_empty(),
+            IntScalarIndex::Dense { values, .. } => !values.is_empty(),
+        }
     }
+}
+
+impl<T> IntScalarIndex<T> {
+    fn finish(self) -> Self {
+        let Self::Map(map) = self else {
+            return self;
+        };
+        if map.is_empty() {
+            return Self::Map(map);
+        }
+        let (min, max) = map.keys().fold((i64::MAX, i64::MIN), |(min, max), &key| {
+            (min.min(key), max.max(key))
+        });
+        let range = (max as i128 - min as i128) as u128;
+        if range * 5 >= map.len() as u128 * 7 {
+            return Self::Map(map);
+        }
+        let mut values = Vec::with_capacity(range as usize + 1);
+        values.resize_with(range as usize + 1, || None);
+        for (key, value) in map {
+            values[(key as i128 - min as i128) as usize] = Some(value);
+        }
+        Self::Dense {
+            offset: min,
+            values,
+        }
+    }
+}
+
+impl<T> StrScalarIndex<T> {
+    fn finish(self) -> Self {
+        let Self::Map(map) = self else {
+            return self;
+        };
+        if map.len() <= 8 {
+            return Self::Map(map);
+        }
+        let size = (map.len() * 4 / 3).max(4).next_power_of_two();
+        let mask = size - 1;
+        let mut entries = Vec::with_capacity(size);
+        entries.resize_with(size, || None);
+        for (key, value) in map {
+            let hash = string_hash(&key);
+            let mut slot = hash as usize & mask;
+            while entries[slot].is_some() {
+                slot = (slot + 1) & mask;
+            }
+            entries[slot] = Some(StrScalarEntry { key, hash, value });
+        }
+        Self::Table { entries, mask }
+    }
+}
+
+fn string_hash(text: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(text.as_bytes());
+    hasher.finish()
 }
 
 impl<T> Default for ScalarIndex<T> {
     fn default() -> Self {
         Self {
-            by_str: RuneMap::default(),
-            by_int: RuneMap::default(),
+            by_str: StrScalarIndex::Map(RuneMap::default()),
+            by_int: IntScalarIndex::Map(RuneMap::default()),
         }
     }
 }
@@ -235,6 +362,7 @@ impl LiteralPlan {
                 plan.values.insert(&value, value.clone().unbind())?;
             }
         }
+        plan.values = plan.values.finish();
         Ok(plan)
     }
 }
@@ -257,7 +385,7 @@ impl EnumPlan {
             members.insert(&value, member.unbind())?;
         }
         Ok(Self {
-            members,
+            members: members.finish(),
             by_value: by_value.unbind(),
             has_custom_missing: has_custom_missing(ty)?,
         })
@@ -266,6 +394,8 @@ impl EnumPlan {
 
 pub(crate) struct UnionPlan {
     pub(crate) accepts_none: bool,
+    pub(crate) accepted_kinds: u16,
+    pub(crate) tagged_kinds: u16,
     pub(crate) plain: Vec<UnionMember>,
     pub(crate) tagged: Vec<NodeId>,
     pub(crate) tag_index: Option<TagIndex>,
@@ -360,6 +490,56 @@ impl StructPlan {
         Ok(())
     }
 
+    pub(crate) fn finish_direct<'py>(
+        &self,
+        py: Python<'py>,
+        instance: Bound<'py, PyAny>,
+    ) -> Decoded<'py> {
+        let Constructor::Direct {
+            info,
+            alias,
+            post_init,
+            ..
+        } = &self.constructor
+        else {
+            unreachable!("direct decoding requires a direct constructor")
+        };
+        let info = info.get();
+        let mut should_untrack = true;
+        for (index, field) in self.fields.iter().enumerate() {
+            if let Some(value) = r#struct::borrow_slot(&instance, info.offsets[index]) {
+                if should_untrack && r#struct::may_be_tracked(value.as_ptr()) {
+                    should_untrack = false;
+                }
+                continue;
+            }
+            if field.is_required {
+                return Err(Fail::missing_field(&field.name));
+            }
+            let value = info.produce_default(py, index)?.ok_or_else(|| {
+                PyTypeError::new_err(format!("Missing required field `{}`", field.name))
+            })?;
+            if should_untrack && r#struct::may_be_tracked(value.as_ptr()) {
+                should_untrack = false;
+            }
+            r#struct::write_slot(&instance, info.offsets[index], value);
+        }
+        if let Some(alias) = alias {
+            let _ = instance.setattr(intern!(py, "__orig_class__"), alias);
+        }
+        if should_untrack {
+            r#struct::untrack(&instance);
+        }
+        if let Some(post_init) = post_init {
+            post_init
+                .bind(py)
+                .call1((&instance,))
+                .map_err(|err| Fail::from_hook(py, err))?;
+        }
+        Ok(instance)
+    }
+
+    #[inline(always)]
     pub(crate) fn instantiate<'py>(
         &self,
         py: Python<'py>,

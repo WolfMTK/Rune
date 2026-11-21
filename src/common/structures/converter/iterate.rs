@@ -1,8 +1,6 @@
-use std::borrow::Cow;
-
 use crate::common::{
     failure::LengthRule,
-    reader::{Key, Reader},
+    reader::{Key, Reader, Text},
     structures::{
         converter::decode::Converter,
         cursor::Checkpoint,
@@ -35,7 +33,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         &mut self,
         len: Option<usize>,
         first_index: usize,
-        mut visit: impl FnMut(&mut Self, Cow<'a, str>, usize) -> Outcome<()>,
+        mut visit: impl FnMut(&mut Self, Text<'a>, usize) -> Outcome<()>,
     ) -> Outcome<usize> {
         let mut index = first_index;
         while let Some(key) = self.wire.next_key(len, index)? {

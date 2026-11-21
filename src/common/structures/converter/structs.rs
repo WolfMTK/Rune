@@ -1,7 +1,7 @@
-use std::borrow::Cow;
+use smallvec::{SmallVec, smallvec};
 
 use pyo3::{
-    Bound, PyAny, PyResult, Python,
+    Bound, PyAny, PyErr, PyResult, Python,
     exceptions::PyKeyError,
     intern,
     prelude::PyDictMethods,
@@ -12,7 +12,8 @@ use crate::common::{
     failure::LengthRule,
     naming::type_name_of,
     py_typing::type_origin,
-    reader::{Reader, kind},
+    reader::{Reader, Text, kind},
+    r#struct,
     structures::{
         converter::{
             convert::ObjectConverter, decode::Converter, predicates::is_typed_dict,
@@ -27,7 +28,7 @@ use crate::common::{
 };
 
 pub(crate) struct Entries<'a> {
-    pub(crate) items: Vec<(Cow<'a, str>, usize)>,
+    pub(crate) items: SmallVec<[(Text<'a>, usize); 16]>,
     pub(crate) end: Checkpoint,
 }
 
@@ -56,7 +57,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
 
     fn decode_array_struct(&mut self, id: NodeId) -> Decoded<'py> {
         let plan = self.plan.struct_plan(id);
-        let mut values = vec![None; plan.fields.len()];
+        let mut values: FieldValues<'py> = smallvec![None; plan.fields.len()];
         let length = Length::at_least(plan.min_array_length);
         self.decode_sequence(&length, self.fields_call_user_code(id), |this, index| {
             match plan.fields.get(index) {
@@ -76,10 +77,18 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         let start = self.wire.checkpoint();
         if !self.fields_call_user_code(id) {
             let len = self.wire.enter_map()?;
-            match self.fill_values(len, plan, 0) {
-                Ok(values) => return plan.instantiate(self.py, values),
-                Err(fail) if fail.is_syntax() => return Err(fail),
-                Err(_) => self.wire.restore(start),
+            if matches!(plan.constructor, Constructor::Direct { .. }) {
+                match self.fill_direct(len, plan, 0) {
+                    Ok(instance) => return plan.finish_direct(self.py, instance),
+                    Err(fail) if fail.is_syntax() => return Err(fail),
+                    Err(_) => self.wire.restore(start),
+                }
+            } else {
+                match self.fill_values(len, plan, 0) {
+                    Ok(values) => return plan.instantiate(self.py, values),
+                    Err(fail) if fail.is_syntax() => return Err(fail),
+                    Err(_) => self.wire.restore(start),
+                }
             }
         }
         let entries = self.index_map()?;
@@ -87,13 +96,43 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         plan.instantiate(self.py, values)
     }
 
+    pub(crate) fn fill_direct(
+        &mut self,
+        len: Option<usize>,
+        plan: &StructPlan,
+        first_index: usize,
+    ) -> Decoded<'py> {
+        let Constructor::Direct { info, class, .. } = &plan.constructor else {
+            unreachable!("direct decoding requires a direct constructor")
+        };
+        let info = info.get();
+        let instance =
+            r#struct::allocate(class.bind(self.py).cast::<PyType>().map_err(PyErr::from)?)?;
+        self.each_entry(len, first_index, |this, key, index| {
+            match plan.slot_of(&key, index - first_index) {
+                Some(slot) => {
+                    let value = this.decode_node(plan.fields[slot].node)?;
+                    r#struct::write_slot(&instance, info.offsets[slot], value);
+                }
+                None => {
+                    plan.check_unknown_key(&key)?;
+                    this.skip()?;
+                }
+            }
+            Ok(())
+        })?;
+        self.wire.leave();
+        Ok(instance)
+    }
+
+    #[inline(always)]
     pub(crate) fn fill_values(
         &mut self,
         len: Option<usize>,
         plan: &StructPlan,
         first_index: usize,
     ) -> Outcome<FieldValues<'py>> {
-        let mut values = vec![None; plan.fields.len()];
+        let mut values: FieldValues<'py> = smallvec![None; plan.fields.len()];
         self.each_entry(len, first_index, |this, key, index| {
             match plan.slot_of(&key, index - first_index) {
                 Some(slot) => values[slot] = Some(this.decode_node(plan.fields[slot].node)?),
@@ -118,7 +157,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
 
     pub(crate) fn index_map(&mut self) -> Outcome<Entries<'a>> {
         let len = self.wire.enter_map()?;
-        let mut items = Vec::new();
+        let mut items = SmallVec::new();
         self.each_entry(len, 0, |this, key, _| {
             items.push((key, this.wire.position));
             this.skip()
@@ -134,7 +173,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
         entries: &Entries<'a>,
         plan: &StructPlan,
     ) -> Outcome<FieldValues<'py>> {
-        let mut latest_entry = vec![None; plan.fields.len()];
+        let mut latest_entry: SmallVec<[Option<usize>; 8]> = smallvec![None; plan.fields.len()];
         for (entry, (key, _)) in entries.items.iter().enumerate() {
             if let Some(&slot) = plan.slot_by_name.get(key.as_ref()) {
                 latest_entry[slot] = Some(entry);
@@ -142,7 +181,7 @@ impl<'py, 'a, W: Reader<'a>> Converter<'_, 'py, W> {
                 plan.check_unknown_key(key)?;
             }
         }
-        let mut values = Vec::with_capacity(plan.fields.len());
+        let mut values = SmallVec::with_capacity(plan.fields.len());
         for (field, entry) in plan.fields.iter().zip(latest_entry) {
             let Some(entry) = entry else {
                 if field.is_required {
@@ -235,7 +274,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
                         .map_err(|fail| fail.at(PathSegment::Index(leading + index))),
                     None => Ok(None),
                 })
-                .collect::<Outcome<Vec<_>>>()
+                .collect::<Outcome<FieldValues<'py>>>()
         })?;
         let value = plan.instantiate(self.py, values)?;
         self.constrain(member, value)
@@ -308,7 +347,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
     ) -> Decoded<'py> {
         let plan = self.plan.struct_plan(self.base(member));
         let values = self.nested(|this| {
-            let mut values = vec![None; plan.fields.len()];
+            let mut values: FieldValues<'py> = smallvec![None; plan.fields.len()];
             for (key, value) in dict.iter() {
                 let Ok(key) = key.cast_exact::<PyString>() else {
                     return Err(Fail::invalid("Expected `str`".to_owned()).at(PathSegment::DictKey));
@@ -348,7 +387,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
             return Ok(obj.clone());
         }
         if let Ok(tuple) = obj.cast::<PyTuple>() {
-            let items: Vec<_> = tuple.iter().collect();
+            let items: SmallVec<[_; 8]> = tuple.iter().collect();
             return self.convert_sequence(&items, id);
         }
         let is_mapping = class.hasattr(intern!(py, "__getitem__"))?;
@@ -439,7 +478,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
         }
         let values = self.nested(|this| {
             let mut use_attribute_names = None;
-            let mut values = Vec::with_capacity(plan.fields.len());
+            let mut values = SmallVec::with_capacity(plan.fields.len());
             for field in &plan.fields {
                 let attribute = field.key.bind(py);
                 let attribute_name = attribute.to_str()?;
@@ -481,7 +520,7 @@ impl<'p, 'py> ObjectConverter<'p, 'py> {
         let py = self.py;
         let plan = self.plan.struct_plan(self.base(member));
         let values = self.nested(|this| {
-            let mut values = Vec::with_capacity(plan.fields.len());
+            let mut values = SmallVec::with_capacity(plan.fields.len());
             for field in &plan.fields {
                 let item = match obj.get_item(field.key.bind(py)) {
                     Ok(item) => item,

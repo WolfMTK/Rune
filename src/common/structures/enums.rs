@@ -21,11 +21,12 @@ use crate::{
             abc_mutable_set, abc_sequence, abc_set, compile_regex, is_type, meta_type,
         },
         raw::Raw,
-        reader::kind,
+        reader::{Text, kind},
         r#struct::StructInfo,
         structures::{
             layout::StructLayout,
             plan::{ArrayPlan, EnumPlan, LiteralPlan, StructPlan, TuplePlan, UnionPlan},
+            values::string_from_read_text,
         },
         types::{ConstraintSetId, NodeId},
     },
@@ -54,7 +55,7 @@ pub(crate) enum Scalar<'a> {
     UInt(u64),
     BigInt(&'a str),
     Float(f64),
-    Str(Cow<'a, str>),
+    Str(Text<'a>),
     Bytes(Cow<'a, [u8]>),
     Ext { code: i8, data: &'a [u8] },
 }
@@ -69,7 +70,7 @@ impl Scalar<'_> {
             Scalar::UInt(value) => PyInt::new(py, *value).into_any(),
             Scalar::BigInt(digits) => return big_integer(py, digits),
             Scalar::Float(value) => PyFloat::new(py, *value).into_any(),
-            Scalar::Str(value) => PyString::new(py, value).into_any(),
+            Scalar::Str(value) => string_from_read_text(py, value)?.into_any(),
             Scalar::Bytes(value) => PyBytes::new(py, value).into_any(),
             Scalar::Ext { code, data } => return extension(py, *code, data),
         })
@@ -183,7 +184,8 @@ impl Shape {
 
     pub(crate) fn accepted_kinds(&self, lax: bool) -> u16 {
         match self {
-            Self::Any | Self::Custom(_) | Self::Union(_) | Self::Raw => kind::ANY,
+            Self::Any | Self::Custom(_) | Self::Raw => kind::ANY,
+            Self::Union(union) => union.accepted_kinds,
             Self::Ext => kind::EXT,
             Self::Primitive(primitive) => primitive.accepted_kinds(lax),
             Self::Literal(plan) => plan.accepted_kinds(),

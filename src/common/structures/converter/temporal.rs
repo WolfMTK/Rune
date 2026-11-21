@@ -45,9 +45,14 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         };
         timedelta_from_text(py, &text)
     }
+    #[inline(always)]
     pub(crate) fn decode_datetime(&mut self, accepted: u16) -> Decoded<'py> {
         let py = self.py;
-        self.expect_kind(accepted, "datetime", kind::name)?;
+        let found = self.expect_kind(accepted, "datetime", kind::name)?;
+        if found == kind::STR && !self.plan.lax {
+            let text = self.wire.read_string()?;
+            return datetime_from_text(py, &text);
+        }
         let scalar = self.wire.read_scalar()?;
         if let Scalar::Ext { code, data } = scalar {
             if code != TIMESTAMP_EXT_CODE {

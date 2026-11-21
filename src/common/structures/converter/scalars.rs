@@ -26,7 +26,9 @@ use crate::{
             enums::{BytesType, Primitive, Scalar, Shape},
             errors::{Fail, number_out_of_range},
             temporal::{datetime_from_epoch, duration_from_seconds},
-            values::{big_integer_as_float, custom_value, decimal_from_text},
+            values::{
+                big_integer_as_float, custom_value, decimal_from_text, string_from_read_text,
+            },
         },
         types::{Decoded, NodeId},
     },
@@ -35,7 +37,17 @@ use crate::{
 };
 
 impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
+    #[inline(always)]
     pub(crate) fn decode_primitive(&mut self, primitive: Primitive, accepted: u16) -> Decoded<'py> {
+        if matches!(primitive, Primitive::Int)
+            && !self.plan.lax
+            && let Some(scalar) = self.wire.read_integer()?
+        {
+            return match scalar {
+                Scalar::Float(_) => Err(Fail::mismatch(primitive.name(), "float")),
+                _ => Ok(scalar.to_py_checked(self.py)?),
+            };
+        }
         let found = self.wire.peek_kind()?;
         if found & accepted == 0 {
             return Err(Fail::mismatch(primitive.name(), kind::name(found)));
@@ -44,6 +56,10 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             let scalar = self.wire.read_scalar()?;
             return lax::primitive(self.py, primitive, &scalar)?
                 .ok_or_else(|| Fail::mismatch(primitive.name(), kind::name(found)));
+        }
+        if matches!(primitive, Primitive::Str) {
+            let text = self.wire.read_string()?;
+            return Ok(string_from_read_text(self.py, &text)?.into_any());
         }
         match (primitive, self.wire.read_scalar()?) {
             (Primitive::Float, Scalar::Float(value)) if value.is_infinite() && !W::BINARY => {

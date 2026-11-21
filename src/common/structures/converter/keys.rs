@@ -1,8 +1,8 @@
-use std::borrow::Cow;
+use std::{cell::RefCell, hash::Hasher};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::{
-    Bound, PyAny, Python,
+    Bound, Py, PyAny, PyResult, Python,
     exceptions::PyValueError,
     intern,
     prelude::PyAnyMethods,
@@ -15,36 +15,67 @@ use crate::{
         lax,
         naming::invalid_enum_value,
         py_typing::uuid,
-        reader::{Reader, kind},
+        reader::{Reader, Text, kind},
         structures::{
             converter::decode::Converter,
             enums::{Primitive, Scalar, Shape},
             errors::Fail,
             plan::{EnumPlan, LiteralPlan, UnionPlan},
             temporal::{date_from_text, datetime_from_text, time_from_text, timedelta_from_text},
-            values::decimal_from_text,
+            values::{decimal_from_text, string_from_read_text, string_from_text},
         },
-        types::{NodeId, Outcome, RuneMap},
+        types::{NodeId, Outcome},
     },
     constants::{INVALID_BASE64, MAX_CACHED_KEY_LEN, MAX_CACHED_KEYS},
 };
 
-#[derive(Default)]
-pub(crate) struct KeyCache<'py>(RuneMap<Box<str>, Bound<'py, PyString>>);
+struct CachedKey {
+    key: Box<str>,
+    hash: u64,
+    value: Py<PyString>,
+}
 
-impl<'py> KeyCache<'py> {
-    pub(crate) fn get(&mut self, py: Python<'py>, key: &str) -> Bound<'py, PyString> {
-        if key.len() < 2 {
-            return PyString::new(py, key);
-        } else if let Some(found) = self.0.get(key) {
-            return found.clone();
+thread_local! {
+    static CACHE: RefCell<[Option<CachedKey>; MAX_CACHED_KEYS]> =
+        const { RefCell::new([const { None }; MAX_CACHED_KEYS]) };
+}
+
+pub(crate) struct KeyCache;
+
+impl KeyCache {
+    pub(crate) fn get<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: &Text<'_>,
+    ) -> PyResult<Bound<'py, PyString>> {
+        if key.len() < 2 || key.len() > MAX_CACHED_KEY_LEN || !key.is_ascii() {
+            return string_from_read_text(py, key);
         }
-        let created = PyString::new(py, key);
-        if key.len() <= MAX_CACHED_KEY_LEN && self.0.len() < MAX_CACHED_KEYS && key.is_ascii() {
-            self.0.insert(key.into(), created.clone());
-        }
-        created
+        let hash = key_hash(key);
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let slot = hash as usize & (MAX_CACHED_KEYS - 1);
+            if let Some(found) = &cache[slot]
+                && found.hash == hash
+                && found.key.as_ref() == key.as_ref()
+            {
+                return Ok(found.value.bind(py).clone());
+            }
+            let created = string_from_read_text(py, key)?;
+            cache[slot] = Some(CachedKey {
+                key: key.as_ref().into(),
+                hash,
+                value: created.clone().unbind(),
+            });
+            Ok(created)
+        })
     }
+}
+
+fn key_hash(key: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(key.as_bytes());
+    hasher.finish()
 }
 
 impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
@@ -60,7 +91,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 plan.constraint_set(*constraints).check(&value)?;
                 value
             }
-            Shape::Any | Shape::Primitive(Primitive::Str) => PyString::new(py, key).into_any(),
+            Shape::Any | Shape::Primitive(Primitive::Str) => string_from_text(py, key)?.into_any(),
             Shape::Primitive(Primitive::Int) => {
                 if !lax::is_json_integer_text(key) {
                     return Err(Fail::mismatch("int", "str"));
@@ -68,7 +99,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                 lax::integer(py, key)?
             }
             Shape::Primitive(primitive) => {
-                lax::primitive(py, *primitive, &Scalar::Str(Cow::Borrowed(key)))?
+                lax::primitive(py, *primitive, &Scalar::Str(Text::Borrowed(key)))?
                     .ok_or_else(|| Fail::mismatch(primitive.name(), "str"))?
             }
             Shape::Literal(literal) => return self.decode_literal_key(literal, key),
@@ -93,7 +124,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
                     .map_err(|_| Fail::invalid(INVALID_BASE64.to_owned()))?,
             )?,
             Shape::Custom(base) => {
-                let raw = PyString::new(py, key).into_any();
+                let raw = string_from_text(py, key)?.into_any();
                 return self.finish_custom(node.ty.bind(py), base.bind(py), raw);
             }
             _ => {
@@ -111,7 +142,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         key: &str,
     ) -> Outcome<Bound<'py, PyAny>> {
         let py = self.py;
-        if let Some(value) = literal.find(py, &Scalar::Str(Cow::Borrowed(key))) {
+        if let Some(value) = literal.find(py, &Scalar::Str(Text::Borrowed(key))) {
             return Ok(value);
         }
         let raw = if literal.values.has_ints() && lax::is_json_integer_text(key) {
@@ -125,7 +156,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             }
             number
         } else {
-            PyString::new(py, key).into_any()
+            string_from_text(py, key)?.into_any()
         };
         Err(invalid_enum_value(&raw)?)
     }
@@ -139,7 +170,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         let raw = if members.is_int_valued() && lax::is_json_integer_text(key) {
             lax::integer(py, key)?
         } else {
-            PyString::new(py, key).into_any()
+            string_from_text(py, key)?.into_any()
         };
         if let Some(member) = members.by_value.bind(py).get_item(&raw)? {
             return Ok(member);

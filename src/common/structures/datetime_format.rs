@@ -23,6 +23,7 @@ pub(crate) enum DurationError {
     OutOfRange,
 }
 
+#[inline(always)]
 pub(crate) fn parse_date(text: &str) -> Option<Date> {
     let bytes = text.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -94,20 +95,35 @@ fn parse_clock(text: &str) -> Option<(Time, bool)> {
     }
     let (fraction, suffix) = split_fraction(&bytes[8..])?;
     let offset_minutes = parse_suffix(suffix)?;
-    let micros_of_day = ((u64::from(hour) * 60 + u64::from(minute)) * 60 + u64::from(second))
-        * 1_000_000
-        + u64::from(fraction_micros(fraction));
-    let day_micros = 24 * 3_600 * 1_000_000;
-    let next_day = micros_of_day >= day_micros;
-    let micros_of_day = micros_of_day % day_micros;
+    let mut microsecond = fraction_micros(fraction);
+    let (hour, minute, second, next_day) = if microsecond == 1_000_000 {
+        microsecond = 0;
+        round_up_second(hour as u8, minute as u8, second as u8)
+    } else {
+        (hour as u8, minute as u8, second as u8, false)
+    };
     let time = Time {
-        hour: (micros_of_day / 3_600_000_000) as u8,
-        minute: ((micros_of_day / 60_000_000) % 60) as u8,
-        second: ((micros_of_day / 1_000_000) % 60) as u8,
-        microsecond: (micros_of_day % 1_000_000) as u32,
+        hour,
+        minute,
+        second,
+        microsecond,
         offset_minutes,
     };
     Some((time, next_day))
+}
+
+#[cold]
+#[inline(never)]
+fn round_up_second(hour: u8, minute: u8, second: u8) -> (u8, u8, u8, bool) {
+    if second < 59 {
+        (hour, minute, second + 1, false)
+    } else if minute < 59 {
+        (hour, minute + 1, 0, false)
+    } else if hour < 23 {
+        (hour + 1, 0, 0, false)
+    } else {
+        (0, 0, 0, true)
+    }
 }
 
 pub(crate) fn parse_duration(text: &str) -> Result<i128, DurationError> {
@@ -199,61 +215,176 @@ pub(crate) fn parse_duration(text: &str) -> Result<i128, DurationError> {
     }
 }
 
-pub(crate) fn format_date(year: i32, month: u8, day: u8) -> String {
-    format!("{year:04}-{month:02}-{day:02}")
+pub(crate) struct TextBuf<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
 }
 
-pub(crate) fn format_time(
+impl<'a> TextBuf<'a> {
+    pub(crate) fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, len: 0 }
+    }
+
+    #[inline(always)]
+    pub(crate) fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    pub(crate) fn extend_from_slice(&mut self, slice: &[u8]) {
+        let end = self.len + slice.len();
+        self.bytes[self.len..end].copy_from_slice(slice);
+        self.len = end;
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
+}
+
+const TWO_DIGITS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+#[inline(always)]
+fn push_two(buf: &mut TextBuf<'_>, value: u8) {
+    let start = usize::from(value) * 2;
+    buf.extend_from_slice(&TWO_DIGITS[start..start + 2]);
+}
+
+fn push_four(buf: &mut TextBuf<'_>, value: u32) {
+    push_two(buf, (value / 100) as u8);
+    push_two(buf, (value % 100) as u8);
+}
+
+fn push_six(buf: &mut TextBuf<'_>, value: u32) {
+    push_two(buf, (value / 10_000) as u8);
+    push_two(buf, ((value / 100) % 100) as u8);
+    push_two(buf, (value % 100) as u8);
+}
+
+fn push_decimal(buf: &mut TextBuf<'_>, mut value: u128) {
+    let mut digits = [0_u8; 20];
+    let mut start = digits.len();
+    while value >= 10 {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    start -= 1;
+    digits[start] = b'0' + value as u8;
+    buf.extend_from_slice(&digits[start..]);
+}
+
+fn push_fraction(buf: &mut TextBuf<'_>, microseconds: u32) {
+    if microseconds == 0 {
+        return;
+    }
+    let mut digits = [0_u8; 6];
+    let mut value = microseconds;
+    for digit in digits.iter_mut().rev() {
+        *digit = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    let end = digits
+        .iter()
+        .rposition(|digit| *digit != b'0')
+        .map_or(0, |position| position + 1);
+    buf.push(b'.');
+    buf.extend_from_slice(&digits[..end]);
+}
+
+pub(crate) fn write_date_text(buf: &mut TextBuf<'_>, year: i32, month: u8, day: u8) {
+    push_four(buf, year as u32);
+    buf.push(b'-');
+    push_two(buf, month);
+    buf.push(b'-');
+    push_two(buf, day);
+}
+
+pub(crate) fn write_time_text(
+    buf: &mut TextBuf<'_>,
     hour: u8,
     minute: u8,
     second: u8,
     microsecond: u32,
     offset_minutes: Option<i32>,
-) -> String {
-    let fraction = if microsecond == 0 {
-        String::new()
-    } else {
-        format!(".{microsecond:06}")
-    };
-    let offset = match offset_minutes {
-        None => String::new(),
-        Some(0) => "Z".to_owned(),
-        Some(minutes) => format_offset(minutes),
-    };
-    format!("{hour:02}:{minute:02}:{second:02}{fraction}{offset}")
+) {
+    push_two(buf, hour);
+    buf.push(b':');
+    push_two(buf, minute);
+    buf.push(b':');
+    push_two(buf, second);
+    if microsecond != 0 {
+        buf.push(b'.');
+        push_six(buf, microsecond);
+    }
+    match offset_minutes {
+        None => {}
+        Some(0) => buf.push(b'Z'),
+        Some(minutes) => {
+            let magnitude = minutes.unsigned_abs();
+            buf.push(if minutes < 0 { b'-' } else { b'+' });
+            push_two(buf, (magnitude / 60) as u8);
+            buf.push(b':');
+            push_two(buf, (magnitude % 60) as u8);
+        }
+    }
 }
 
-pub(crate) fn format_duration(total_micros: i128) -> String {
-    let sign = if total_micros < 0 { "-" } else { "" };
+pub(crate) fn write_duration_text(buf: &mut TextBuf<'_>, total_micros: i128) {
+    if total_micros < 0 {
+        buf.push(b'-');
+    }
     let magnitude = total_micros.unsigned_abs();
-    let day_micros = MICROS_PER_DAY.unsigned_abs();
-    let days = magnitude / day_micros;
-    let rest = magnitude % day_micros;
+    let rest = magnitude % MICROS_PER_DAY.unsigned_abs();
+    let days = magnitude / MICROS_PER_DAY.unsigned_abs();
     let seconds = rest / 1_000_000;
     let microseconds = rest % 1_000_000;
     let has_time = seconds != 0 || microseconds != 0;
-    let days_text = if days > 0 || !has_time {
-        format!("{days}D")
-    } else {
-        String::new()
-    };
-    let time_text = if has_time {
-        format!("T{seconds}{}S", fraction_text(microseconds))
-    } else {
-        String::new()
-    };
-    format!("{sign}P{days_text}{time_text}")
+    buf.push(b'P');
+    if days > 0 || !has_time {
+        push_decimal(buf, days);
+        buf.push(b'D');
+    }
+    if has_time {
+        buf.push(b'T');
+        push_decimal(buf, seconds);
+        push_fraction(buf, microseconds as u32);
+        buf.push(b'S');
+    }
 }
 
 pub(crate) fn utc_offset_minutes(offset_micros: i128) -> i32 {
-    let whole_minutes = offset_micros / MICROS_PER_MINUTE;
-    let remainder = offset_micros % MICROS_PER_MINUTE;
-    let rounded = if 2 * remainder.abs() > MICROS_PER_MINUTE {
+    const MINUTES_PER_DAY_I64: i64 = 1_440;
+    let Some(offset_micros) = i64::try_from(offset_micros).ok() else {
+        let whole_minutes = offset_micros / MICROS_PER_MINUTE;
+        let remainder = offset_micros % MICROS_PER_MINUTE;
+        let rounded = if 2 * remainder.abs() > MICROS_PER_MINUTE {
+            whole_minutes + remainder.signum()
+        } else {
+            whole_minutes
+        };
+        return (rounded % MINUTES_PER_DAY) as i32;
+    };
+    const MICROS_PER_MINUTE_I64: i64 = 60_000_000;
+    let whole_minutes = offset_micros / MICROS_PER_MINUTE_I64;
+    let remainder = offset_micros % MICROS_PER_MINUTE_I64;
+    let rounded = if 2 * remainder.abs() > MICROS_PER_MINUTE_I64 {
         whole_minutes + remainder.signum()
     } else {
         whole_minutes
     };
-    (rounded % MINUTES_PER_DAY) as i32
+    (rounded % MINUTES_PER_DAY_I64) as i32
 }
 
 pub(crate) fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
@@ -280,20 +411,6 @@ pub(crate) fn timedelta_components(total_micros: i128) -> (i32, i32, i32) {
         (rest / MICROS_PER_SECOND) as i32,
         (rest % MICROS_PER_SECOND) as i32,
     )
-}
-
-fn format_offset(minutes: i32) -> String {
-    let sign = if minutes < 0 { '-' } else { '+' };
-    let magnitude = minutes.unsigned_abs();
-    format!("{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)
-}
-
-fn fraction_text(microseconds: u128) -> String {
-    if microseconds == 0 {
-        return String::new();
-    }
-    let digits = format!("{microseconds:06}");
-    format!(".{}", digits.trim_end_matches('0'))
 }
 
 fn days_in_month(year: i32, month: u8) -> u8 {

@@ -61,7 +61,7 @@ pub(crate) struct StructInfo {
     pub(crate) omit_defaults: bool,
     pub(crate) forbid_unknown_fields: bool,
     field_types: OnceLock<Py<PyAny>>,
-    owner: usize,
+    pub(crate) owner: usize,
 }
 
 #[pymethods]
@@ -146,6 +146,16 @@ pub(crate) fn read_slot<'py>(
     }
 }
 
+pub(crate) fn borrow_slot<'a, 'py>(
+    object: &'a Bound<'py, PyAny>,
+    offset: isize,
+) -> Option<Borrowed<'a, 'py, PyAny>> {
+    unsafe {
+        let value = *slot_pointer(object.as_ptr(), offset);
+        Borrowed::from_ptr_or_opt(object.py(), value)
+    }
+}
+
 pub(crate) fn write_slot(object: &Bound<'_, PyAny>, offset: isize, value: Bound<'_, PyAny>) {
     unsafe {
         let slot = slot_pointer(object.as_ptr(), offset);
@@ -177,10 +187,10 @@ fn is_gc_type(ty: *mut ffi::PyTypeObject) -> bool {
     unsafe { ffi::PyType_IS_GC(ty) != 0 }
 }
 
-fn may_be_tracked(value: *mut ffi::PyObject) -> bool {
+pub(crate) fn may_be_tracked(value: *mut ffi::PyObject) -> bool {
     unsafe {
-        is_gc_type(ffi::Py_TYPE(value))
-            && (ffi::PyTuple_CheckExact(value) == 0 || ffi::PyObject_GC_IsTracked(value) != 0)
+        ffi::PyDict_Check(value) != 0
+            || (is_gc_type(ffi::Py_TYPE(value)) && ffi::PyObject_GC_IsTracked(value) != 0)
     }
 }
 
@@ -200,6 +210,15 @@ pub(crate) fn untrack_if_possible(object: &Bound<'_, PyAny>, info: &StructInfo) 
     }
 }
 
+pub(crate) fn untrack(object: &Bound<'_, PyAny>) {
+    unsafe {
+        let pointer = object.as_ptr();
+        if ffi::PyObject_GC_IsTracked(pointer) != 0 {
+            ffi::PyObject_GC_UnTrack(pointer.cast());
+        }
+    }
+}
+
 fn track_if_needed(object: *mut ffi::PyObject, value: *mut ffi::PyObject) {
     unsafe {
         if value.is_null()
@@ -208,10 +227,7 @@ fn track_if_needed(object: *mut ffi::PyObject, value: *mut ffi::PyObject) {
         {
             return;
         }
-        let value_type = ffi::Py_TYPE(value);
-        let tracked_value = is_gc_type(value_type)
-            && (ffi::PyTuple_CheckExact(value) == 0 || ffi::PyObject_GC_IsTracked(value) != 0);
-        if tracked_value {
+        if may_be_tracked(value) {
             ffi::PyObject_GC_Track(object.cast());
         }
     }

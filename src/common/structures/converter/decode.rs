@@ -22,7 +22,7 @@ pub(crate) struct Converter<'p, 'py, W> {
     pub(crate) owner: Option<&'p Bound<'py, PyBytes>>,
     pub(crate) in_key: bool,
     pub(crate) wire: W,
-    pub(crate) keys: KeyCache<'py>,
+    pub(crate) keys: KeyCache,
     pub(crate) items: Vec<Bound<'py, PyAny>>,
 }
 
@@ -43,7 +43,7 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             owner,
             in_key: false,
             wire,
-            keys: KeyCache::default(),
+            keys: KeyCache,
             items: Vec::new(),
         }
     }
@@ -66,17 +66,17 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn decode_node(&mut self, id: NodeId) -> Decoded<'py> {
         let plan = self.plan;
         let node = plan.node(id);
-        let user_code_inside = node.children_call_user_code;
         match &node.shape {
             Shape::Any => self.decode_any(),
             Shape::Primitive(primitive) => self.decode_primitive(*primitive, node.accepted_kinds),
             Shape::Literal(literal) => self.decode_literal(literal),
             Shape::Enum(members) => self.decode_enum(node.ty.bind(self.py), members),
             Shape::Union(union) => self.decode_union(union),
-            Shape::Array(array) => self.decode_array(array, user_code_inside),
+            Shape::Array(array) => self.decode_array(array, node.children_call_user_code),
             Shape::AbstractArray(inner) => self.decode_abstract(*inner, kind::ARRAY, "array"),
             Shape::Dict { keys, key, values } => self.decode_dict(*keys, *key, *values),
             Shape::Frozendict {
@@ -87,7 +87,9 @@ impl<'p, 'py, 'a, W: Reader<'a>> Converter<'p, 'py, W> {
             } => self.decode_frozendict(class.bind(self.py), *keys, *key, *values),
             Shape::AbstractDict(inner) => self.decode_abstract(*inner, kind::MAP, "object"),
             Shape::Struct(_) => self.decode_struct(id),
-            Shape::NamedTuple(tuple) => self.decode_named_tuple(tuple, user_code_inside),
+            Shape::NamedTuple(tuple) => {
+                self.decode_named_tuple(tuple, node.children_call_user_code)
+            }
             Shape::Custom(base) => self.decode_custom(node.ty.bind(self.py), base.bind(self.py)),
             Shape::Decimal => self.decode_decimal(node.ty.bind(self.py)),
             Shape::Date => self.decode_date(),

@@ -136,7 +136,7 @@ macro_rules! format_bindings {
             }
         }
 
-        #[pyclass(name = "Encoder", module = $module, frozen, unsendable)]
+        #[pyclass(name = "Encoder", module = $module, frozen)]
         pub(crate) struct Encoder {
             hook: Hook,
             decimal_format: DecimalFormat,

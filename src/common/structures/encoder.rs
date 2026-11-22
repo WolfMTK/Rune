@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pyo3::{
@@ -51,7 +51,7 @@ use crate::{
 
 const KIND_CACHE_SIZE: usize = 8;
 
-pub(crate) type LayoutCache = RefCell<RuneMap<usize, (Py<PyType>, Rc<StructLayout>)>>;
+pub(crate) type LayoutCache = Mutex<RuneMap<usize, (Py<PyType>, Arc<StructLayout>)>>;
 
 pub(crate) struct Encoder<'f, 'py, W> {
     pub(crate) writer: W,
@@ -121,18 +121,25 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         Ok(kind)
     }
 
-    fn cached_layout(&self, ty: &Bound<'py, PyType>, plain: bool) -> PyResult<Rc<StructLayout>> {
+    fn cached_layout(&self, ty: &Bound<'py, PyType>, plain: bool) -> PyResult<Arc<StructLayout>> {
         let key = ty.as_ptr() as usize;
-        if let Some((_, layout)) = self.layouts.borrow().get(&key) {
-            return Ok(layout.clone());
+        let cached = self
+            .layouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .map(|(_, layout)| layout.clone());
+        if let Some(layout) = cached {
+            return Ok(layout);
         }
-        let layout = Rc::new(if plain {
+        let layout = Arc::new(if plain {
             StructLayout::load_plain(ty)?
         } else {
             StructLayout::load(ty, ty)?
         });
         self.layouts
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, (ty.clone().unbind(), layout.clone()));
         Ok(layout)
     }
@@ -755,7 +762,7 @@ impl<'py, W: Writer> Encoder<'_, 'py, W> {
         &mut self,
         py: Python<'py>,
         slot: &Slot,
-    ) -> PyResult<Vec<(usize, Rc<StructLayout>)>> {
+    ) -> PyResult<Vec<(usize, Arc<StructLayout>)>> {
         let Some(annotation) = &slot.list_annotation else {
             return Ok(Vec::new());
         };

@@ -13,6 +13,7 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, make_dataclass
 from types import ModuleType
 from typing import Any, Literal
@@ -286,6 +287,19 @@ class TestRecursion:
 
 
 class TestThreadSafe:
+    def test_encode_across_threads(self, proto: ModuleType) -> None:
+        # issue: https://github.com/WolfMTK/Rune/issues/66
+        class Item(Struct):
+            value: int
+
+        enc = proto.Encoder()
+        assert enc.encode(Item(1)) == proto.encode({"value": 1})
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(enc.encode, Item(2)).result()
+
+        assert result == proto.encode({"value": 2})
+
     def test_encode_threadsafe(self, proto: ModuleType) -> None:
         class Nested:
             def __init__(self, x: int) -> None:

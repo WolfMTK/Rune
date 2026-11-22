@@ -1,4 +1,4 @@
-use std::{cell::OnceCell, rc::Rc};
+use std::sync::{Arc, OnceLock};
 
 use pyo3::{
     Bound, Py, PyAny, PyResult, Python, intern,
@@ -177,7 +177,7 @@ impl StructSettings {
     }
 }
 
-pub(crate) type ListPlans = Vec<(usize, Rc<StructLayout>)>;
+pub(crate) type ListPlans = Vec<(usize, Arc<StructLayout>)>;
 
 pub(crate) struct Slot {
     pub(crate) offset: isize,
@@ -194,7 +194,7 @@ pub(crate) struct Slot {
     pub(crate) json_key: Option<Box<[u8]>>,
     pub(crate) binary_key: Box<[u8]>,
     pub(crate) list_annotation: Option<Py<PyAny>>,
-    pub(crate) list_plan: OnceCell<Option<ListPlans>>,
+    pub(crate) list_plan: OnceLock<Option<ListPlans>>,
 }
 
 impl Slot {
@@ -222,7 +222,7 @@ impl Slot {
             json_key: field.json_key.clone(),
             binary_key: MsgpackWriter::encoded_string(&field.name),
             list_annotation,
-            list_plan: OnceCell::new(),
+            list_plan: OnceLock::new(),
         })
     }
 }

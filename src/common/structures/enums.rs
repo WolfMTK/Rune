@@ -1,4 +1,4 @@
-use std::{borrow::Cow, rc::Rc};
+use std::{borrow::Cow, sync::Arc};
 
 use pyo3::{
     Bound, Py, PyAny, PyErr, PyResult, Python,
@@ -541,7 +541,7 @@ pub(crate) enum Kind {
     FrozenSet,
     Enum,
     Uncommon,
-    Struct(Rc<StructLayout>),
+    Struct(Arc<StructLayout>),
     Raw,
     Ext,
     Unknown,

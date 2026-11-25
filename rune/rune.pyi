@@ -5,6 +5,9 @@ from typing import Any, TypeVar, overload
 _T = TypeVar("_T")
 
 # exceptions.rs
+class EncodeError:
+    pass
+
 class DecodeError:
     pass
 

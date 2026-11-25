@@ -50,7 +50,7 @@ mod rune {
     #[pymodule_export]
     use crate::common::structures::converter::convert::convert;
     #[pymodule_export]
-    use crate::exceptions::{DecodeError, ValidationError};
+    use crate::exceptions::{DecodeError, EncodeError, ValidationError};
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

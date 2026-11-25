@@ -12,9 +12,9 @@ macro_rules! reject_union_if {
 pub(crate) use reject_union_if;
 
 #[cold]
-pub(crate) fn unsupported_union(ty: &Bound<'_, PyAny>, reason: impl Display) -> PyErr {
+pub(crate) fn unsupported_union(ty: &Bound<'_, PyAny>, message: impl Display) -> PyErr {
     match ty.repr() {
-        Ok(repr) => PyTypeError::new_err(format!("Union {repr} is not supported, {reason}")),
+        Ok(repr) => PyTypeError::new_err(format!("{message} - type `{repr}` is not supported")),
         Err(err) => err,
     }
 }

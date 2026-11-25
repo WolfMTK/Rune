@@ -123,52 +123,55 @@ pub(crate) fn ensure_union_is_unambiguous(ty: &Bound<'_, PyAny>) -> PyResult<()>
     let rules = [
         (
             int_enums > 1,
-            "it may not contain more than one int enum type",
+            "Type unions may not contain more than one int enum type",
         ),
         (
             str_enums > 1,
-            "it may not contain more than one str enum type",
+            "Type unions may not contain more than one str enum type",
         ),
         (
             int_enums >= 1 && int_like > 1,
-            "it may not contain more than one int-like type",
+            "Type unions may not contain more than one int-like type",
         ),
         (
             str_enum_or_strict >= 1 && str_like > 1,
-            "it may not contain more than one str-like type",
+            "Type unions may not contain more than one str-like type",
         ),
         (
             typed_dicts > 1,
-            "it may not contain more than one TypedDict type",
+            "Type unions may not contain more than one TypedDict type",
         ),
         (
             dataclasses > 1,
-            "it may not contain more than one dataclass or attrs type",
+            "Type unions may not contain more than one dataclass or attrs type",
         ),
         (
             has_dict_like,
-            "it may not contain more than one dict-like type",
+            "Type unions may not contain more than one dict-like type",
         ),
-        (has_many_dicts, "it may not contain more than one dict type"),
+        (
+            has_many_dicts,
+            "Type unions may not contain more than one dict type",
+        ),
         (
             named_tuples > 1,
-            "it may not contain more than one NamedTuple type",
+            "Type unions may not contain more than one NamedTuple type",
         ),
         (
             array_like > 1,
-            "it may not contain more than one array-like type",
+            "Type unions may not contain more than one array-like type",
         ),
         (
             custom_like > 1,
-            "it may not contain more than one custom type",
+            "Type unions may not contain more than one custom type",
         ),
         (
             deques > 0,
-            "contains a custom type (collections.deque), which can't be used in a union",
+            "Type unions may not contain a custom type (collections.deque)",
         ),
         (
             customs > 0,
-            "it may not combine a custom type with types other than None",
+            "Type unions may not combine a custom type with types other than None",
         ),
     ];
     if let Some((_, reason)) = rules.iter().find(|(violated, _)| *violated) {
@@ -220,20 +223,20 @@ fn ensure_union_structs_are_valid(
     reject_union_if!(
         ty,
         !structs.iter().all(|s| s.array_like == first.array_like),
-        "structs in a union must all have the same `array_like` setting"
+        "Type unions with structs must all have the same `array_like` setting"
     );
     reject_union_if!(
         ty,
         structs.iter().any(|s| {
             s.tag.is_some() && first_tagged.is_some_and(|tagged| s.tag_field != tagged.tag_field)
         }),
-        "structs in a union must all use the same `tag_field`"
+        "Type unions with structs must all use the same `tag_field`"
     );
     let py = ty.py();
     reject_union_if!(
         ty,
         structs.iter().any(|s| s.tag.is_none()),
-        "structs in a union must be tagged (set `tag`) so they can be told apart"
+        "Type unions with structs must be tagged (set `tag`) so they can be told apart"
     );
     let mut tags: Vec<Tag<'_>> = Vec::with_capacity(structs.len());
     for settings in &structs {
@@ -246,7 +249,7 @@ fn ensure_union_structs_are_valid(
         reject_union_if!(
             ty,
             tags.contains(&key),
-            "struct tags must be a unique `tag` value for each struct"
+            "Type unions with structs must have a unique `tag` value for each struct"
         );
         tags.push(key);
     }
@@ -255,7 +258,7 @@ fn ensure_union_structs_are_valid(
     reject_union_if!(
         ty,
         has_str && has_int,
-        "a union can't mix both `int` and `str` tags"
+        "Type unions can't mix both `int` and `str` tags"
     );
     Ok(())
 }

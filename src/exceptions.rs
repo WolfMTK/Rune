@@ -4,14 +4,21 @@ use pyo3::{
 };
 
 create_exception!(
-    "rune.exceptions",
+    rune.exceptions,
+    EncodeError,
+    PyException,
+    "An error occurred while encoding an object"
+);
+
+create_exception!(
+    rune.exceptions,
     DecodeError,
     PyException,
     "An error occurred while decoding an object"
 );
 
 create_exception!(
-    "rune.exceptions",
+    rune.exceptions,
     ValidationError,
     DecodeError,
     "The message didn't match the expected schema"

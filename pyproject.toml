@@ -37,10 +37,12 @@ bench = [
     "ujson==6.0.0",
     "msgspec==0.22.0"
 ]
-dev = [
+lint = [
+    "ruff>=0.17.1",
+]
+test = [
     "attrs>=26.1.0",
     "pytest>=9.1.1",
-    "ruff>=0.17.1",
     "pyyaml",
 ]
 

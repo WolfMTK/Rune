@@ -39,7 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: py-${{ matrix.python }}
-      - run: uv sync --python ${{ matrix.python }}
+      - run: uv sync --python ${{ matrix.python }} --group test
       - run: uv run pytest
 
   lint-python:
@@ -51,6 +51,6 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - run: uv sync --python 3.13
+      - run: uv sync --python 3.13 --group lint
       - run: uv run ruff check rune tests
       - run: uv run ruff format --check rune tests
